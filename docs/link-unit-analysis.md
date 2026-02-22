@@ -64,6 +64,11 @@ paths**. Same-project deps are listed under `"link_deps"` (by output
 filename). The `"objects"` field lists the `.o` members used to derive the
 `bc_files`.
 
+The analysis output fields (`db_path`, `callgraph_json`, `cflcg`,
+`vsnapshot`) are **written back by `batch_call_graph_gen.py`** after
+processing. They use absolute paths and may be `null` if the step did not
+produce that artifact.
+
 ```json
 {
   "project": "zlib",
@@ -84,7 +89,11 @@ filename). The `"objects"` field lists the `.o` members used to derive the
         "/data/csong/build-artifacts/zlib/CMakeFiles/zlibstatic.dir/compress.bc",
         "/data/csong/build-artifacts/zlib/CMakeFiles/zlibstatic.dir/deflate.bc"
       ],
-      "link_deps": []
+      "link_deps": [],
+      "db_path": "func-scans/zlib/zlibstatic/functions.db",
+      "callgraph_json": "func-scans/zlib/zlibstatic/callgraph.json",
+      "cflcg": "func-scans/zlib/zlibstatic/zlibstatic.cflcg",
+      "vsnapshot": "func-scans/zlib/zlibstatic/zlibstatic.vsnap"
     },
     {
       "name": "zlib_static_example",
@@ -96,7 +105,11 @@ filename). The `"objects"` field lists the `.o` members used to derive the
       "bc_files": [
         "/data/csong/build-artifacts/zlib/test/CMakeFiles/zlib_static_example.dir/example.bc"
       ],
-      "link_deps": ["libz.a"]
+      "link_deps": ["libz.a"],
+      "db_path": "func-scans/zlib/zlib_static_example/functions.db",
+      "callgraph_json": "func-scans/zlib/zlib_static_example/callgraph.json",
+      "cflcg": "func-scans/zlib/zlib_static_example/zlib_static_example.cflcg",
+      "vsnapshot": "func-scans/zlib/zlib_static_example/zlib_static_example.vsnap"
     }
   ]
 }
