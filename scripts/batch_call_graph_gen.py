@@ -34,6 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from llm_summary.allocator import STDLIB_ALLOCATORS, AllocatorDetector
 from llm_summary.callgraph_import import CallGraphImporter
 from llm_summary.db import SummaryDB
+from llm_summary.link_units.pipeline import (
+    build_output_index,
+    load_link_units,
+    resolve_dep_db_paths,
+    topo_sort_link_units,
+    update_link_units_file,
+)
 from gpr_utils import resolve_compile_commands
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -454,32 +461,6 @@ def import_callgraph(
 # Per-project processing
 # ---------------------------------------------------------------------------
 
-def _topo_sort_link_units(link_units: list[dict]) -> list[dict]:
-    """Return link units in dependency order (deps before dependents)."""
-    # Build lookup: output filename (and basename) -> link unit
-    by_output: dict[str, dict] = {}
-    for lu in link_units:
-        by_output[lu["output"]] = lu
-        by_output[Path(lu["output"]).name] = lu
-
-    visited: set[str] = set()
-    order: list[dict] = []
-
-    def visit(lu: dict) -> None:
-        if lu["name"] in visited:
-            return
-        visited.add(lu["name"])
-        for dep in lu.get("link_deps", []):
-            dep_lu = by_output.get(dep)
-            if dep_lu:
-                visit(dep_lu)
-        order.append(lu)
-
-    for lu in link_units:
-        visit(lu)
-
-    return order
-
 
 def process_project_compositional(
     project_name: str,
@@ -504,22 +485,16 @@ def process_project_compositional(
 
     Returns a list of per-target result dicts.
     """
-    with open(link_units_path) as f:
-        lu_data = json.load(f)
-
-    raw_units = lu_data.get("link_units", lu_data.get("targets", []))
+    lu_data, raw_units = load_link_units(link_units_path)
     if not raw_units:
         return [{"target": project_name, "error": "link_units.json has no targets"}]
 
-    link_units = _topo_sort_link_units(raw_units)
+    link_units = topo_sort_link_units(raw_units)
 
-    # Map name -> link unit (for dependency lookup)
+    # Map name -> link unit (for transitive dep traversal)
     by_name = {lu["name"]: lu for lu in link_units}
-    # Map output -> link unit
-    by_output: dict[str, dict] = {}
-    for lu in link_units:
-        by_output[lu["output"]] = lu
-        by_output[Path(lu["output"]).name] = lu
+    # Map output -> link unit (for dep resolution)
+    by_output = build_output_index(link_units)
 
     # Track per-target .cflcg paths (produced in Phase 1)
     cflcg_by_name: dict[str, Path] = {}
@@ -669,8 +644,7 @@ def process_project_compositional(
         results.append(result)
 
     # Write output paths back into link_units.json
-    with open(link_units_path, "w") as f:
-        json.dump(lu_data, f, indent=2)
+    update_link_units_file(link_units_path, lu_data)
 
     return results
 
