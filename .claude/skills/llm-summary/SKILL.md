@@ -164,11 +164,13 @@ llm-summary clear --db func-scans/<project>/functions.db
 | Script | Purpose |
 |--------|---------|
 | `batch_scan_targets.py` | Scan all projects (function extraction) |
-| `batch_call_graph_gen.py` | Run KAMain + import call graphs |
-| `batch_summarize.py` | Run all four summary passes for all projects |
+| `batch_call_graph_gen.py` | Run KAMain + import call graphs; writes `db_path`/`callgraph_json`/`cflcg`/`vsnapshot` back to `link_units.json` |
+| `batch_summarize.py` | Run all four summary passes; link-unit-aware when `link_units.json` present |
 | `batch_rebuild.py` | Rebuild projects with debug info |
 
 All batch scripts support: `--filter <name>`, `--tier <1|2|3>`, `--skip-list`, `--success-list`, `--verbose`
+
+`batch_call_graph_gen.py` also supports `--compositional` / `--no-compositional` to control CFL analysis mode.
 
 ---
 
@@ -187,7 +189,15 @@ All batch scripts support: `--filter <name>`, `--tier <1|2|3>`, `--skip-list`, `
 1. **build-learn** — produces `build-scripts/<project>/compile_commands.json` (host paths)
 2. **discover-link-units** — produces `func-scans/<project>/link_units.json`
 3. **scan** (per target) — `func-scans/<project>/<target>/functions.db`
-4. **KAMain** (per target) — `func-scans/<project>/<target>/callgraph.json`
-5. **import-callgraph** (per target)
-6. **init-stdlib** + **import-dep-summaries** (for targets with deps)
-7. **Summarize** (per target, two passes)
+4. **batch_call_graph_gen** `--compositional` — per-target CFL analysis; writes `db_path`, `callgraph_json`, `cflcg`, `vsnapshot` back into `link_units.json`
+5. **batch_summarize** — auto-detects `link_units.json`; for each target in topo order:
+   - `import-dep-summaries` from intra-project dep DBs
+   - `init-stdlib` (if `--init-stdlib` passed)
+   - Pass 1: `allocation + free + init`
+   - Pass 2: `memsafe`
+
+**Key files per link unit** (recorded in `link_units.json` after step 4):
+- `db_path` — functions DB
+- `callgraph_json` — KAMain call graph
+- `cflcg` — compressed CFL constraint graph
+- `vsnapshot` — serialized V-relation (value aliasing)
