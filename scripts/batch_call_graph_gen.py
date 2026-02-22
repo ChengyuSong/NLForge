@@ -317,31 +317,57 @@ def extract_allocator_candidates(
 
 def run_kamain(
     bc_files: list[Path],
-    output_json: Path,
+    output_json: Path | None,
     kamain_bin: str,
     allocator_file: Path | None = None,
     container_file: Path | None = None,
     snapshot_path: Path | None = None,
+    cfl_compressed_output: Path | None = None,
+    cfl_compressed_inputs: list[Path] | None = None,
+    cfl_compositional: bool = False,
     verbose_level: int = 1,
     timeout: int = 3600,
     verbose: bool = False,
 ) -> tuple[bool, str, float]:
-    """Run KAMain on .bc files. Returns (success, error_msg, duration)."""
+    """Run KAMain on .bc files. Returns (success, error_msg, duration).
+
+    Compositional mode (two-phase):
+      Phase 1 – produce compressed graph:
+        run_kamain(bc_files, output_json=None,
+                   cfl_compressed_output=Path("target.cflcg"))
+      Phase 2 – whole-program composition:
+        run_kamain(all_bc_files, output_json=Path("callgraph.json"),
+                   cfl_compressed_inputs=[Path("a.cflcg"), ...],
+                   cfl_compositional=True)
+    """
     start = time.monotonic()
 
     if not bc_files:
         return False, "No .bc files to analyze", 0.0
 
+    # Determine the working directory for bc_files.txt (use output dir or cflcg dir)
+    work_dir = (output_json or cfl_compressed_output)
+    if work_dir is None:
+        return False, "Neither output_json nor cfl_compressed_output specified", 0.0
+    work_dir = work_dir.parent
+    work_dir.mkdir(parents=True, exist_ok=True)
+
     # Write .bc paths to a list file to avoid command-line length limits
-    bc_list_path = output_json.parent / "bc_files.txt"
-    bc_list_path.parent.mkdir(parents=True, exist_ok=True)
+    bc_list_path = work_dir / "bc_files.txt"
     bc_list_path.write_text("\n".join(str(f) for f in bc_files) + "\n")
 
     cmd = [kamain_bin,
         "--bc-list", str(bc_list_path),
-        "--callgraph-json", str(output_json),
         "--verbose", str(verbose_level),
     ]
+    if output_json:
+        cmd += ["--callgraph-json", str(output_json)]
+    if cfl_compressed_output:
+        cmd += ["--cfl-compressed-output", str(cfl_compressed_output)]
+    if cfl_compositional:
+        cmd.append("--cfl-compositional")
+    for cflcg in (cfl_compressed_inputs or []):
+        cmd += ["--cfl-compressed-input", str(cflcg)]
     if allocator_file and allocator_file.exists():
         cmd += ["--allocator-file", str(allocator_file)]
     if container_file and container_file.exists():
@@ -350,10 +376,13 @@ def run_kamain(
         cmd += ["--v-snapshot", str(snapshot_path)]
 
     if verbose:
-        print(f"    KAMain: {len(bc_files)} bitcode files (via {bc_list_path.name}) -> {output_json.name}")
+        label = output_json.name if output_json else (cfl_compressed_output.name if cfl_compressed_output else "?")
+        print(f"    KAMain: {len(bc_files)} bitcode files -> {label}")
         print(f"    cmd: {shlex.join(cmd)}")
 
-    output_json.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = output_json.parent if output_json else (cfl_compressed_output.parent if cfl_compressed_output else None)
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         result = subprocess.run(
@@ -362,9 +391,11 @@ def run_kamain(
         duration = time.monotonic() - start
 
         if result.returncode == 0:
-            # Verify output was actually produced
-            if not output_json.exists():
-                return False, "KAMain exited 0 but no output JSON produced", duration
+            # Verify expected output was produced
+            if output_json and not output_json.exists():
+                return False, "KAMain exited 0 but no callgraph JSON produced", duration
+            if cfl_compressed_output and not cfl_compressed_output.exists():
+                return False, "KAMain exited 0 but no .cflcg file produced", duration
             return True, "", duration
 
         # Detect OOM kill: SIGKILL = -9 (Python) or 137 (shell convention)
@@ -423,6 +454,227 @@ def import_callgraph(
 # Per-project processing
 # ---------------------------------------------------------------------------
 
+def _topo_sort_link_units(link_units: list[dict]) -> list[dict]:
+    """Return link units in dependency order (deps before dependents)."""
+    # Build lookup: output filename (and basename) -> link unit
+    by_output: dict[str, dict] = {}
+    for lu in link_units:
+        by_output[lu["output"]] = lu
+        by_output[Path(lu["output"]).name] = lu
+
+    visited: set[str] = set()
+    order: list[dict] = []
+
+    def visit(lu: dict) -> None:
+        if lu["name"] in visited:
+            return
+        visited.add(lu["name"])
+        for dep in lu.get("link_deps", []):
+            dep_lu = by_output.get(dep)
+            if dep_lu:
+                visit(dep_lu)
+        order.append(lu)
+
+    for lu in link_units:
+        visit(lu)
+
+    return order
+
+
+def process_project_compositional(
+    project_name: str,
+    link_units_path: Path,
+    func_scans_dir: Path,
+    kamain_bin: str,
+    allocator_file: Path | None = None,
+    container_file: Path | None = None,
+    kamain_timeout: int = 3600,
+    verbose: bool = False,
+) -> list[dict]:
+    """Compositional CFL analysis for a project with link_units.json.
+
+    For each link unit in topological order:
+      Phase 1 (Level 2): kanalyzer <bc_files> --cfl-compressed-output <target>.cflcg
+      Phase 2 (Level 3): kanalyzer <target+dep bc_files>
+                           --cfl-compositional
+                           --cfl-compressed-input <target>.cflcg
+                           [--cfl-compressed-input <dep>.cflcg ...]
+                           --callgraph-json <target>/callgraph.json
+    Then imports the callgraph into the per-target functions.db.
+
+    Returns a list of per-target result dicts.
+    """
+    with open(link_units_path) as f:
+        lu_data = json.load(f)
+
+    raw_units = lu_data.get("link_units", lu_data.get("targets", []))
+    if not raw_units:
+        return [{"target": project_name, "error": "link_units.json has no targets"}]
+
+    link_units = _topo_sort_link_units(raw_units)
+
+    # Map name -> link unit (for dependency lookup)
+    by_name = {lu["name"]: lu for lu in link_units}
+    # Map output -> link unit
+    by_output: dict[str, dict] = {}
+    for lu in link_units:
+        by_output[lu["output"]] = lu
+        by_output[Path(lu["output"]).name] = lu
+
+    # Track per-target .cflcg paths (produced in Phase 1)
+    cflcg_by_name: dict[str, Path] = {}
+
+    project_scan_dir = func_scans_dir / project_name
+    results = []
+
+    for lu in link_units:
+        target = lu["name"]
+        bc_files = [Path(p) for p in lu.get("bc_files", []) if Path(p).exists()]
+        target_dir = project_scan_dir / target
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        result: dict = {
+            "target": target,
+            "type": lu.get("type", "unknown"),
+            "bc_files": len(bc_files),
+            "phase1_success": False,
+            "phase2_success": False,
+            "edges_imported": 0,
+            "direct_edges": 0,
+            "indirect_edges": 0,
+            "stubs_created": 0,
+            "timing_seconds": 0.0,
+            "error": None,
+        }
+        start = time.monotonic()
+
+        if not bc_files:
+            result["error"] = "no_bc_files"
+            result["timing_seconds"] = round(time.monotonic() - start, 2)
+            results.append(result)
+            continue
+
+        cflcg_path = target_dir / f"{target}.cflcg"
+
+        # --- Phase 1: Produce compressed constraint graph ---
+        if verbose:
+            print(f"      [{target}] Phase 1: compress {len(bc_files)} bc files -> {cflcg_path.name}")
+
+        ok, err, dur = run_kamain(
+            bc_files=bc_files,
+            output_json=None,
+            kamain_bin=kamain_bin,
+            cfl_compressed_output=cflcg_path,
+            allocator_file=allocator_file,
+            container_file=container_file,
+            timeout=kamain_timeout,
+            verbose=verbose,
+        )
+
+        result["phase1_success"] = ok
+        if not ok:
+            result["error"] = f"phase1_failed: {err}"
+            result["timing_seconds"] = round(time.monotonic() - start, 2)
+            results.append(result)
+            continue
+
+        cflcg_by_name[target] = cflcg_path
+
+        # --- Phase 2: Compositional whole-program solve ---
+        # Collect transitive deps: bc_files + .cflcg for this target and all deps
+        all_bc: list[Path] = list(bc_files)
+        all_cflcg: list[Path] = [cflcg_path]
+
+        def _collect_deps(lu_name: str, visited_deps: set[str]) -> None:
+            lu_entry = by_name.get(lu_name)
+            if not lu_entry:
+                return
+            for dep_output in lu_entry.get("link_deps", []):
+                dep_lu = by_output.get(dep_output)
+                if dep_lu and dep_lu["name"] not in visited_deps:
+                    visited_deps.add(dep_lu["name"])
+                    dep_bc = [Path(p) for p in dep_lu.get("bc_files", []) if Path(p).exists()]
+                    all_bc.extend(dep_bc)
+                    dep_cflcg = cflcg_by_name.get(dep_lu["name"])
+                    if dep_cflcg and dep_cflcg.exists():
+                        all_cflcg.append(dep_cflcg)
+                    _collect_deps(dep_lu["name"], visited_deps)
+
+        _collect_deps(target, {target})
+
+        callgraph_json = target_dir / "callgraph.json"
+
+        if verbose:
+            print(
+                f"      [{target}] Phase 2: compose {len(all_bc)} bc, "
+                f"{len(all_cflcg)} cflcg -> {callgraph_json.name}"
+            )
+
+        vsnapshot_path = target_dir / f"{target}.vsnap"
+
+        ok, err, dur = run_kamain(
+            bc_files=all_bc,
+            output_json=callgraph_json,
+            kamain_bin=kamain_bin,
+            cfl_compressed_inputs=all_cflcg,
+            cfl_compositional=True,
+            snapshot_path=vsnapshot_path,
+            allocator_file=allocator_file,
+            container_file=container_file,
+            timeout=kamain_timeout,
+            verbose=verbose,
+        )
+
+        result["phase2_success"] = ok
+        if not ok:
+            result["error"] = f"phase2_failed: {err}"
+            result["timing_seconds"] = round(time.monotonic() - start, 2)
+            results.append(result)
+            continue
+
+        if verbose:
+            print(f"      [{target}] Phase 2 done in {dur:.1f}s")
+
+        # --- Import callgraph into per-target DB ---
+        db_path = str(target_dir / "functions.db")
+        if not Path(db_path).exists():
+            result["error"] = "no_per_target_db (run scan --link-units first)"
+            result["timing_seconds"] = round(time.monotonic() - start, 2)
+            results.append(result)
+            continue
+
+        try:
+            import_stats = import_callgraph(
+                json_path=callgraph_json,
+                db_path=db_path,
+                clear_edges=True,
+                verbose=verbose,
+            )
+            result.update(import_stats)
+            if verbose:
+                print(
+                    f"      [{target}] Imported: {import_stats['edges_imported']} edges "
+                    f"({import_stats['direct_edges']}d+{import_stats['indirect_edges']}i)"
+                )
+        except Exception as e:
+            result["error"] = f"import_failed: {e}"
+
+        # Record output paths on the link unit entry (written back to link_units.json below)
+        lu["db_path"] = str(target_dir / "functions.db")
+        lu["callgraph_json"] = str(callgraph_json)
+        lu["cflcg"] = str(cflcg_path)
+        lu["vsnapshot"] = str(vsnapshot_path) if vsnapshot_path.exists() else None
+
+        result["timing_seconds"] = round(time.monotonic() - start, 2)
+        results.append(result)
+
+    # Write output paths back into link_units.json
+    with open(link_units_path, "w") as f:
+        json.dump(lu_data, f, indent=2)
+
+    return results
+
+
 def process_project(
     project_name: str,
     build_scripts_dir: Path,
@@ -434,9 +686,15 @@ def process_project(
     include_stdlib: bool = True,
     kamain_timeout: int = 3600,
     recompile: bool = True,
+    compositional: bool | None = None,  # None = auto-detect from link_units.json
     verbose: bool = False,
 ) -> dict:
-    """Process a single project end-to-end."""
+    """Process a single project end-to-end.
+
+    When link_units.json is present (and compositional is not False), delegates
+    to process_project_compositional for per-link-unit analysis.  Returns a
+    wrapper dict with a 'targets' key containing per-target results.
+    """
     result = {
         "project": project_name,
         "bc_files": 0,
@@ -458,8 +716,62 @@ def process_project(
     start = time.monotonic()
 
     project_scripts_dir = build_scripts_dir / project_name
-    cc_path = project_scripts_dir / "compile_commands.json"
     scan_dir = func_scans_dir / project_name
+
+    # --- Auto-route to compositional mode when link_units.json is present ---
+    link_units_path = scan_dir / "link_units.json"
+    if compositional is not False and link_units_path.exists():
+        if verbose:
+            print(f"    link_units.json found — using compositional CFL analysis")
+        # Extract project-level allocator candidates if a project-level DB exists
+        allocator_json = scan_dir / "allocator_candidates.json"
+        project_db = scan_dir / "functions.db"
+        if project_db.exists() and not allocator_json.exists():
+            try:
+                extract_allocator_candidates(
+                    db_path=str(project_db),
+                    project_name=project_name,
+                    output_path=allocator_json,
+                    min_score=min_score,
+                    include_stdlib=include_stdlib,
+                    verbose=verbose,
+                )
+            except Exception:
+                allocator_json = None
+        container_file = None
+        for candidate in [
+            project_scripts_dir / "containers.json",
+            scan_dir / "containers.json",
+        ]:
+            if candidate.exists():
+                container_file = candidate
+                break
+        target_results = process_project_compositional(
+            project_name=project_name,
+            link_units_path=link_units_path,
+            func_scans_dir=func_scans_dir,
+            kamain_bin=kamain_bin,
+            allocator_file=allocator_json if allocator_json and allocator_json.exists() else None,
+            container_file=container_file,
+            kamain_timeout=kamain_timeout,
+            verbose=verbose,
+        )
+        total_edges = sum(r.get("edges_imported", 0) for r in target_results)
+        total_direct = sum(r.get("direct_edges", 0) for r in target_results)
+        total_indirect = sum(r.get("indirect_edges", 0) for r in target_results)
+        total_stubs = sum(r.get("stubs_created", 0) for r in target_results)
+        errors = [r["error"] for r in target_results if r.get("error")]
+        result["targets"] = target_results
+        result["edges_imported"] = total_edges
+        result["direct_edges"] = total_direct
+        result["indirect_edges"] = total_indirect
+        result["stubs_created"] = total_stubs
+        result["kamain_success"] = not errors
+        result["error"] = "; ".join(errors) if errors else None
+        result["timing_seconds"] = round(time.monotonic() - start, 2)
+        return result
+
+    cc_path = project_scripts_dir / "compile_commands.json"
     db_path = str(scan_dir / "functions.db")
 
     # --- Prerequisites ---
@@ -661,6 +973,15 @@ def main():
         "--no-recompile", action="store_true",
         help="Skip tier-3 recompilation (only use existing .bc/.o files)",
     )
+    comp_group = parser.add_mutually_exclusive_group()
+    comp_group.add_argument(
+        "--compositional", action="store_true", default=None,
+        help="Force compositional CFL analysis (requires link_units.json)",
+    )
+    comp_group.add_argument(
+        "--no-compositional", action="store_true",
+        help="Force monolithic analysis even when link_units.json is present",
+    )
     parser.add_argument(
         "--tier", type=int, default=None,
         help="Only process projects with this tier (1, 2, or 3)",
@@ -778,6 +1099,10 @@ def main():
         "total_stubs": 0,
     }
 
+    compositional: bool | None = (
+        False if args.no_compositional else (True if args.compositional else None)
+    )
+
     for i, project in enumerate(projects, 1):
         project_dir = project["project_dir"]
         print(f"[{i}/{len(projects)}] {project_dir}...", end=" ", flush=True)
@@ -793,6 +1118,7 @@ def main():
             include_stdlib=not args.no_stdlib,
             kamain_timeout=args.kamain_timeout,
             recompile=not args.no_recompile,
+            compositional=compositional,
             verbose=args.verbose,
         )
 
