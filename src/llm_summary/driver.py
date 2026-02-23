@@ -268,6 +268,14 @@ class BottomUpDriver:
                 if func is None:
                     continue
 
+                # Skip sourceless stubs (e.g. stdlib) — nothing to summarize
+                if not func.source:
+                    for p in passes:
+                        cached = p.get_cached(func_id, func)
+                        if cached is not None:
+                            results[p.name][func_id] = cached
+                    continue
+
                 # If incremental and function is not affected, load from cache
                 if affected is not None and func_id not in affected:
                     for p in passes:
