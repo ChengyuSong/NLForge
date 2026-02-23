@@ -289,17 +289,30 @@ class SummaryDB:
     # ========== Function Operations ==========
 
     def insert_function(self, func: Function) -> int:
-        """Insert a function and return its ID."""
+        """Insert a function and return its ID.
+
+        Uses ON CONFLICT DO UPDATE to preserve the existing row ID on re-scan,
+        so that foreign-key-referenced call_edges and summaries are not cascade-deleted.
+        Only source-derived columns are updated on conflict; summaries are left intact.
+        """
         import json as _json
         source_hash = compute_source_hash(func.source) if func.source else None
         params_json = _json.dumps(func.params) if func.params else None
         callsites_json = _json.dumps(func.callsites) if func.callsites else None
         cursor = self.conn.execute(
             """
-            INSERT OR REPLACE INTO functions
+            INSERT INTO functions
             (name, signature, canonical_signature, file_path, line_start, line_end,
              source, source_hash, params_json, callsites_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, signature, file_path) DO UPDATE SET
+              canonical_signature = excluded.canonical_signature,
+              line_start          = excluded.line_start,
+              line_end            = excluded.line_end,
+              source              = excluded.source,
+              source_hash         = excluded.source_hash,
+              params_json         = excluded.params_json,
+              callsites_json      = excluded.callsites_json
             """,
             (
                 func.name,
@@ -315,6 +328,13 @@ class SummaryDB:
             ),
         )
         self.conn.commit()
+        # ON CONFLICT DO UPDATE doesn't update lastrowid; fetch the real ID.
+        if cursor.lastrowid == 0:
+            row = self.conn.execute(
+                "SELECT id FROM functions WHERE name=? AND signature=? AND file_path=?",
+                (func.name, func.signature, func.file_path),
+            ).fetchone()
+            return row["id"] if row else 0
         return cursor.lastrowid
 
     def insert_functions_batch(self, functions: list[Function]) -> dict[Function, int]:
