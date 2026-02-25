@@ -68,6 +68,9 @@ Uses LLM to determine likely targets for indirect calls based on:
 - Code context
 - Address flow information
 
+#### Flow Summarizer (`indirect/flow_summarizer.py`)
+Uses LLM to analyze where function addresses flow to (struct fields, globals, callback registrations).
+
 ### 4. Topological Ordering (`ordering.py`)
 
 Computes processing order using Tarjan's SCC algorithm.
@@ -91,19 +94,25 @@ Abstraction layer for different LLM providers.
 - `ClaudeBackend`: Anthropic Claude API
 - `OpenAIBackend`: OpenAI API (also works with compatible APIs)
 - `OllamaBackend`: Local models via Ollama
+- `LlamaCppBackend`: Local models via llama.cpp server
+- `GeminiBackend`: Google Gemini API via Vertex AI
+
+**Thread pool:** `LLMPool` (`llm/pool.py`) — `ThreadPoolExecutor` wrapper for parallel LLM queries, used by `BottomUpDriver` when `-j` > 1.
 
 ### 6. Graph Traversal Driver (`driver.py`)
 
-Unified bottom-up traversal engine. Builds the call graph once, computes SCCs, and runs one or more summary passes over functions in topological order (callees first). When `--type allocation --type free` is used, both passes execute in a single traversal instead of duplicating graph construction. All four passes (`allocation`, `free`, `init`, `memsafe`) can run together.
+Unified bottom-up traversal engine. Builds the call graph once, computes SCCs, and runs one or more summary passes over functions in topological order (callees first). All five passes (`allocation`, `free`, `init`, `memsafe`, `verify`) can run together. Sourceless stubs (stdlib functions without bodies) are skipped from all passes.
 
 **Key classes:**
-- `BottomUpDriver`: Owns graph building (cached) and SCC traversal. `run(passes, force, dirty_ids)` executes all passes per function.
+- `BottomUpDriver`: Owns graph building (cached) and SCC traversal. `run(passes, force, dirty_ids, pool)` executes all passes per function.
 - `SummaryPass` (Protocol): Interface each pass implements — `get_cached()`, `summarize()`, `store()`
 - `AllocationPass`: Adapter wrapping `AllocationSummarizer`
 - `FreePass`: Adapter wrapping `FreeSummarizer`
 - `InitPass`: Adapter wrapping `InitSummarizer`
-- `MemsafePass`: Adapter wrapping `MemsafeSummarizer`
-- `VerificationPass`: Adapter wrapping `VerificationSummarizer`
+- `MemsafePass`: Adapter wrapping `MemsafeSummarizer` (accepts `alias_builder`)
+- `VerificationPass`: Adapter wrapping `VerificationSummarizer` (accepts `alias_builder`)
+
+**Parallel execution:** When `-j N` is given (N > 1), the driver uses `LLMPool` and `orderer.get_parallel_levels()` to execute functions at the same depth in the SCC DAG concurrently. Synchronizes at level boundaries to ensure transitive dependencies are resolved.
 
 **Incremental support:** When `dirty_ids` is provided, the driver computes the affected set (dirty functions + transitive callers via reverse edges) and only re-summarizes those; all others load from cache.
 
@@ -118,13 +127,14 @@ Per-function LLM summarization logic. Each summarizer builds a prompt from the f
 - `MemsafeSummarizer`: Safety contract (pre-condition) analysis
 - `VerificationSummarizer`: Cross-pass verification and contract simplification
 - `IncrementalSummarizer`: Handles source-change invalidation, delegates re-summarization to `BottomUpDriver`
+- `ExternalFunctionSummarizer` (`external_summarizer.py`): Generates summaries for functions without source code
 
 ### 8. Database (`db.py`)
 
 SQLite storage for all analysis data.
 
 **Tables:**
-- `functions`: Function metadata and source
+- `functions`: Function metadata, source, canonical signature, params JSON, callsites JSON
 - `allocation_summaries`: Generated allocation summaries as JSON
 - `free_summaries`: Generated free/deallocation summaries as JSON
 - `init_summaries`: Generated initialization summaries as JSON
@@ -133,16 +143,20 @@ SQLite storage for all analysis data.
 - `call_edges`: Call graph with callsite locations
 - `address_taken_functions`: Functions whose addresses are taken
 - `address_flows`: Where function addresses flow to
+- `address_flow_summaries`: LLM-generated address flow analysis
 - `indirect_callsites`: Indirect call expressions
-- `indirect_call_targets`: Resolved indirect call targets
+- `indirect_call_targets`: Resolved indirect call targets with confidence
+- `build_configs`: Project build system information
+- `container_summaries`: Container/collection function detection results
+- `typedefs`: Type declarations (typedef, using, struct/class/union)
 
 ### 9. Standard Library (`stdlib.py`)
 
 Pre-defined allocation, free, and initialization summaries for common C standard library functions.
 
 **Allocation summaries:**
-- Memory: `malloc`, `calloc`, `realloc`, `free`, `aligned_alloc`
-- Strings: `strdup`, `strndup`, `asprintf`
+- Memory: `malloc`, `calloc`, `realloc`, `reallocarray`, `aligned_alloc`
+- Strings: `strdup`, `strndup`, `asprintf`, `getline`
 - Files: `fopen`, `fdopen`, `tmpfile`, `opendir`
 - Memory mapping: `mmap`, `munmap`
 
@@ -155,12 +169,48 @@ Pre-defined allocation, free, and initialization summaries for common C standard
 **Memsafe summaries:**
 - `memcpy`, `memmove`, `memset`, `free`, `strlen`, `strcpy`, `strncpy`, `strcmp`, `snprintf`, `printf`, `fprintf`, `fwrite`, `fread`, `malloc`
 
-### 10. CLI (`cli.py`)
+### 10. V-Snapshot Alias Context (`vsnapshot.py`, `alias_context.py`)
+
+Integrates whole-program pointer aliasing data from external CFL analysis (kanalyzer) into the memsafe and verification passes.
+
+- **`VSnapshot`** (`vsnapshot.py`): Loads V-snapshot binary format — per-function alias sets showing which pointers may alias at each program point
+- **`AliasContextBuilder`** (`alias_context.py`): Builds alias context sections for LLM prompts from V-snapshot data. Groups aliasing pointers and annotates which fields/parameters may point to the same memory
+
+Used by `MemsafePass` and `VerificationPass` via the `alias_builder` parameter to improve precision of safety contract analysis.
+
+### 11. Allocator & Container Detection (`allocator.py`, `container.py`)
+
+Heuristic + LLM-based detection of project-specific patterns:
+
+- **`AllocatorDetector`** (`allocator.py`): Identifies custom allocator/deallocator functions (e.g., `g_malloc`, `png_malloc`)
+- **`ContainerDetector`** (`container.py`): Detects container/collection functions (e.g., list append, hash insert)
+
+### 12. Build-Learn System (`builder/`)
+
+LLM-driven incremental build system that can configure, build, and learn from C/C++ projects.
+
+**Key classes:**
+- `Builder` (`builder.py`): ReAct-loop agent that iteratively configures and builds projects using LLM tool calls
+- `AssemblyChecker` (`assembly_checker.py`): Detects standalone and inline assembly in build artifacts; supports iterative minimization
+- `ErrorAnalyzer` (`error_analyzer.py`): Parses build failures for actionable diagnostics
+- `ScriptGenerator` (`script_generator.py`): Auto-generates reproducible build scripts
+
+Supports CMake and Autotools projects. Assembly detection scans `compile_commands.json`, source files, and LLVM IR.
+
+### 13. Link-Unit Pipeline (`link_units/`)
+
+Batch analysis pipeline aware of build targets (executables, libraries).
+
+- **`LinkUnitDiscoverer`** (`discoverer.py`): Detects link units from `compile_commands.json` or build system
+- **`Pipeline`** (`pipeline.py`): Orchestrates per-target extract → summarize workflows
+- Enables dependency-aware analysis where shared libraries are analyzed before executables that link them
+
+### 14. CLI (`cli.py`)
 
 Command-line interface using Click.
 
 **Commands:**
-- `summarize`: Generate allocation, free, init, memsafe, and/or verify summaries (`--type allocation`, `--type free`, `--type init`, `--type memsafe`, `--type verify`)
+- `summarize`: Generate summaries (`--type allocation|free|init|memsafe|verify`, `-j N` for parallel)
 - `extract`: Function and call graph extraction only
 - `callgraph`: Export call graph
 - `show`: Display summaries
@@ -169,6 +219,17 @@ Command-line interface using Click.
 - `export`: Export to JSON
 - `init-stdlib`: Add stdlib summaries
 - `clear`: Clear database
+- `indirect-analyze`: Resolve indirect calls via LLM
+- `show-indirect`: Display indirect call analysis results
+- `container-analyze`: Detect container/collection functions
+- `show-containers`: Display container detection results
+- `find-allocator-candidates`: Identify custom allocator functions
+- `scan`: Comprehensive analysis using `compile_commands.json` (link-unit aware)
+- `build-learn`: Incremental project builder with LLM-driven ReAct loop
+- `generate-kanalyzer-script`: Generate kanalyzer analysis script
+- `import-callgraph`: Import external call graph (e.g., from kanalyzer)
+- `discover-link-units`: Detect build targets/link units
+- `import-dep-summaries`: Import summaries from dependency databases
 
 ## Data Flow
 
@@ -201,7 +262,8 @@ Command-line interface using Click.
    ├──▶ Build call graph + compute SCCs (once)
    ├──▶ Traverse in topological order (callees first)
    ├──▶ Run all registered passes per function:
-   │      AllocationPass, FreePass, InitPass, MemsafePass, etc.
+   │      AllocationPass, FreePass, InitPass, MemsafePass, VerificationPass
+   ├──▶ Optional: parallel execution across SCC levels (-j N)
    │
    ▼
 6. Summary Generation (LLM, per pass)
