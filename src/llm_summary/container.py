@@ -481,7 +481,7 @@ class ContainerDetector:
     def _build_prompt(self, func: Function, signals: list[str]) -> str:
         """Build the evidence-grounded LLM prompt for a function."""
         # Add line numbers to source
-        lines = (func.source or "").split('\n')
+        lines = (func.llm_source or "").split('\n')
         numbered = []
         for i, line in enumerate(lines, func.line_start or 1):
             numbered.append(f"{i:4d} | {line}")

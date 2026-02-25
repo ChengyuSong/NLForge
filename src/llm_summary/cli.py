@@ -1684,7 +1684,8 @@ def _source_files_for_target(
                    "/workspace/build -> build_dir.")
 @click.option("--db", "db_path", default="summaries.db", help="Database file path")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def scan(compile_commands_path, link_units_path, target_name, project_path, db_path, verbose):
+@click.option("--preprocess", is_flag=True, help="Run clang -E to expand macros and store preprocessed source")
+def scan(compile_commands_path, link_units_path, target_name, project_path, db_path, verbose, preprocess):
     """Extract functions, scan indirect call targets, and find callsites (no LLM).
 
     This command runs the pre-LLM scanner phases:
@@ -1779,7 +1780,12 @@ def scan(compile_commands_path, link_units_path, target_name, project_path, db_p
         # Phase 1: Extract functions
         console.print("\n[bold]Phase 1: Extracting functions[/bold]")
 
-        extractor = FunctionExtractor(compile_commands=compile_commands)
+        project_root = Path(project_path).resolve() if project_path else None
+        extractor = FunctionExtractor(
+            compile_commands=compile_commands,
+            project_root=project_root,
+            enable_preprocessing=preprocess,
+        )
         all_functions = []
         all_typedefs = []
         extract_errors = 0

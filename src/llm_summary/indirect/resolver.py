@@ -222,7 +222,7 @@ class IndirectCallResolver:
                 continue
 
             # Get first 10 lines of source
-            source_lines = func.source.split("\n")[:10] if func.source else []
+            source_lines = func.llm_source.split("\n")[:10] if func.source else []
             source_snippet = "\n".join(source_lines)
 
             # Get flow summary from Pass 1

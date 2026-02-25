@@ -172,7 +172,7 @@ class FlowSummarizer:
         prompt = FLOW_SUMMARY_PROMPT.format(
             func_name=func.name,
             address_flows_section=address_flows_section,
-            func_source=func.source or "(source not available)",
+            func_source=func.llm_source or "(source not available)",
             file_path=func.file_path,
             signature=signature,
         )
