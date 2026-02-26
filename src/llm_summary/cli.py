@@ -2373,6 +2373,20 @@ def discover_link_units(
                     console.print("[yellow]Using heuristic results only[/yellow]")
                     result = heuristic_result
 
+    # Populate bc_files for any link unit that only has objects (heuristic/agent path)
+    from .link_units.skills import map_objects_to_bc
+    result_build_dir = Path(result.get("build_dir", str(build_dir)))
+    for lu in result.get("link_units", []):
+        if not lu.get("bc_files") and lu.get("objects"):
+            bc_result = map_objects_to_bc(lu["objects"], result_build_dir)
+            lu["bc_files"] = [bc for bc in bc_result["mappings"].values() if bc is not None]
+            if verbose:
+                s = bc_result["stats"]
+                console.print(
+                    f"  [bc] {lu['name']}: {len(lu['bc_files'])} bc files "
+                    f"(tier1={s['tier1']}, tier2={s['tier2']}, missing={s['not_found']})"
+                )
+
     # Write output
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
