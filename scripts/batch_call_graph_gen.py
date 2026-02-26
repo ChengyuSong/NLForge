@@ -540,6 +540,7 @@ def process_project_compositional(
             output_json=None,
             kamain_bin=kamain_bin,
             cfl_compressed_output=cflcg_path,
+            cfl_compositional=True,
             allocator_file=allocator_file,
             container_file=container_file,
             timeout=kamain_timeout,
