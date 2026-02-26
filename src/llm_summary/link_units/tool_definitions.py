@@ -107,6 +107,25 @@ COMMAND_TOOL = {
     },
 }
 
+REQUEST_MORE_TURNS_TOOL = {
+    "name": "request_more_turns",
+    "description": (
+        "Request additional turns when running low but still making progress. "
+        "Use when you have identified some link units but need more turns to resolve "
+        "remaining targets. Grants 10 extra turns per call (max 10 extensions)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Why more turns are needed and what remains to be done.",
+            },
+        },
+        "required": ["reason"],
+    },
+}
+
 FINISH_TOOL = {
     "name": "finish",
     "description": "Call when done. Provide discovered link units. No .bc files needed.",
@@ -148,4 +167,4 @@ FINISH_TOOL = {
     },
 }
 
-DISCOVERY_TOOL_DEFINITIONS = FILE_TOOLS + SKILL_TOOLS + [COMMAND_TOOL, FINISH_TOOL]
+DISCOVERY_TOOL_DEFINITIONS = FILE_TOOLS + SKILL_TOOLS + [COMMAND_TOOL, REQUEST_MORE_TURNS_TOOL, FINISH_TOOL]

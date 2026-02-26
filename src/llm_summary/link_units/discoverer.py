@@ -26,11 +26,13 @@ from .skills import parse_ninja_targets, prescan_build_dir, run_ar_t
 from .tool_definitions import DISCOVERY_TOOL_DEFINITIONS
 
 # ReAct loop parameters
-BASE_TURNS = 10          # initial exploration overhead
-PER_TARGET_TURNS = 1.5   # turns per estimated link unit (Makefile read + ar_t + inspect)
-MIN_TURNS = 15
+BASE_TURNS = 12          # initial exploration overhead
+PER_TARGET_TURNS = 3     # turns per unresolved target (list + read Makefile + grep + verify)
+MIN_TURNS = 20
 MAX_CONTEXT_TOKENS = 100000
-TURNS_LOW_WARNING = 5
+TURNS_LOW_WARNING = 7
+TURNS_EXTENSION = 10     # extra turns granted per request_more_turns call
+MAX_TURN_EXTENSIONS = 10 # maximum extensions allowed
 
 # Docker paths (same convention as builder)
 DOCKER_WORKSPACE_SRC = "/workspace/src"
@@ -57,6 +59,7 @@ find, make -n, nm, readelf, etc.
 - Be efficient — you have a limited turn budget.
 - Call `finish()` as soon as you have identified the link units.
 - Prefer `finish(status='partial')` over running out of turns.
+- Call `request_more_turns` if you are still making progress but need more turns.
 """
 
 
@@ -173,6 +176,7 @@ class LinkUnitDiscoverer:
         recent_calls: list[str] = []  # track recent (name, input) for loop detection
         turn = 0
         nudge_count = 0
+        turn_extensions_used = 0
 
         while turn < self.max_turns:
             if response.stop_reason in ("end_turn", "stop"):
@@ -277,6 +281,25 @@ class LinkUnitDiscoverer:
                         if block.name == "finish":
                             finished = True
                             finish_result = block.input
+                        elif block.name == "request_more_turns":
+                            if turn_extensions_used < MAX_TURN_EXTENSIONS:
+                                self.max_turns += TURNS_EXTENSION
+                                turn_extensions_used += 1
+                                reason = block.input.get("reason", "")
+                                result = {
+                                    "granted": TURNS_EXTENSION,
+                                    "total_remaining": self.max_turns - turn - 1,
+                                    "extensions_used": turn_extensions_used,
+                                    "extensions_remaining": MAX_TURN_EXTENSIONS - turn_extensions_used,
+                                }
+                                if self.verbose:
+                                    print(f"[link-units] Granted {TURNS_EXTENSION} extra turns "
+                                          f"({turn_extensions_used}/{MAX_TURN_EXTENSIONS}): {reason[:100]}")
+                            else:
+                                result = {
+                                    "error": "Maximum extensions reached. Call finish() now.",
+                                    "extensions_used": turn_extensions_used,
+                                }
 
                         tool_results.append({
                             "type": "tool_result",
@@ -290,7 +313,8 @@ class LinkUnitDiscoverer:
                 remaining = self.max_turns - turn - 1
                 if remaining in (TURNS_LOW_WARNING, 1) and tool_results:
                     tool_results[-1]["content"] += (
-                        f"\n\n[SYSTEM] {remaining} turn(s) left. Call finish() now."
+                        f"\n\n[SYSTEM] {remaining} turn(s) left. "
+                        f"Call request_more_turns if still making progress, or finish() now."
                     )
 
                 messages.append({"role": "user", "content": tool_results})
@@ -395,6 +419,10 @@ class LinkUnitDiscoverer:
 
             elif name == "finish":
                 return {"status": "ok", "message": "Discovery complete."}
+
+            elif name == "request_more_turns":
+                # Handled by the ReAct loop; this path is only reached via _execute_tool
+                return {"acknowledged": True}
 
             else:
                 return {"error": f"Unknown tool: {name}"}
