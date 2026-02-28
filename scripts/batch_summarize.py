@@ -194,6 +194,7 @@ def _summarize_target(
             init_stdlib=init_stdlib,
             verbose=verbose,
             timeout=timeout,
+            vsnap_path=vsnap_path,
         )
         total_duration += dur
         if not ok:

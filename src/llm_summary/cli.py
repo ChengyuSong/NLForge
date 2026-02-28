@@ -178,6 +178,17 @@ def summarize(db_path, backend, model, llm_host, llm_port, disable_thinking, ver
         llm = create_backend(backend, model=model, **backend_kwargs)
         console.print(f"Using {backend} backend ({llm.model})")
 
+        # Load alias context builder early (needed for candidate confirmation + memsafe/verify)
+        alias_builder = None
+        if vsnap:
+            from .alias_context import AliasContextBuilder
+            alias_builder = AliasContextBuilder(vsnap, db)
+            if verbose:
+                console.print(f"  V-snapshot loaded: {vsnap} "
+                              f"(nodes={alias_builder.snap.node_count}, "
+                              f"reps={alias_builder.snap.rep_count}, "
+                              f"named={len(alias_builder.snap.named_entries)})")
+
         # Build passes list
         passes = []
         alloc_summarizer = None
@@ -194,6 +205,14 @@ def summarize(db_path, backend, model, llm_host, llm_port, disable_thinking, ver
                     allocators = alloc_data.get("candidates", [])
                 if allocators:
                     console.print(f"Custom allocators: {len(allocators)} loaded from {allocator_file}")
+
+                # Confirm candidates via vsnapshot alias analysis
+                if allocators and alias_builder:
+                    from .allocator import vsnapshot_confirm_allocators
+                    confirmed, remaining = vsnapshot_confirm_allocators(alias_builder.snap, allocators)
+                    console.print(f"  Vsnapshot alloc confirmation: {len(confirmed)} confirmed, "
+                                  f"{len(remaining)} unconfirmed (dropped)")
+                    allocators = confirmed
 
             alloc_summarizer = AllocationSummarizer(db, llm, verbose=verbose, log_file=log_llm, allocators=allocators)
             passes.append(AllocationPass(alloc_summarizer, db, llm.model))
@@ -212,6 +231,14 @@ def summarize(db_path, backend, model, llm_host, llm_port, disable_thinking, ver
                 if deallocators:
                     console.print(f"Custom deallocators: {len(deallocators)} loaded from {deallocator_file}")
 
+                # Confirm candidates via vsnapshot alias analysis
+                if deallocators and alias_builder:
+                    from .allocator import vsnapshot_confirm_deallocators
+                    dconfirmed, dremaining = vsnapshot_confirm_deallocators(alias_builder.snap, deallocators)
+                    console.print(f"  Vsnapshot dealloc confirmation: {len(dconfirmed)} confirmed, "
+                                  f"{len(dremaining)} unconfirmed (dropped)")
+                    deallocators = dconfirmed
+
             free_summarizer = FreeSummarizer(db, llm, verbose=verbose, log_file=log_llm, deallocators=deallocators)
             passes.append(FreePass(free_summarizer, db, llm.model))
 
@@ -221,17 +248,6 @@ def summarize(db_path, backend, model, llm_host, llm_port, disable_thinking, ver
 
             init_summarizer = InitSummarizer(db, llm, verbose=verbose, log_file=log_llm)
             passes.append(InitPass(init_summarizer, db, llm.model))
-
-        # Build alias context builder if --vsnap provided
-        alias_builder = None
-        if vsnap:
-            from .alias_context import AliasContextBuilder
-            alias_builder = AliasContextBuilder(vsnap, db)
-            if verbose:
-                console.print(f"  V-snapshot loaded: {vsnap} "
-                              f"(nodes={alias_builder.snap.node_count}, "
-                              f"reps={alias_builder.snap.rep_count}, "
-                              f"named={len(alias_builder.snap.named_entries)})")
 
         memsafe_summarizer = None
         if "memsafe" in summary_types:
@@ -1411,7 +1427,7 @@ def find_allocator_candidates(
         llm-summary find-allocator-candidates --db functions.db -o alloc.json --heuristic-only -v
         llm-summary find-allocator-candidates --db functions.db -o alloc.json --backend ollama --model qwen3
     """
-    from .allocator import STDLIB_ALLOCATORS, AllocatorDetector
+    from .allocator import STDLIB_ALLOCATORS, STDLIB_DEALLOCATORS, AllocatorDetector
 
     # Infer project name from DB path
     db_dir = Path(db_path).resolve().parent
@@ -1432,48 +1448,81 @@ def find_allocator_candidates(
                 db, llm=None, verbose=verbose, min_score=min_score,
                 project_name=project_name,
             )
-            scored = detector.heuristic_only()
+            alloc_scored, dealloc_scored = detector.heuristic_only()
 
-            if not scored:
+            if not alloc_scored and not dealloc_scored:
                 console.print("[yellow]No candidates found above threshold.[/yellow]")
-                output = {"candidates": [], "confirmed": []}
+                output = {"candidates": [], "confirmed": [],
+                          "dealloc_candidates": [], "dealloc_confirmed": []}
                 with open(output_path, "w") as f:
                     json.dump(output, f, indent=2)
                 console.print(f"Wrote empty result to {output_path}")
                 return
 
-            # Display results
-            table = Table(title=f"Allocator Candidates (score >= {min_score})")
-            table.add_column("Score", justify="right", style="green")
-            table.add_column("Function", style="cyan")
-            table.add_column("File", style="dim")
-            table.add_column("Signals")
+            # Display allocator results
+            if alloc_scored:
+                table = Table(title=f"Allocator Candidates (score >= {min_score})")
+                table.add_column("Score", justify="right", style="green")
+                table.add_column("Function", style="cyan")
+                table.add_column("File", style="dim")
+                table.add_column("Signals")
 
-            scored.sort(key=lambda x: x[1], reverse=True)
+                alloc_scored.sort(key=lambda x: x[1], reverse=True)
 
-            for func, score, signals in scored:
-                signal_strs = [s.split(": ", 1)[0] if ": " in s else s for s in signals]
-                table.add_row(
-                    str(score),
-                    func.name,
-                    Path(func.file_path).name if func.file_path else "?",
-                    ", ".join(signal_strs),
-                )
+                for func, score, signals in alloc_scored:
+                    signal_strs = [s.split(": ", 1)[0] if ": " in s else s for s in signals]
+                    table.add_row(
+                        str(score),
+                        func.name,
+                        Path(func.file_path).name if func.file_path else "?",
+                        ", ".join(signal_strs),
+                    )
 
-            console.print(table)
+                console.print(table)
 
-            candidate_names = [func.name for func, _, _ in scored]
+            # Display deallocator results
+            if dealloc_scored:
+                dtable = Table(title=f"Deallocator Candidates (score >= {min_score})")
+                dtable.add_column("Score", justify="right", style="green")
+                dtable.add_column("Function", style="cyan")
+                dtable.add_column("File", style="dim")
+                dtable.add_column("Signals")
+
+                dealloc_scored.sort(key=lambda x: x[1], reverse=True)
+
+                for func, score, signals in dealloc_scored:
+                    signal_strs = [s.split(": ", 1)[0] if ": " in s else s for s in signals]
+                    dtable.add_row(
+                        str(score),
+                        func.name,
+                        Path(func.file_path).name if func.file_path else "?",
+                        ", ".join(signal_strs),
+                    )
+
+                console.print(dtable)
+
+            candidate_names = [func.name for func, _, _ in alloc_scored]
+            dealloc_candidate_names = [func.name for func, _, _ in dealloc_scored]
             if include_stdlib:
                 for name in sorted(STDLIB_ALLOCATORS):
                     if name not in candidate_names:
                         candidate_names.append(name)
+                for name in sorted(STDLIB_DEALLOCATORS):
+                    if name not in dealloc_candidate_names:
+                        dealloc_candidate_names.append(name)
 
-            output = {"candidates": candidate_names, "confirmed": []}
+            output = {
+                "candidates": candidate_names,
+                "confirmed": [],
+                "dealloc_candidates": dealloc_candidate_names,
+                "dealloc_confirmed": [],
+            }
             with open(output_path, "w") as f:
                 json.dump(output, f, indent=2)
 
             stats = detector.stats
-            console.print(f"\nTotal candidates: {len(candidate_names)}")
+            console.print(f"\nAlloc candidates: {len(candidate_names)}")
+            console.print(f"Dealloc candidates: {len(dealloc_candidate_names)}")
             console.print(f"Functions scanned: {stats['functions_scanned']}")
             console.print(f"Wrote {output_path}")
             return
@@ -1493,22 +1542,32 @@ def find_allocator_candidates(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Detecting allocator functions...", total=None)
-            candidates, confirmed = detector.detect_all(include_stdlib=include_stdlib)
+            task = progress.add_task("Detecting allocator/deallocator functions...", total=None)
+            candidates, confirmed, dealloc_candidates, dealloc_confirmed = detector.detect_all(
+                include_stdlib=include_stdlib
+            )
             progress.update(task, completed=True)
 
         # All go into candidates for KAMain to verify; confirmed is left empty for KAMain to populate
         all_candidates = confirmed + candidates
-        output = {"candidates": all_candidates, "confirmed": []}
+        all_dealloc = dealloc_confirmed + dealloc_candidates
+        output = {
+            "candidates": all_candidates,
+            "confirmed": [],
+            "dealloc_candidates": all_dealloc,
+            "dealloc_confirmed": [],
+        }
         with open(output_path, "w") as f:
             json.dump(output, f, indent=2)
 
         stats = detector.stats
-        console.print("\nAllocator detection complete:")
+        console.print("\nAllocator/deallocator detection complete:")
         console.print(f"  Functions scanned: {stats['functions_scanned']}")
-        console.print(f"  Candidates (score >= {min_score}): {stats['candidates']}")
-        console.print(f"  LLM calls: {stats['llm_calls']}")
+        console.print(f"  Alloc candidates (score >= {min_score}): {stats['candidates']}")
         console.print(f"  Confirmed allocators: {stats['confirmed']}")
+        console.print(f"  Dealloc candidates (score >= {min_score}): {stats['dealloc_candidates']}")
+        console.print(f"  Confirmed deallocators: {stats['dealloc_confirmed']}")
+        console.print(f"  LLM calls: {stats['llm_calls']}")
         if stats["input_tokens"] > 0 or stats["output_tokens"] > 0:
             total_tok = stats['input_tokens'] + stats['output_tokens']
             console.print(f"  Tokens: {total_tok:,} ({stats['input_tokens']:,} in + {stats['output_tokens']:,} out)")
