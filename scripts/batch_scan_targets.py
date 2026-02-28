@@ -97,9 +97,17 @@ def _source_files_for_bc(
     for entry in cc_entries:
         output = entry.get("output", "")
         src = entry.get("file", "")
-        if not (output and src and Path(src).suffix.lower() in C_EXTENSIONS):
+        if not (src and Path(src).suffix.lower() in C_EXTENSIONS):
             continue
-        out_path = Path(output)
+        if output:
+            out_path = Path(output)
+        else:
+            # bear sometimes omits output when -o is absent (implicit naming).
+            # Default: compiler writes <stem>.o into the directory field.
+            directory = entry.get("directory", "")
+            if not directory:
+                continue
+            out_path = Path(directory) / (Path(src).stem + ".o")
         # Make relative to build_dir if absolute
         if out_path.is_absolute():
             try:

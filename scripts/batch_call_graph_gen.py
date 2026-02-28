@@ -462,6 +462,108 @@ def import_callgraph(
 # ---------------------------------------------------------------------------
 
 
+def _process_single_link_unit(
+    lu: dict,
+    func_scans_dir: Path,
+    project_name: str,
+    kamain_bin: str,
+    allocator_file: Path | None = None,
+    container_file: Path | None = None,
+    kamain_timeout: int = 3600,
+    verbose: bool = False,
+) -> list[dict]:
+    """Fast path for projects with a single link unit (no compositional split).
+
+    Runs a single KAMain invocation with --cfl-compositional but without the
+    redundant compress-then-compose two-phase split.
+    """
+    target = lu["name"]
+    bc_files = [Path(p) for p in lu.get("bc_files", []) if Path(p).exists()]
+    project_scan_dir = func_scans_dir / project_name
+    target_dir = project_scan_dir / target
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    result: dict = {
+        "target": target,
+        "type": lu.get("type", "unknown"),
+        "bc_files": len(bc_files),
+        "phase1_success": True,   # no separate phase 1
+        "phase2_success": False,
+        "edges_imported": 0,
+        "direct_edges": 0,
+        "indirect_edges": 0,
+        "stubs_created": 0,
+        "timing_seconds": 0.0,
+        "error": None,
+    }
+    start = time.monotonic()
+
+    if not bc_files:
+        result["error"] = "no_bc_files"
+        result["timing_seconds"] = round(time.monotonic() - start, 2)
+        return [result]
+
+    callgraph_json = target_dir / "callgraph.json"
+    vsnapshot_path = target_dir / f"{target}.vsnap"
+
+    if verbose:
+        print(
+            f"      [{target}] Single link unit: {len(bc_files)} bc files "
+            f"-> {callgraph_json.name}"
+        )
+
+    ok, err, dur = run_kamain(
+        bc_files=bc_files,
+        output_json=callgraph_json,
+        kamain_bin=kamain_bin,
+        cfl_compositional=True,
+        snapshot_path=vsnapshot_path,
+        allocator_file=allocator_file,
+        container_file=container_file,
+        timeout=kamain_timeout,
+        verbose=verbose,
+    )
+
+    result["phase2_success"] = ok
+    if not ok:
+        result["error"] = f"kamain_failed: {err}"
+        result["timing_seconds"] = round(time.monotonic() - start, 2)
+        return [result]
+
+    if verbose:
+        print(f"      [{target}] Done in {dur:.1f}s")
+
+    # --- Import callgraph into per-target DB ---
+    db_path = str(target_dir / "functions.db")
+    if not Path(db_path).exists():
+        result["error"] = "no_per_target_db (run scan --link-units first)"
+        result["timing_seconds"] = round(time.monotonic() - start, 2)
+        return [result]
+
+    try:
+        import_stats = import_callgraph(
+            json_path=callgraph_json,
+            db_path=db_path,
+            clear_edges=True,
+            verbose=verbose,
+        )
+        result.update(import_stats)
+        if verbose:
+            print(
+                f"      [{target}] Imported: {import_stats['edges_imported']} edges "
+                f"({import_stats['direct_edges']}d+{import_stats['indirect_edges']}i)"
+            )
+    except Exception as e:
+        result["error"] = f"import_failed: {e}"
+
+    lu["db_path"] = str(target_dir / "functions.db")
+    lu["callgraph_json"] = str(callgraph_json)
+    lu["vsnapshot"] = str(vsnapshot_path) if vsnapshot_path.exists() else None
+
+    result["timing_seconds"] = round(time.monotonic() - start, 2)
+    return [result]
+
+
 def process_project_compositional(
     project_name: str,
     link_units_path: Path,
@@ -490,6 +592,23 @@ def process_project_compositional(
         return [{"target": project_name, "error": "link_units.json has no targets"}]
 
     link_units = topo_sort_link_units(raw_units)
+
+    # Optimisation: when there is only a single link unit, the two-phase
+    # compositional split is redundant (Phase 2 would feed the exact same
+    # bc_files back).  Fall back to a single direct KAMain invocation.
+    if len(link_units) == 1:
+        results = _process_single_link_unit(
+            link_units[0],
+            func_scans_dir=func_scans_dir,
+            project_name=project_name,
+            kamain_bin=kamain_bin,
+            allocator_file=allocator_file,
+            container_file=container_file,
+            kamain_timeout=kamain_timeout,
+            verbose=verbose,
+        )
+        update_link_units_file(link_units_path, lu_data)
+        return results
 
     # Map name -> link unit (for transitive dep traversal)
     by_name = {lu["name"]: lu for lu in link_units}
@@ -888,7 +1007,7 @@ def process_project(
 def _format_result(r: dict) -> str:
     """Format a single result for console output."""
     if r["error"]:
-        return f"SKIP ({r['error'][:80]})"
+        return f"SKIP ({r['error'][:200]})"
     parts = [
         f"{r['bc_files']} bc",
         f"T1:{r['bc_tier1']}/T2:{r['bc_tier2']}/T3:{r['bc_tier3']}",

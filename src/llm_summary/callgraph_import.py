@@ -98,6 +98,22 @@ def _extract_base_name(demangled: str) -> str:
     return parts[-1]
 
 
+_DOCKER_PATH_PREFIXES = ("/workspace/src/", "/workspace/build/")
+
+
+def _strip_docker_prefix(path: str) -> str:
+    """Strip Docker container path prefixes from a file path.
+
+    KAMain reads debug info from .bc files compiled inside Docker, so function
+    keys and file fields carry /workspace/src/ or /workspace/build/ prefixes.
+    Strip them so that suffix matching against host paths in the DB works.
+    """
+    for prefix in _DOCKER_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
 def _parse_ka_function_key(key: str) -> tuple[str | None, str]:
     """Parse a KAMain function key into (file_path, func_name).
 
@@ -242,8 +258,10 @@ class CallGraphImporter:
             return self._id_cache[ka_key]
 
         file_path, raw_name = _parse_ka_function_key(ka_key)
+        if file_path:
+            file_path = _strip_docker_prefix(file_path)
         name = _normalize_callee_name(raw_name)
-        ka_file = ka_info.get("file", file_path or "")
+        ka_file = _strip_docker_prefix(ka_info.get("file", file_path or ""))
         ka_linkage = ka_info.get("linkage", "external")
         ka_line_start = ka_info.get("line_start", 0)
         ka_line_end = ka_info.get("line_end", 0)
@@ -309,8 +327,12 @@ class CallGraphImporter:
 def _file_suffix(path: str, components: int = 3) -> str:
     """Get the last N path components as a suffix for matching.
 
+    Strips Docker container path prefixes first so that paths like
+    '/workspace/src/dh.c' match host-path DB entries ending in 'dh.c'.
+
     E.g., '/magma/targets/libpng/repo/png.c' -> 'repo/png.c' (components=2)
     """
+    path = _strip_docker_prefix(path)
     parts = Path(path).parts
     if len(parts) <= components:
         return path
