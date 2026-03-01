@@ -36,19 +36,120 @@ def _entry_func_name(entry: NamedEntry) -> str | None:
     return None
 
 
+def _word_in_line(word: str, line: str) -> bool:
+    """Check if *word* appears as a whole word in *line* (no regex)."""
+    wlen = len(word)
+    start = 0
+    while True:
+        idx = line.find(word, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not (line[idx - 1].isalnum() or line[idx - 1] == "_")
+        end = idx + wlen
+        after_ok = end >= len(line) or not (line[end].isalnum() or line[end] == "_")
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
+
+def _aliased_param_names(func: Function, group: AliasGroup) -> list[str]:
+    """Return parameter names of *func* that participate in the alias group."""
+    names: list[str] = []
+    for entry in group.entries:
+        if entry.kind != 3:  # only args
+            continue
+        if _entry_func_name(entry) != func.name:
+            continue
+        # entry.name is like "funcname::arg#2"
+        suffix = entry.name.rsplit("#", 1)[-1]
+        try:
+            idx = int(suffix)
+        except ValueError:
+            continue
+        if idx < len(func.params) and func.params[idx] not in names:
+            names.append(func.params[idx])
+    return names
+
+
+def _extract_relevant_lines(
+    source: str, param_names: list[str], context: int = 2
+) -> str:
+    """Extract function signature + lines referencing aliased params.
+
+    Always includes the signature lines (everything up to and including the
+    opening '{'). Then includes lines mentioning any of *param_names* with
+    ±context surrounding lines.
+
+    Falls back to full source if param_names is empty or the heuristic
+    matches almost everything (>80%).
+    """
+    if not param_names:
+        return source
+
+    # Skip very short names (1 char) — too noisy
+    usable = [p for p in param_names if len(p) >= 2]
+    if not usable:
+        return source
+
+    lines = source.splitlines()
+    matched: set[int] = set()
+
+    # Always include signature: lines until we see '{'
+    sig_end = 0
+    for i, line in enumerate(lines):
+        matched.add(i)
+        sig_end = i
+        if "{" in line:
+            break
+
+    # Scan remaining lines for param references
+    for i in range(sig_end + 1, len(lines)):
+        for pname in usable:
+            if _word_in_line(pname, lines[i]):
+                matched.add(i)
+                break
+
+    if len(matched) >= len(lines) * 0.8:
+        return source  # almost everything matched, just use full source
+
+    # Expand with context
+    expanded: set[int] = set()
+    for i in matched:
+        for j in range(max(0, i - context), min(len(lines), i + context + 1)):
+            expanded.add(j)
+
+    # Build output with ... separators for gaps
+    result: list[str] = []
+    prev = -2
+    for i in sorted(expanded):
+        if i > prev + 1 and result:
+            result.append("    ...")
+        result.append(lines[i])
+        prev = i
+
+    return "\n".join(result)
+
+
 class AliasContextBuilder:
     """Builds alias context sections from V-snapshot data."""
 
     def __init__(
-        self, vsnap_path: str, db: SummaryDB, max_candidates: int = 3
+        self,
+        vsnap_path: str,
+        db: SummaryDB,
+        max_candidates: int = 3,
+        alloc_candidates_path: str | None = None,
     ):
         self.snap = VSnapshot.load(vsnap_path)
         self.db = db
         self.max_candidates = max_candidates
+        self._alloc_candidates_path = alloc_candidates_path
         # Index: rep → list of named entries with that rep
         self._rep_to_entries: dict[int, list[NamedEntry]] | None = None
         # Index: function name → set of reps for its entries
         self._func_to_reps: dict[str, set[int]] | None = None
+        # Reps to exclude from alias expansion (allocator returns, deallocator args)
+        self._heap_reps: set[int] | None = None
 
     def _build_index(self) -> None:
         """Build indexes from named entries (kinds 2/3/6/7)."""
@@ -65,6 +166,68 @@ class AliasContextBuilder:
             if func_name:
                 self._func_to_reps[func_name].add(rep)
 
+        self._heap_reps = self._find_heap_reps()
+
+    def _find_heap_reps(self) -> set[int]:
+        """Identify reps for allocator return values and deallocator args.
+
+        These alias with every heap object in the program and produce
+        useless noise in the alias context.
+        """
+        import json
+
+        allocator_names: set[str] = set()
+        deallocator_names: set[str] = set()
+
+        # Query DB for functions with returned allocations → allocators
+        rows = self.db.conn.execute(
+            "SELECT f.name, a.summary_json "
+            "FROM allocation_summaries a "
+            "JOIN functions f ON f.id = a.function_id"
+        ).fetchall()
+        for name, summary_json in rows:
+            data = json.loads(summary_json)
+            if any(a.get("returned") for a in data.get("allocations", [])):
+                allocator_names.add(name)
+
+        # Query DB for functions with free operations → deallocators
+        rows = self.db.conn.execute(
+            "SELECT f.name, a.summary_json "
+            "FROM free_summaries a "
+            "JOIN functions f ON f.id = a.function_id"
+        ).fetchall()
+        for name, summary_json in rows:
+            data = json.loads(summary_json)
+            if data.get("frees"):
+                deallocator_names.add(name)
+
+        # Also load from allocator candidates JSON if available
+        if self._alloc_candidates_path:
+            try:
+                with open(self._alloc_candidates_path) as f:
+                    cands = json.load(f)
+                for name in cands.get("candidates", []) + cands.get("confirmed", []):
+                    allocator_names.add(name)
+                for name in cands.get("dealloc_candidates", []) + cands.get("dealloc_confirmed", []):
+                    deallocator_names.add(name)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        # Collect reps to exclude
+        heap_reps: set[int] = set()
+        for entry in self.snap.named_entries:
+            func_name = _entry_func_name(entry)
+            if func_name is None:
+                continue
+            # Allocator return values (kind 6 = ret:funcname)
+            if entry.kind == 6 and func_name in allocator_names:
+                heap_reps.add(self.snap.rep(entry.node))
+            # Deallocator first arg (kind 3 = funcname::arg#0)
+            if entry.kind == 3 and entry.name.endswith("::arg#0") and func_name in deallocator_names:
+                heap_reps.add(self.snap.rep(entry.node))
+
+        return heap_reps
+
     def _find_aliased_functions(
         self, query_names: set[str]
     ) -> AliasGroup:
@@ -76,10 +239,12 @@ class AliasContextBuilder:
         if self._rep_to_entries is None or self._func_to_reps is None:
             self._build_index()
 
-        # Collect all reps for query functions
+        # Collect all reps for query functions, excluding heap-level reps
+        # (allocator returns, deallocator args) that alias with everything.
         query_reps: set[int] = set()
         for name in query_names:
-            query_reps |= self._func_to_reps.get(name, set())
+            reps = self._func_to_reps.get(name, set())
+            query_reps |= (reps - self._heap_reps)
 
         if not query_reps:
             return AliasGroup()
@@ -185,12 +350,11 @@ class AliasContextBuilder:
             if e.kind in (3, 6, 7) and _entry_func_name(e) == func_name
         ]
 
-        # Collect entries for target/callees
+        # Collect entries for target/callees (exclude globals — too noisy)
         query_set = {target_func} | callee_names
         related_entries = [
             e for e in group.entries
-            if (e.kind == 2)  # globals always relevant
-            or (e.kind in (3, 6, 7) and _entry_func_name(e) in query_set)
+            if e.kind in (3, 6, 7) and _entry_func_name(e) in query_set
         ]
 
         for ce in cand_entries:
@@ -210,15 +374,10 @@ class AliasContextBuilder:
                 seen.add(pair_key)
 
                 rel_func = _entry_func_name(re_)
-                # Skip noisy string literal globals
-                if re_.kind == 2 and re_.name.startswith(".str"):
-                    continue
 
                 note = ""
                 if rel_func and rel_func in callee_names and rel_func != target_func:
                     note = "  (callee)"
-                elif re_.kind == 2:
-                    note = "  (global)"
 
                 lines.append(f"  - {ce.name}  \u2194  {re_.name}{note}")
 
@@ -250,7 +409,9 @@ class AliasContextBuilder:
                 parts.extend(annotations)
             parts.append("")
             if cand.source:
-                parts.append(f"```c\n{cand.source}\n```\n")
+                pnames = _aliased_param_names(cand, group)
+                src = _extract_relevant_lines(cand.source, pnames)
+                parts.append(f"```c\n{src}\n```\n")
 
         parts.append(
             "When a callee's contract references a field path (e.g., "
@@ -273,6 +434,11 @@ class AliasContextBuilder:
         """
         if self._rep_to_entries is None:
             self._build_index()
+
+        # Skip alias context for mega-functions — too many callees make
+        # the annotation cross-product useless noise.
+        if len(callee_names) > 30:
+            return None
 
         query_names = {func.name} | set(callee_names)
         group = self._find_aliased_functions(query_names)

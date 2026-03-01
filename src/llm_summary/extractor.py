@@ -412,6 +412,12 @@ class FunctionExtractor:
                                 for arg_cursor in children[1:]:
                                     tokens = list(arg_cursor.get_tokens())
                                     arg_text = " ".join(t.spelling for t in tokens) if tokens else arg_cursor.spelling or ""
+                                    # get_tokens() can return the entire macro
+                                    # expansion; fall back to raw source text.
+                                    if len(arg_text) > 200:
+                                        raw = self._get_raw_extent_text(arg_cursor, raw_lines)
+                                        if raw:
+                                            arg_text = raw
                                     if arg_text:
                                         args.append(arg_text)
 
@@ -427,6 +433,25 @@ class FunctionExtractor:
 
         walk(func_cursor)
         return callsites
+
+    @staticmethod
+    def _get_raw_extent_text(cursor: Cursor, raw_lines: list[str]) -> str:
+        """Extract raw source text for a cursor's extent from file lines."""
+        if not cursor.extent or not cursor.extent.start.file:
+            return ""
+        sl = cursor.extent.start.line - 1
+        sc = cursor.extent.start.column - 1
+        el = cursor.extent.end.line - 1
+        ec = cursor.extent.end.column - 1
+        if sl < 0 or el >= len(raw_lines):
+            return ""
+        if sl == el:
+            return raw_lines[sl][sc:ec]
+        parts = [raw_lines[sl][sc:]]
+        for i in range(sl + 1, el):
+            parts.append(raw_lines[i])
+        parts.append(raw_lines[el][:ec])
+        return "\n".join(parts)
 
     # -- Block extraction helpers ------------------------------------------------
 
@@ -544,20 +569,25 @@ class FunctionExtractor:
         # Sort by start line
         spans.sort(key=lambda s: s[0])
 
-        # Group small spans with adjacent ones
+        # Group small spans with adjacent ones.
+        # Use cur_code_lines (sum of each span's own line count) rather than
+        # the file-extent distance, so that gaps from comments don't prematurely
+        # stop merging in heavily-commented code like sqlite3.
         groups: list[tuple[int, int]] = []  # (start_line, end_line) of each group
         cur_start, cur_end, _ = spans[0]
+        cur_code_lines = spans[0][1] - spans[0][0] + 1
         for i in range(1, len(spans)):
             s, e, _ = spans[i]
-            cur_span_lines = cur_end - cur_start + 1
             next_span_lines = e - s + 1
-            if cur_span_lines < self._MIN_BLOCK_LINES and next_span_lines < self._MIN_BLOCK_LINES:
+            if cur_code_lines < self._MIN_BLOCK_LINES and next_span_lines < self._MIN_BLOCK_LINES:
                 # Merge: extend current group
                 cur_end = max(cur_end, e)
+                cur_code_lines += next_span_lines
             else:
                 # Flush current group
                 groups.append((cur_start, cur_end))
                 cur_start, cur_end = s, e
+                cur_code_lines = next_span_lines
         groups.append((cur_start, cur_end))
 
         # Build FunctionBlock for each group
