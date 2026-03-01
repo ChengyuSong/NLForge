@@ -505,27 +505,9 @@ class MemsafeSummarizer:
 
     def _parse_response(self, response: str, func_name: str) -> MemsafeSummary:
         """Parse LLM response into MemsafeSummary."""
-        # Extract JSON from response
-        json_match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-            else:
-                return MemsafeSummary(
-                    function_name=func_name,
-                    description="Failed to parse LLM response",
-                )
+        from .builder.json_utils import extract_json
 
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            return MemsafeSummary(
-                function_name=func_name,
-                description=f"JSON parse error: {e}",
-            )
+        data = extract_json(response)
 
         # Parse contracts
         _VALID_KINDS = {"not_null", "not_freed", "initialized", "buffer_size"}

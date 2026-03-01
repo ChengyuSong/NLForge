@@ -591,27 +591,9 @@ class VerificationSummarizer:
 
     def _parse_response(self, response: str, func_name: str) -> VerificationSummary:
         """Parse LLM response into VerificationSummary."""
-        # Extract JSON from response
-        json_match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-            else:
-                return VerificationSummary(
-                    function_name=func_name,
-                    description="Failed to parse LLM response",
-                )
+        from .builder.json_utils import extract_json
 
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            return VerificationSummary(
-                function_name=func_name,
-                description=f"JSON parse error: {e}",
-            )
+        data = extract_json(response)
 
         # Parse simplified contracts
         contracts = []
