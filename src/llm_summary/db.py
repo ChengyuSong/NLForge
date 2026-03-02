@@ -226,6 +226,21 @@ CREATE INDEX IF NOT EXISTS idx_build_configs_name ON build_configs(project_name)
 CREATE INDEX IF NOT EXISTS idx_container_summaries_function ON container_summaries(function_id);
 CREATE INDEX IF NOT EXISTS idx_typedefs_name ON typedefs(name);
 
+-- Issue reviews (human annotations on verification issues)
+CREATE TABLE IF NOT EXISTS issue_reviews (
+    id INTEGER PRIMARY KEY,
+    function_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+    issue_index INTEGER NOT NULL,
+    issue_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(function_id, issue_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_issue_reviews_function ON issue_reviews(function_id);
+CREATE INDEX IF NOT EXISTS idx_issue_reviews_status ON issue_reviews(status);
+
 -- Function blocks (switch-case chunks for large function summarization)
 CREATE TABLE IF NOT EXISTS function_blocks (
     id INTEGER PRIMARY KEY,
@@ -952,6 +967,64 @@ class SummaryDB:
             description=data.get("description", ""),
         )
 
+    # ========== Issue Review Operations ==========
+
+    def upsert_issue_review(
+        self,
+        function_id: int,
+        issue_index: int,
+        fingerprint: str,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        """Insert or update a review for a verification issue."""
+        self.conn.execute(
+            """
+            INSERT INTO issue_reviews
+                (function_id, issue_index, issue_fingerprint, status, reason)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(function_id, issue_fingerprint) DO UPDATE SET
+                issue_index = excluded.issue_index,
+                status      = excluded.status,
+                reason      = excluded.reason,
+                updated_at  = CURRENT_TIMESTAMP
+            """,
+            (function_id, issue_index, fingerprint, status, reason),
+        )
+        self.conn.commit()
+
+    def get_issue_reviews(self, function_id: int) -> list[dict[str, Any]]:
+        """Return all issue reviews for a function."""
+        rows = self.conn.execute(
+            """
+            SELECT id, function_id, issue_index, issue_fingerprint,
+                   status, reason, created_at, updated_at
+            FROM issue_reviews
+            WHERE function_id = ?
+            ORDER BY issue_index
+            """,
+            (function_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_issue_reviews_by_fingerprints(
+        self, function_id: int, fingerprints: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Look up reviews for a set of fingerprints.  Returns {fingerprint: row_dict}."""
+        if not fingerprints:
+            return {}
+        placeholders = ",".join("?" for _ in fingerprints)
+        rows = self.conn.execute(
+            f"""
+            SELECT id, function_id, issue_index, issue_fingerprint,
+                   status, reason, created_at, updated_at
+            FROM issue_reviews
+            WHERE function_id = ? AND issue_fingerprint IN ({placeholders})
+            """,
+            [function_id, *fingerprints],
+        ).fetchall()
+        return {r["issue_fingerprint"]: dict(r) for r in rows}
+
     # ========== Call Graph Operations ==========
 
     def add_call_edge(self, edge: CallEdge) -> int:
@@ -1573,6 +1646,7 @@ class SummaryDB:
             "container_summaries",
             "typedefs",
             "build_configs",
+            "issue_reviews",
         ]
         for table in tables:
             row = self.conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()

@@ -2601,5 +2601,196 @@ def import_dep_summaries(db_path, dep_db_paths, force, verbose):
         target_db.close()
 
 
+@main.command("review-issue")
+@click.argument("function_name")
+@click.argument("issue_index", type=int)
+@click.option("--db", "db_path", required=True, help="Database file path")
+@click.option(
+    "--status",
+    "review_status",
+    required=True,
+    type=click.Choice(["pending", "confirmed", "false_positive", "wontfix"]),
+    help="Review status to set",
+)
+@click.option("--reason", default=None, help="Reviewer explanation")
+@click.option("--signature", default=None, help="Function signature for disambiguation")
+def review_issue(function_name, issue_index, db_path, review_status, reason, signature):
+    """Mark a verification issue as confirmed, false_positive, or wontfix.
+
+    Example:
+        llm-summary review-issue sftp_path_append 0 \\
+          --status false_positive \\
+          --reason "short-circuit eval guards this" \\
+          --db func-scans/openssh/scp/functions.db
+    """
+    db = SummaryDB(db_path)
+
+    try:
+        # Resolve function
+        functions = db.get_function_by_name(function_name)
+        if not functions:
+            console.print(f"[red]Function '{function_name}' not found in database.[/red]")
+            sys.exit(1)
+
+        if signature:
+            functions = [f for f in functions if f.signature == signature]
+            if not functions:
+                console.print(f"[red]No function '{function_name}' with signature '{signature}'.[/red]")
+                sys.exit(1)
+
+        if len(functions) > 1:
+            console.print(f"[yellow]Multiple functions named '{function_name}':[/yellow]")
+            for f in functions:
+                console.print(f"  {f.signature}  ({f.file_path}:{f.line_start})")
+            console.print("Use --signature to disambiguate.")
+            sys.exit(1)
+
+        func = functions[0]
+
+        # Load verification summary
+        vsummary = db.get_verification_summary_by_function_id(func.id)
+        if not vsummary:
+            console.print(f"[red]No verification summary for '{function_name}'. Run verify pass first.[/red]")
+            sys.exit(1)
+
+        if not vsummary.issues:
+            console.print(f"[yellow]'{function_name}' has no issues.[/yellow]")
+            return
+
+        if issue_index < 0 or issue_index >= len(vsummary.issues):
+            console.print(
+                f"[red]Invalid issue_index {issue_index}. "
+                f"'{function_name}' has {len(vsummary.issues)} issue(s) (0-{len(vsummary.issues) - 1}).[/red]"
+            )
+            sys.exit(1)
+
+        issue = vsummary.issues[issue_index]
+        fp = issue.fingerprint()
+
+        db.upsert_issue_review(
+            function_id=func.id,
+            issue_index=issue_index,
+            fingerprint=fp,
+            status=review_status,
+            reason=reason,
+        )
+
+        console.print(
+            f"[green]Marked issue #{issue_index} of '{function_name}' as {review_status}[/green]"
+        )
+        console.print(f"  kind: {issue.issue_kind}")
+        console.print(f"  location: {issue.location}")
+        console.print(f"  fingerprint: {fp}")
+        if reason:
+            console.print(f"  reason: {reason}")
+
+    finally:
+        db.close()
+
+
+@main.command("show-issues")
+@click.option("--db", "db_path", required=True, help="Database file path")
+@click.option("--name", default=None, help="Filter by function name")
+@click.option(
+    "--status",
+    "filter_status",
+    default=None,
+    type=click.Choice(["pending", "confirmed", "false_positive", "wontfix"]),
+    help="Filter by review status",
+)
+@click.option("--severity", default=None, type=click.Choice(["high", "medium", "low"]), help="Filter by severity")
+@click.option("--format", "fmt", type=click.Choice(["table", "json"]), default="table")
+def show_issues(db_path, name, filter_status, severity, fmt):
+    """List all verification issues with their review status.
+
+    Example:
+        llm-summary show-issues --db func-scans/openssh/scp/functions.db
+        llm-summary show-issues --db ... --status false_positive
+        llm-summary show-issues --db ... --severity high --status pending
+        llm-summary show-issues --db ... --name sftp_path_append
+    """
+    db = SummaryDB(db_path)
+
+    try:
+        functions = db.get_all_functions()
+
+        if name:
+            functions = [f for f in functions if name in f.name]
+
+        rows = []
+        for func in functions:
+            vsummary = db.get_verification_summary_by_function_id(func.id)
+            if not vsummary or not vsummary.issues:
+                continue
+
+            # Build fingerprint->review lookup
+            fingerprints = [iss.fingerprint() for iss in vsummary.issues]
+            reviews = db.get_issue_reviews_by_fingerprints(func.id, fingerprints)
+
+            for idx, issue in enumerate(vsummary.issues):
+                fp = issue.fingerprint()
+                review = reviews.get(fp)
+                issue_status = review["status"] if review else "pending"
+                issue_reason = review["reason"] if review else None
+
+                if severity and issue.severity != severity:
+                    continue
+                if filter_status and issue_status != filter_status:
+                    continue
+
+                rows.append({
+                    "function": func.name,
+                    "file": Path(func.file_path).name,
+                    "index": idx,
+                    "severity": issue.severity,
+                    "kind": issue.issue_kind,
+                    "status": issue_status,
+                    "description": issue.description,
+                    "reason": issue_reason,
+                    "fingerprint": fp,
+                    "location": issue.location,
+                })
+
+        if fmt == "json":
+            console.print(json.dumps(rows, indent=2))
+        else:
+            table = Table(title=f"Verification Issues ({len(rows)})")
+            table.add_column("Function", style="cyan")
+            table.add_column("File", style="dim")
+            table.add_column("#", justify="right")
+            table.add_column("Sev", style="bold")
+            table.add_column("Kind")
+            table.add_column("Status")
+            table.add_column("Description")
+
+            status_styles = {
+                "pending": "",
+                "confirmed": "red",
+                "false_positive": "green",
+                "wontfix": "yellow",
+            }
+
+            for r in rows:
+                sev_style = "red" if r["severity"] == "high" else ("yellow" if r["severity"] == "medium" else "dim")
+                status_style = status_styles.get(r["status"], "")
+                desc = r["description"]
+                if len(desc) > 60:
+                    desc = desc[:57] + "..."
+                table.add_row(
+                    r["function"],
+                    r["file"],
+                    str(r["index"]),
+                    f"[{sev_style}]{r['severity']}[/{sev_style}]",
+                    r["kind"],
+                    f"[{status_style}]{r['status']}[/{status_style}]" if status_style else r["status"],
+                    desc,
+                )
+
+            console.print(table)
+
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     main()

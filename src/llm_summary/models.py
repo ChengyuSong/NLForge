@@ -366,6 +366,17 @@ class SafetyIssue:
     callee: str | None = None  # callee whose contract was violated, None if foo's own op
     contract_kind: str | None = None  # which contract kind was violated
 
+    def fingerprint(self) -> str:
+        """Stable hash of (issue_kind, location, description[:80]).
+
+        Survives verification re-runs that produce the same issue so that
+        human review state can be matched back to current issues.
+        """
+        import hashlib
+
+        key = f"{self.issue_kind}|{self.location}|{self.description[:80]}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
     def to_dict(self) -> dict[str, Any]:
         result = {
             "location": self.location,

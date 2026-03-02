@@ -152,6 +152,33 @@ llm-summary build-learn \
 - `--ccache-dir PATH`: host ccache directory (default: `~/.cache/llm-summary-ccache`)
 - `--log-llm PATH`: log all LLM prompts/responses to file
 
+### show-issues — list verification issues with review status
+```bash
+llm-summary show-issues --db func-scans/<project>/functions.db
+llm-summary show-issues --db func-scans/<project>/functions.db --status pending
+llm-summary show-issues --db func-scans/<project>/functions.db --status false_positive
+llm-summary show-issues --db func-scans/<project>/functions.db --severity high --status pending
+llm-summary show-issues --db func-scans/<project>/functions.db --name <function_name>
+llm-summary show-issues --db func-scans/<project>/functions.db --format json
+```
+- `--status`: `pending`, `confirmed`, `false_positive`, `wontfix`
+- `--severity`: `high`, `medium`, `low`
+- `--name TEXT`: filter by function name (substring match)
+- `--format`: `table` (default), `json`
+
+### review-issue — mark a verification issue
+```bash
+llm-summary review-issue <function_name> <issue_index> \
+  --status false_positive \
+  --reason "short-circuit eval guards this" \
+  --db func-scans/<project>/functions.db
+```
+- `<issue_index>`: 0-based index into the function's `issues[]` array
+- `--status`: `pending`, `confirmed`, `false_positive`, `wontfix` (required)
+- `--reason TEXT`: reviewer explanation
+- `--signature TEXT`: disambiguate when multiple functions share the same name
+- Reviews are keyed by a stable fingerprint — survive verify re-runs
+
 ### clear — wipe all data
 ```bash
 llm-summary clear --db func-scans/<project>/functions.db
