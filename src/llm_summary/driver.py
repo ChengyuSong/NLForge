@@ -341,6 +341,10 @@ class BottomUpDriver:
                         print(f"  Skipping {p.name} for {func.name}: "
                               f"callee '{e2.callee_name}' still incomplete after retry")
                     continue
+                except Exception as e2:
+                    if self.verbose:
+                        print(f"  Retry of {p.name} for {func.name} failed: {e2}")
+                    continue
 
             with results_lock:
                 results[p.name][func_id] = summary
