@@ -43,7 +43,7 @@ For each free operation, identify:
    - "field" — a struct field (accessed via parameter or global) is freed
    - "local" — a local variable is freed
    - "return_value" — the freed pointer is also returned (rare)
-3. **deallocator**: The function that performs the free (e.g., "free", "png_free", "g_free")
+3. **deallocator**: The function that performs the free (e.g., "free", "fclose", "closedir")
 4. **conditional**: true if the free is inside an if-block, error path, or conditional
 5. **nulled_after**: true if the pointer is set to NULL after the free
 
@@ -140,7 +140,7 @@ For each free operation, identify:
    - "field" — a struct field (accessed via parameter or global) is freed
    - "local" — a local variable is freed
    - "return_value" — the freed pointer is also returned (rare)
-3. **deallocator**: The function that performs the free (e.g., "free", "png_free", "g_free")
+3. **deallocator**: The function that performs the free (e.g., "free", "fclose", "closedir")
 4. **conditional**: true if the free is inside an if-block, error path, or conditional
 5. **nulled_after**: true if the pointer is set to NULL after the free
 
