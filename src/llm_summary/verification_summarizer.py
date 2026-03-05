@@ -485,7 +485,8 @@ class VerificationSummarizer:
                 continue
 
             callee_name = callee_func.name
-            section_lines = [f"### `{callee_name}`"]
+            attr_text = f" {callee_func.attributes}" if callee_func.attributes else ""
+            section_lines = [f"### `{callee_name}`{attr_text}"]
 
             # Pre-conditions: from verified summary (simplified_contracts)
             if callee_name in callee_summaries:

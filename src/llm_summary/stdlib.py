@@ -607,6 +607,45 @@ STDLIB_MEMSAFE_SUMMARIES: dict[str, MemsafeSummary] = {
 }
 
 
+# Function attributes for stdlib functions
+STDLIB_ATTRIBUTES: dict[str, str] = {
+    # noreturn functions
+    "exit": "__attribute__((noreturn))",
+    "abort": "__attribute__((noreturn))",
+    "_exit": "__attribute__((noreturn))",
+    "_Exit": "__attribute__((noreturn))",
+    "quick_exit": "__attribute__((noreturn))",
+    "__assert_fail": "__attribute__((noreturn))",
+    "pthread_exit": "__attribute__((noreturn))",
+    "longjmp": "__attribute__((noreturn))",
+    "siglongjmp": "__attribute__((noreturn))",
+    "err": "__attribute__((noreturn))",
+    "errx": "__attribute__((noreturn))",
+    "verr": "__attribute__((noreturn))",
+    "verrx": "__attribute__((noreturn))",
+    "thrd_exit": "__attribute__((noreturn))",
+    # nonnull + returns_nonnull
+    "strlen": "__attribute__((nonnull(1)))",
+    "strcmp": "__attribute__((nonnull(1, 2)))",
+    "strncmp": "__attribute__((nonnull(1, 2)))",
+    "strcpy": "__attribute__((nonnull(1, 2)))",
+    "strncpy": "__attribute__((nonnull(1, 2)))",
+    "memcpy": "__attribute__((nonnull(1, 2), returns_nonnull))",
+    "memmove": "__attribute__((nonnull(1, 2), returns_nonnull))",
+    "memset": "__attribute__((nonnull(1), returns_nonnull))",
+}
+
+
+def get_stdlib_attributes(name: str) -> str:
+    """Get attribute text for a stdlib function, or empty string."""
+    return STDLIB_ATTRIBUTES.get(name, "")
+
+
+def get_all_stdlib_attributes() -> dict[str, str]:
+    """Get all stdlib function attributes."""
+    return STDLIB_ATTRIBUTES.copy()
+
+
 def get_stdlib_memsafe_summary(name: str) -> MemsafeSummary | None:
     """Get pre-defined safety summary for a standard library function."""
     return STDLIB_MEMSAFE_SUMMARIES.get(name)

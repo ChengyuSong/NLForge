@@ -477,6 +477,15 @@ class FreeSummarizer:
             )
             return prompt, None, False
 
+    def _get_callee_attributes(self, callee_names: list[str]) -> dict[str, str]:
+        """Look up attributes for callee functions."""
+        attrs = {}
+        for name in callee_names:
+            funcs = self.db.get_function_by_name(name)
+            if funcs and funcs[0].attributes:
+                attrs[name] = funcs[0].attributes
+        return attrs
+
     def _build_callee_section(
         self,
         func: Function,
@@ -486,16 +495,19 @@ class FreeSummarizer:
         if not callee_summaries and not self.deallocators:
             return "No callee free summaries available (leaf function or external calls only)."
 
+        callee_attrs = self._get_callee_attributes(list(callee_summaries.keys()))
+
         lines = []
         for name, summary in callee_summaries.items():
+            attr_suffix = f" {callee_attrs[name]}" if name in callee_attrs else ""
             if summary.frees:
                 free_desc = ", ".join(
                     f"{f.deallocator}({f.target})"
                     for f in summary.frees
                 )
-                lines.append(f"- `{name}`: Frees {free_desc}")
+                lines.append(f"- `{name}`: Frees {free_desc}{attr_suffix}")
             else:
-                lines.append(f"- `{name}`: {summary.description or 'Does not free memory'}")
+                lines.append(f"- `{name}`: {summary.description or 'Does not free memory'}{attr_suffix}")
 
         # Append project-specific deallocators not already covered
         covered_names = set(callee_summaries.keys())

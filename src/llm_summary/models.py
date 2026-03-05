@@ -171,6 +171,8 @@ class Function:
     callsites: list[dict] = field(default_factory=list)
     # Preprocessed (macro-expanded) source from clang -E, or None
     pp_source: str | None = None
+    # Raw function attributes text, e.g. "__attribute__((noreturn))"
+    attributes: str = ""
     # Switch-case blocks extracted from large functions (not persisted on Function itself)
     blocks: list["FunctionBlock"] = field(default_factory=list)
 

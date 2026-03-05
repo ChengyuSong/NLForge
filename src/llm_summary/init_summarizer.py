@@ -489,6 +489,15 @@ class InitSummarizer:
             )
             return prompt, None, False
 
+    def _get_callee_attributes(self, callee_names: list[str]) -> dict[str, str]:
+        """Look up attributes for callee functions."""
+        attrs = {}
+        for name in callee_names:
+            funcs = self.db.get_function_by_name(name)
+            if funcs and funcs[0].attributes:
+                attrs[name] = funcs[0].attributes
+        return attrs
+
     def _build_callee_section(
         self,
         func: Function,
@@ -498,16 +507,19 @@ class InitSummarizer:
         if not callee_summaries:
             return "No callee initialization summaries available (leaf function or external calls only)."
 
+        callee_attrs = self._get_callee_attributes(list(callee_summaries.keys()))
+
         lines = []
         for name, summary in callee_summaries.items():
+            attr_suffix = f" {callee_attrs[name]}" if name in callee_attrs else ""
             if summary.inits:
                 init_desc = ", ".join(
                     f"{i.initializer}({i.target})"
                     for i in summary.inits
                 )
-                lines.append(f"- `{name}`: Initializes {init_desc}")
+                lines.append(f"- `{name}`: Initializes {init_desc}{attr_suffix}")
             else:
-                lines.append(f"- `{name}`: {summary.description or 'Does not initialize caller-visible state'}")
+                lines.append(f"- `{name}`: {summary.description or 'Does not initialize caller-visible state'}{attr_suffix}")
 
         if not lines:
             return "No callee initialization summaries available (leaf function or external calls only)."

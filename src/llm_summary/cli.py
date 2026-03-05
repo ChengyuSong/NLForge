@@ -30,6 +30,7 @@ from .indirect import (
 from .llm import create_backend
 from .ordering import ProcessingOrderer
 from .stdlib import (
+    STDLIB_ATTRIBUTES,
     get_all_stdlib_free_summaries,
     get_all_stdlib_init_summaries,
     get_all_stdlib_memsafe_summaries,
@@ -153,27 +154,65 @@ def summarize(db_path, backend, model, llm_host, llm_port, disable_thinking, ver
 
         # Init stdlib if requested
         if init_stdlib:
-            stdlib = get_all_stdlib_summaries()
             from .models import Function
-            added = 0
-            for name, summary in stdlib.items():
+
+            def _ensure_stdlib_func(name: str) -> Function:
+                """Find or create a stdlib function stub."""
                 existing = db.get_function_by_name(name)
                 if existing:
                     func = existing[0]
-                else:
-                    func = Function(
-                        name=name,
-                        file_path="<stdlib>",
-                        line_start=0,
-                        line_end=0,
-                        source="",
-                        signature=f"{name}(...)",
-                    )
-                    func.id = db.insert_function(func)
+                    # Update attributes if not already set
+                    attrs = STDLIB_ATTRIBUTES.get(name, "")
+                    if attrs and not func.attributes:
+                        func.attributes = attrs
+                        func.id = db.insert_function(func)
+                    return func
+                func = Function(
+                    name=name,
+                    file_path="<stdlib>",
+                    line_start=0,
+                    line_end=0,
+                    source="",
+                    signature=f"{name}(...)",
+                    attributes=STDLIB_ATTRIBUTES.get(name, ""),
+                )
+                func.id = db.insert_function(func)
+                return func
+
+            # Allocation summaries
+            alloc_summaries = get_all_stdlib_summaries()
+            for name, summary in alloc_summaries.items():
+                func = _ensure_stdlib_func(name)
                 db.upsert_summary(func, summary, model_used="builtin")
-                added += 1
-            if added:
-                console.print(f"  Stdlib summaries added: {added}")
+
+            # Free summaries
+            free_summaries = get_all_stdlib_free_summaries()
+            for name, summary in free_summaries.items():
+                func = _ensure_stdlib_func(name)
+                db.upsert_free_summary(func, summary, model_used="builtin")
+
+            # Init summaries
+            init_summaries = get_all_stdlib_init_summaries()
+            for name, summary in init_summaries.items():
+                func = _ensure_stdlib_func(name)
+                db.upsert_init_summary(func, summary, model_used="builtin")
+
+            # Memsafe summaries
+            memsafe_summaries = get_all_stdlib_memsafe_summaries()
+            for name, summary in memsafe_summaries.items():
+                func = _ensure_stdlib_func(name)
+                db.upsert_memsafe_summary(func, summary, model_used="builtin")
+
+            # Create stubs for attribute-only functions (e.g., exit, abort)
+            for name in STDLIB_ATTRIBUTES:
+                _ensure_stdlib_func(name)
+
+            total = len(set(
+                list(alloc_summaries) + list(free_summaries) +
+                list(init_summaries) + list(memsafe_summaries) +
+                list(STDLIB_ATTRIBUTES)
+            ))
+            console.print(f"  Stdlib functions initialized: {total}")
 
         # Create LLM backend
         backend_kwargs = _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)

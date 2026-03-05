@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS functions (
     source_hash TEXT,
     params_json TEXT,
     callsites_json TEXT,
+    attributes TEXT DEFAULT '',
     UNIQUE(name, signature, file_path)
 );
 
@@ -334,6 +335,9 @@ class SummaryDB:
         if "pp_source" not in columns:
             self.conn.execute("ALTER TABLE functions ADD COLUMN pp_source TEXT")
             self.conn.commit()
+        if "attributes" not in columns:
+            self.conn.execute("ALTER TABLE functions ADD COLUMN attributes TEXT DEFAULT ''")
+            self.conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -358,8 +362,8 @@ class SummaryDB:
             """
             INSERT INTO functions
             (name, signature, canonical_signature, file_path, line_start, line_end,
-             source, pp_source, source_hash, params_json, callsites_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source, pp_source, source_hash, params_json, callsites_json, attributes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name, signature, file_path) DO UPDATE SET
               canonical_signature = excluded.canonical_signature,
               line_start          = excluded.line_start,
@@ -368,7 +372,8 @@ class SummaryDB:
               pp_source           = excluded.pp_source,
               source_hash         = excluded.source_hash,
               params_json         = excluded.params_json,
-              callsites_json      = excluded.callsites_json
+              callsites_json      = excluded.callsites_json,
+              attributes          = excluded.attributes
             """,
             (
                 func.name,
@@ -382,6 +387,7 @@ class SummaryDB:
                 source_hash,
                 params_json,
                 callsites_json,
+                func.attributes or "",
             ),
         )
         self.conn.commit()
@@ -474,6 +480,7 @@ class SummaryDB:
             params=_json.loads(params_raw) if params_raw else [],
             callsites=_json.loads(callsites_raw) if callsites_raw else [],
             pp_source=_col("pp_source"),
+            attributes=_col("attributes", "") or "",
         )
 
     # ========== Function Block Operations ==========
@@ -1590,6 +1597,7 @@ class SummaryDB:
         line_start: int = 0,
         line_end: int = 0,
         linkage: str = "external",
+        attributes: str = "",
     ) -> int:
         """Insert a minimal function entry (stub) and return its ID."""
         func = Function(
@@ -1599,6 +1607,7 @@ class SummaryDB:
             line_end=line_end,
             source="",
             signature=f"{name}(...)",
+            attributes=attributes,
         )
         return self.insert_function(func)
 

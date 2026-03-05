@@ -426,6 +426,17 @@ class MemsafeSummarizer:
         )
         return prompt, None, False
 
+    def _get_callee_attributes(self, callee_names: list[str]) -> dict[str, str]:
+        """Look up attributes for callee functions."""
+        if not getattr(self, "db", None):
+            return {}
+        attrs = {}
+        for name in callee_names:
+            funcs = self.db.get_function_by_name(name)
+            if funcs and funcs[0].attributes:
+                attrs[name] = funcs[0].attributes
+        return attrs
+
     def _annotate_source(
         self,
         func: Function,
@@ -442,12 +453,18 @@ class MemsafeSummarizer:
         if not func.callsites or not callee_summaries:
             return func.llm_source, False
 
+        # Look up attributes for all callees referenced in callsites
+        all_callee_names = {cs["callee"] for cs in func.callsites}
+        callee_attrs = self._get_callee_attributes(list(all_callee_names))
+
         # Group callsites by line_in_body (0-based offset from function start line).
         # line_in_body offsets are relative to the *original* source, so annotation
         # must always operate on func.source, not pp_source.
+        # Include callees with contracts OR attributes (e.g., noreturn).
         by_line: dict[int, list[dict]] = {}
         for cs in func.callsites:
-            if cs["callee"] in callee_summaries:
+            callee = cs["callee"]
+            if callee in callee_summaries or callee in callee_attrs:
                 by_line.setdefault(cs["line_in_body"], []).append(cs)
 
         if not by_line:
@@ -458,8 +475,11 @@ class MemsafeSummarizer:
         for i, line in enumerate(lines):
             for cs in by_line.get(i, []):
                 callee = cs["callee"]
-                summary = callee_summaries[callee]
-                if not summary.contracts:
+                summary = callee_summaries.get(callee)
+                has_contracts = summary and summary.contracts
+                has_attrs = callee in callee_attrs
+
+                if not has_contracts and not has_attrs:
                     continue
 
                 actual_args: list[str] = cs.get("args", [])
@@ -476,15 +496,22 @@ class MemsafeSummarizer:
                     header = f"{callee}({args_str})"
 
                 indent = " " * (len(line) - len(line.lstrip()))
-                result.append(f"{indent}/* PRE[{header}]:")
-                for c in summary.contracts:
-                    target = _substitute(c.target, formal_params, actual_args)
-                    if c.contract_kind == "buffer_size" and c.size_expr:
-                        size = _substitute(c.size_expr, formal_params, actual_args)
-                        result.append(f"{indent} *   {target}: {c.contract_kind}({size})")
-                    else:
-                        result.append(f"{indent} *   {target}: {c.contract_kind}")
-                result.append(f"{indent} */")
+
+                # Add attribute annotation (e.g., noreturn)
+                if has_attrs:
+                    result.append(f"{indent}/* {callee}: {callee_attrs[callee]} */")
+
+                # Add contract annotations
+                if has_contracts:
+                    result.append(f"{indent}/* PRE[{header}]:")
+                    for c in summary.contracts:
+                        target = _substitute(c.target, formal_params, actual_args)
+                        if c.contract_kind == "buffer_size" and c.size_expr:
+                            size = _substitute(c.size_expr, formal_params, actual_args)
+                            result.append(f"{indent} *   {target}: {c.contract_kind}({size})")
+                        else:
+                            result.append(f"{indent} *   {target}: {c.contract_kind}")
+                    result.append(f"{indent} */")
 
             result.append(line)
 
@@ -498,8 +525,11 @@ class MemsafeSummarizer:
         if not callee_summaries:
             return "No callee safety contracts available (leaf function or external calls only)."
 
+        callee_attrs = self._get_callee_attributes(list(callee_summaries.keys()))
+
         lines = []
         for name, summary in callee_summaries.items():
+            attr_suffix = f" {callee_attrs[name]}" if name in callee_attrs else ""
             if summary.contracts:
                 contract_descs = []
                 for c in summary.contracts:
@@ -507,9 +537,9 @@ class MemsafeSummarizer:
                         contract_descs.append(f"{c.target}: {c.contract_kind}({c.size_expr})")
                     else:
                         contract_descs.append(f"{c.target}: {c.contract_kind}")
-                lines.append(f"- `{name}`: Requires {', '.join(contract_descs)}")
+                lines.append(f"- `{name}`: Requires {', '.join(contract_descs)}{attr_suffix}")
             else:
-                lines.append(f"- `{name}`: {summary.description or 'No safety pre-conditions'}")
+                lines.append(f"- `{name}`: {summary.description or 'No safety pre-conditions'}{attr_suffix}")
 
         return "\n".join(lines) if lines else "No callee safety contracts available."
 

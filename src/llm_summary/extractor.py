@@ -329,6 +329,8 @@ class FunctionExtractor:
         params = self._extract_params(cursor)
         callsites = self._extract_callsites(cursor)
 
+        attributes = self._extract_attributes(cursor, source)
+
         func = Function(
             name=name,
             file_path=str(cursor.location.file),
@@ -339,6 +341,7 @@ class FunctionExtractor:
             canonical_signature=canonical_signature,
             params=params,
             callsites=callsites,
+            attributes=attributes,
         )
 
         # Extract code blocks for large functions.
@@ -351,6 +354,34 @@ class FunctionExtractor:
             )
 
         return func
+
+    def _extract_attributes(self, cursor: Cursor, source: str) -> str:
+        """Extract function attributes as raw text.
+
+        Collects __attribute__((...)) from UNEXPOSED_ATTR AST children,
+        plus _Noreturn / [[noreturn]] from the declaration line.
+        """
+        attrs: list[str] = []
+
+        for child in cursor.get_children():
+            if child.kind == CursorKind.UNEXPOSED_ATTR:
+                tokens = list(child.get_tokens())
+                if tokens:
+                    token_text = " ".join(t.spelling for t in tokens)
+                    # Reconstruct as __attribute__((...))
+                    attrs.append(f"__attribute__(({token_text}))")
+
+        # Check declaration line for C11 _Noreturn / C++11 [[noreturn]]
+        if source:
+            first_line = source.split("\n")[0]
+            if "_Noreturn" in first_line:
+                if not any("noreturn" in a.lower() for a in attrs):
+                    attrs.append("_Noreturn")
+            if "[[noreturn]]" in first_line:
+                if not any("noreturn" in a.lower() for a in attrs):
+                    attrs.append("[[noreturn]]")
+
+        return " ".join(attrs)
 
     def _extract_params(self, func_cursor: Cursor) -> list[str]:
         """Return formal parameter names from PARM_DECL children."""

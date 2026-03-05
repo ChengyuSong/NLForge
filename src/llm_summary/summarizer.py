@@ -623,6 +623,15 @@ class AllocationSummarizer:
             )
             return prompt, None, False
 
+    def _get_callee_attributes(self, callee_names: list[str]) -> dict[str, str]:
+        """Look up attributes for callee functions."""
+        attrs = {}
+        for name in callee_names:
+            funcs = self.db.get_function_by_name(name)
+            if funcs and funcs[0].attributes:
+                attrs[name] = funcs[0].attributes
+        return attrs
+
     def _build_callee_section(
         self,
         func: Function,
@@ -632,16 +641,19 @@ class AllocationSummarizer:
         if not callee_summaries and not self.allocators:
             return "No callee summaries available (leaf function or external calls only)."
 
+        callee_attrs = self._get_callee_attributes(list(callee_summaries.keys()))
+
         lines = []
         for name, summary in callee_summaries.items():
+            attr_suffix = f" {callee_attrs[name]}" if name in callee_attrs else ""
             if summary.allocations:
                 alloc_desc = ", ".join(
                     f"{a.source}({a.size_expr or 'unknown size'})"
                     for a in summary.allocations
                 )
-                lines.append(f"- `{name}`: Allocates via {alloc_desc}")
+                lines.append(f"- `{name}`: Allocates via {alloc_desc}{attr_suffix}")
             else:
-                lines.append(f"- `{name}`: {summary.description or 'No allocations'}")
+                lines.append(f"- `{name}`: {summary.description or 'No allocations'}{attr_suffix}")
             if summary.buffer_size_pairs:
                 pairs_desc = ", ".join(
                     f"({p.buffer}, {p.size})" for p in summary.buffer_size_pairs

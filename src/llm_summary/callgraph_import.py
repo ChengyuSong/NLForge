@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .db import SummaryDB
 from .models import CallEdge
+from .stdlib import get_stdlib_attributes
 
 
 @dataclass
@@ -310,6 +311,7 @@ class CallGraphImporter:
                 line_start=ka_line_start,
                 line_end=ka_line_end,
                 linkage=ka_linkage,
+                attributes=get_stdlib_attributes(name),
             )
             stats.stubs_created += 1
             # Update caches
