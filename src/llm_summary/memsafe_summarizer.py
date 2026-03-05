@@ -62,6 +62,7 @@ For each contract, identify:
 1. **target**: The parameter or expression the contract applies to (e.g., "ptr", "buf", "ctx->data")
 2. **contract_kind**: One of:
    - "not_null" — pointer parameter that is dereferenced and must not be NULL
+   - "nullable" — pointer parameter that is explicitly checked for NULL before use (caller MAY pass NULL)
    - "not_freed" — pointer passed to free/dealloc that must point to live memory
    - "buffer_size" — pointer used with memcpy/memset/indexing that must have sufficient capacity
    - "initialized" — variable/field used in dereference, branch, or index that must be initialized
@@ -70,12 +71,12 @@ For each contract, identify:
 5. **relationship**: (buffer_size only) One of "byte_count" or "element_count"
 
 Rules:
-- Pointer params that are **dereferenced** (read/write through `*p`, `p->field`, `p[i]`) → `not_null`
+- Pointer params that are **dereferenced** (read/write through `*p`, `p->field`, `p[i]`) without a NULL check → `not_null`
+- Pointer params that are **checked for NULL** before any dereference (e.g., `if (p == NULL) return`) → `nullable`
 - Params passed to `free()` or deallocators → `not_freed`
 - Params used in memcpy/memset/array indexing with a size → `buffer_size` (include size_expr + relationship)
 - Params/fields used in dereference, branch, or index before being set → `initialized`
 - If a callee PRE annotation lists a requirement this function does NOT satisfy internally, propagate it
-- Do NOT include contracts for parameters that are checked (e.g., `if (ptr == NULL) return`) before use
 - Only include size_expr and relationship for buffer_size contracts
 
 Respond in JSON format:
@@ -85,7 +86,7 @@ Respond in JSON format:
   "contracts": [
     {{
       "target": "parameter or expression",
-      "contract_kind": "not_null|not_freed|initialized|buffer_size",
+      "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
       "description": "brief description of the requirement",
       "size_expr": "n (buffer_size only, omit otherwise)",
       "relationship": "byte_count (buffer_size only, omit otherwise)"
@@ -133,7 +134,7 @@ Respond in JSON:
   "contracts": [
     {{{{
       "target": "parameter or expression",
-      "contract_kind": "not_null|not_freed|initialized|buffer_size",
+      "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
       "description": "brief description",
       "size_expr": "n (buffer_size only)",
       "relationship": "byte_count (buffer_size only)"
@@ -568,7 +569,7 @@ class MemsafeSummarizer:
         data = extract_json(response)
 
         # Parse contracts
-        _VALID_KINDS = {"not_null", "not_freed", "initialized", "buffer_size"}
+        _VALID_KINDS = {"not_null", "nullable", "not_freed", "initialized", "buffer_size"}
         contracts = []
         for c in data.get("contracts", []):
             contract_kind = c.get("contract_kind", "not_null")

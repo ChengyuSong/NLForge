@@ -78,8 +78,12 @@ A callee pre-condition is SATISFIED if:
 - The argument is guarded before the call (e.g., null check)
 - The value comes from an allocation that guarantees the property (e.g., calloc → initialized)
 - The value flows from a parameter covered by this function's own pre-conditions (propagation)
+- The callee has a `nullable` contract on that parameter (meaning it accepts NULL safely)
 
 A callee pre-condition is VIOLATED if none of the above hold — this is a real bug.
+
+**nullable contracts**: If a callee has `nullable` on a parameter, passing NULL to that parameter
+is explicitly safe — the callee handles NULL internally. Do NOT report null_deref for such calls.
 
 Also use callee post-conditions to detect internal issues:
 - If a callee's post-condition says a returned pointer may_be_null, and the caller dereferences
@@ -119,7 +123,7 @@ Respond with JSON:
   "simplified_contracts": [
     {{
       "target": "parameter or expression",
-      "contract_kind": "not_null|not_freed|initialized|buffer_size",
+      "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
       "description": "brief description",
       "size_expr": "n (buffer_size only, omit otherwise)",
       "relationship": "byte_count (buffer_size only, omit otherwise)"
@@ -202,7 +206,7 @@ _VALID_ISSUE_KINDS = {
     "uninitialized_use",
 }
 _VALID_SEVERITIES = {"high", "medium", "low"}
-_VALID_CONTRACT_KINDS = {"not_null", "not_freed", "initialized", "buffer_size"}
+_VALID_CONTRACT_KINDS = {"not_null", "nullable", "not_freed", "initialized", "buffer_size"}
 
 class VerificationSummarizer:
     """Verifies memory safety and simplifies contracts using cross-pass data."""

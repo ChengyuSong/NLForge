@@ -516,9 +516,10 @@ STDLIB_MEMSAFE_SUMMARIES: dict[str, MemsafeSummary] = {
     "free": MemsafeSummary(
         function_name="free",
         contracts=[
-            MemsafeContract(target="ptr", contract_kind="not_freed", description="ptr must point to live heap memory (not already freed)"),
+            MemsafeContract(target="ptr", contract_kind="nullable", description="ptr may be NULL (free(NULL) is a no-op per C standard)"),
+            MemsafeContract(target="ptr", contract_kind="not_freed", description="if non-NULL, ptr must point to live heap memory (not already freed)"),
         ],
-        description="Requires ptr to point to live memory or be NULL.",
+        description="Accepts NULL (no-op). If non-NULL, ptr must point to live heap memory.",
     ),
     "strlen": MemsafeSummary(
         function_name="strlen",
