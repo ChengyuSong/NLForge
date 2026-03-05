@@ -1869,24 +1869,29 @@ def scan(compile_commands_path, link_units_path, target_name, project_path, db_p
         console.print(f"[red]Failed to load compile_commands.json: {e}[/red]")
         return
 
-    # Filter to C/C++ source files
+    # Filter to C/C++ source files and assembly files
     c_extensions = {".c", ".cpp", ".cc", ".cxx", ".c++"}
+    asm_extensions = {".s", ".S", ".asm"}
     all_files = compile_commands.get_all_files()
 
     if bc_files_filter is not None:
         # Use the resolved compile_commands path so source file paths match
         scoped = _source_files_for_target(resolved_cc_path, bc_files_filter, build_dir=lu_build_dir)
         source_files = [f for f in all_files if f in scoped and Path(f).suffix.lower() in c_extensions]
-        console.print(
-            f"Loaded compile_commands.json: {len(all_files)} entries, "
-            f"{len(source_files)} C/C++ source files (scoped to target '{target_name}')"
-        )
+        asm_files = [f for f in all_files if f in scoped and Path(f).suffix in asm_extensions]
     else:
         source_files = [f for f in all_files if Path(f).suffix.lower() in c_extensions]
-        console.print(f"Loaded compile_commands.json: {len(all_files)} entries, {len(source_files)} C/C++ source files")
+        asm_files = [f for f in all_files if Path(f).suffix in asm_extensions]
 
-    if not source_files:
-        console.print("[red]No C/C++ source files found in compile_commands.json[/red]")
+    file_counts = f"{len(source_files)} C/C++ source files"
+    if asm_files:
+        file_counts += f", {len(asm_files)} assembly files"
+    if bc_files_filter is not None:
+        file_counts += f" (scoped to target '{target_name}')"
+    console.print(f"Loaded compile_commands.json: {len(all_files)} entries, {file_counts}")
+
+    if not source_files and not asm_files:
+        console.print("[red]No source files found in compile_commands.json[/red]")
         if _tmp_cc_file:
             Path(_tmp_cc_file).unlink(missing_ok=True)
         return
@@ -1937,6 +1942,52 @@ def scan(compile_commands_path, link_units_path, target_name, project_path, db_p
         console.print(f"  Typedefs: {len(all_typedefs)}")
         if extract_errors:
             console.print(f"  [yellow]Errors: {extract_errors}[/yellow]")
+
+        # Phase 1b: Extract assembly functions
+        if asm_files:
+            from .asm_extractor import extract_asm_functions
+
+            console.print(f"\n[bold]Phase 1b: Extracting assembly functions[/bold]")
+
+            # Build source -> output mapping from raw compile_commands JSON
+            asm_output_map: dict[str, str] = {}
+            cc_json_path = Path(resolved_cc_path or compile_commands_path)
+            if cc_json_path.exists():
+                try:
+                    with open(cc_json_path) as f:
+                        raw_cc = json.load(f)
+                    for entry in raw_cc:
+                        src = entry.get("file", "")
+                        out = entry.get("output", "")
+                        if src and out:
+                            src_resolved = str(Path(src).resolve()) if Path(src).is_absolute() else src
+                            asm_output_map[src_resolved] = out
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            asm_functions = []
+            asm_errors = 0
+            for f in asm_files:
+                try:
+                    obj_path = asm_output_map.get(f)
+                    funcs = extract_asm_functions(
+                        Path(f),
+                        Path(obj_path) if obj_path else None,
+                    )
+                    asm_functions.extend(funcs)
+                    if verbose:
+                        console.print(f"  {Path(f).name}: {len(funcs)} functions")
+                except Exception as e:
+                    asm_errors += 1
+                    if verbose:
+                        console.print(f"  [yellow]{Path(f).name}: {e}[/yellow]")
+
+            if asm_functions:
+                db.insert_functions_batch(asm_functions)
+                all_functions.extend(asm_functions)
+            console.print(f"  Assembly functions: {len(asm_functions)}")
+            if asm_errors:
+                console.print(f"  [yellow]Errors: {asm_errors}[/yellow]")
 
         # Phase 2: Scan for indirect call targets
         console.print("\n[bold]Phase 2: Scanning indirect call targets[/bold]")

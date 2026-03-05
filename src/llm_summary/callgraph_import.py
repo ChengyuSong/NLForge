@@ -119,16 +119,18 @@ def _parse_ka_function_key(key: str) -> tuple[str | None, str]:
     """Parse a KAMain function key into (file_path, func_name).
 
     Internal: '/path/to/file.c:func_name' -> ('/path/to/file.c', 'func_name')
+              'src/aio/aio.c:cleanup'     -> ('src/aio/aio.c', 'cleanup')
     External: 'func_name' -> (None, 'func_name')
 
     Handles edge case: C++ mangled names in internal functions like
     '/path/file.cc:_ZN3FooC2Ev' where ':' also appears in the key prefix.
     """
-    # Internal functions start with '/' and contain ':'
-    if key.startswith("/") and ":" in key:
-        # rsplit on ':' to handle paths with colons (unlikely but safe)
+    if ":" in key:
         file_path, name = key.rsplit(":", 1)
-        return file_path, name
+        # Internal if the file part contains '/' (absolute or relative path)
+        # or has a source file extension
+        if "/" in file_path or "." in file_path:
+            return file_path, name
     # External function: plain name
     return None, key
 
