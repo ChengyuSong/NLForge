@@ -564,20 +564,25 @@ class VerificationSummarizer:
 
             # Pass 2: Frees
             free_summary = self.db.get_free_summary_by_function_id(callee_id)
-            if free_summary and free_summary.frees:
-                free_descs = []
-                for f in free_summary.frees:
-                    desc = f"{f.deallocator}({f.target})"
-                    extras = []
-                    if f.conditional:
-                        cond_text = f"when {f.condition}" if f.condition else "conditional"
-                        extras.append(cond_text)
-                    if f.nulled_after:
-                        extras.append("nulled_after")
-                    if extras:
-                        desc += f" [{', '.join(extras)}]"
-                    free_descs.append(desc)
-                post_parts.append(f"  Frees: {'; '.join(free_descs)}")
+            if free_summary and (free_summary.frees or free_summary.resource_releases):
+                def _fmt_ops(ops: list) -> list[str]:
+                    descs = []
+                    for f in ops:
+                        desc = f"{f.deallocator}({f.target})"
+                        extras = []
+                        if f.conditional:
+                            cond_text = f"when {f.condition}" if f.condition else "conditional"
+                            extras.append(cond_text)
+                        if f.nulled_after:
+                            extras.append("nulled_after")
+                        if extras:
+                            desc += f" [{', '.join(extras)}]"
+                        descs.append(desc)
+                    return descs
+                if free_summary.frees:
+                    post_parts.append(f"  Frees: {'; '.join(_fmt_ops(free_summary.frees))}")
+                if free_summary.resource_releases:
+                    post_parts.append(f"  Releases: {'; '.join(_fmt_ops(free_summary.resource_releases))}")
 
             # Pass 3: Initializations
             init_summary = self.db.get_init_summary_by_function_id(callee_id)

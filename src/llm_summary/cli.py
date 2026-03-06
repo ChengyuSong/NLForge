@@ -506,7 +506,10 @@ def summarize(
                 console.print(f"  [yellow]Errors: {s['errors']}[/yellow]")
 
             freeing = sum(1 for sm in free_summaries.values() if sm.frees)
+            releasing = sum(1 for sm in free_summaries.values() if sm.resource_releases)
             console.print(f"\nFunctions with frees: {freeing}")
+            if releasing:
+                console.print(f"Functions with resource releases: {releasing}")
 
         if init_summarizer is not None:
             init_summaries = results["init"]

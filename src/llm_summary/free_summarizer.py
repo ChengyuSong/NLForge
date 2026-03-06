@@ -17,7 +17,16 @@ from .models import (
 # --- Shared free/deallocation task instructions (single source of truth) ---
 
 _FREE_INSTRUCTIONS = """\
-For each free operation, identify:
+Separate heap deallocations from non-heap resource cleanup:
+
+- **frees**: Heap memory deallocations — free, realloc, munmap, custom wrappers \
+(xfree, g_free, etc.), fclose (frees FILE*), closedir (frees DIR*).
+- **resource_releases**: Non-heap resource cleanup — close(fd), sem_destroy, \
+pthread_join, pthread_cancel, and similar. Do NOT include internal stdio \
+buffer management (e.g. fprintf/fwrite/putc may internally realloc a \
+buffer — that is an implementation detail, not a free or resource release).
+
+For each operation (in either list), identify:
 
 1. **target**: What gets freed — the expression (e.g., "ptr", "info_ptr->palette", "row_buf")
 2. **target_kind**: One of:
@@ -25,7 +34,7 @@ For each free operation, identify:
    - "field" — a struct field (accessed via parameter or global) is freed
    - "local" — a local variable is freed
    - "return_value" — the freed pointer is also returned (rare)
-3. **deallocator**: The function that performs the free (e.g., "free", "fclose", "closedir")
+3. **deallocator**: The function that performs the free (e.g., "free", "close", "sem_destroy")
 4. **conditional**: true if the free is inside an if-block, error path, or conditional
 5. **condition**: If conditional is true, the C expression that guards the free \
 (e.g., "do_close != 0", "ptr != NULL", "error path"). \
@@ -33,7 +42,17 @@ If a callee's free is conditional on one of this function's parameters, \
 record the condition in terms of this function's parameters. Omit if conditional is false.
 6. **nulled_after**: true if the pointer is set to NULL after the free
 
-Consider:
+**Caller-visible abstraction**: Only report frees at the abstraction level of \
+THIS function's code. If this function calls `cleanup(ctx)` and the callee \
+summary says `cleanup` frees `ctx->buf`, `ctx->name`, and `ctx->data`, \
+report ONE entry: target="ctx", deallocator="cleanup", target_kind="parameter". \
+Do NOT enumerate the callee's internal frees — the callee's own summary \
+already captures those details. \
+Exception: if this function directly accesses and frees a field \
+(e.g., `free(ctx->buf); cleanup(ctx);`), report the direct `free(ctx->buf)` \
+AND the `cleanup(ctx)` call separately.
+
+Other considerations:
 - Direct calls to free/deallocator functions
 - Wrapper functions that free (use callee summaries)
 - Conditional frees (inside if-blocks, error paths)
@@ -70,15 +89,26 @@ Respond in JSON format:
       "nulled_after": true|false
     {cb}
   ],
-  "description": "One-sentence description of what this function frees"
+  "resource_releases": [
+    {ob}
+      "target": "resource being released",
+      "target_kind": "parameter|field|local|return_value",
+      "deallocator": "close|sem_destroy|etc",
+      "conditional": true|false,
+      "condition": "guard expression (omit if unconditional)",
+      "nulled_after": true|false
+    {cb}
+  ],
+  "description": "One-sentence description of what this function frees/releases"
 {cb}
 ```
 
-If the function does not free any memory (directly or via callees), return:
+If the function does not free any memory or release resources, return:
 ```json
 {ob}
   "function": "{func_name}",
   "frees": [],
+  "resource_releases": [],
   "description": "Does not free memory"
 {cb}
 ```"""
@@ -294,6 +324,29 @@ class FreeSummarizer:
 
         block_summaries: dict[int, str] = {}
         all_block_frees: list[FreeOp] = []
+        all_block_releases: list[FreeOp] = []
+
+        def _parse_block_ops(data: dict) -> None:
+            for f in data.get("frees", []):
+                cond = f.get("conditional", False)
+                all_block_frees.append(FreeOp(
+                    target=f.get("target", ""),
+                    target_kind=f.get("target_kind", "local"),
+                    deallocator=f.get("deallocator", "free"),
+                    conditional=cond,
+                    nulled_after=f.get("nulled_after", False),
+                    condition=f.get("condition") if cond else None,
+                ))
+            for f in data.get("resource_releases", []):
+                cond = f.get("conditional", False)
+                all_block_releases.append(FreeOp(
+                    target=f.get("target", ""),
+                    target_kind=f.get("target_kind", "local"),
+                    deallocator=f.get("deallocator", "close"),
+                    conditional=cond,
+                    nulled_after=f.get("nulled_after", False),
+                    condition=f.get("condition") if cond else None,
+                ))
 
         for i, block in enumerate(blocks):
             assert block.id is not None
@@ -301,16 +354,7 @@ class FreeSummarizer:
                 try:
                     data = json.loads(block.summary_json)
                     block_summaries[block.id] = data.get("summary", "")
-                    for f in data.get("frees", []):
-                        cond = f.get("conditional", False)
-                        all_block_frees.append(FreeOp(
-                            target=f.get("target", ""),
-                            target_kind=f.get("target_kind", "local"),
-                            deallocator=f.get("deallocator", "free"),
-                            conditional=cond,
-                            nulled_after=f.get("nulled_after", False),
-                            condition=f.get("condition") if cond else None,
-                        ))
+                    _parse_block_ops(data)
                 except (json.JSONDecodeError, TypeError):
                     pass
                 continue
@@ -342,17 +386,7 @@ class FreeSummarizer:
                     block.id, json.dumps(data),
                     data.get("suggested_name"), data.get("suggested_signature"),
                 )
-
-                for f in data.get("frees", []):
-                    cond = f.get("conditional", False)
-                    all_block_frees.append(FreeOp(
-                        target=f.get("target", ""),
-                        target_kind=f.get("target_kind", "local"),
-                        deallocator=f.get("deallocator", "free"),
-                        conditional=cond,
-                        nulled_after=f.get("nulled_after", False),
-                        condition=f.get("condition") if cond else None,
-                    ))
+                _parse_block_ops(data)
             except Exception as e:
                 if self.verbose:
                     print(f"    Error summarizing block {block.label}: {e}")
@@ -385,6 +419,7 @@ class FreeSummarizer:
 
         # Phase C: merge
         skeleton_summary.frees = list(skeleton_summary.frees) + all_block_frees
+        skeleton_summary.resource_releases = list(skeleton_summary.resource_releases) + all_block_releases
         with self._stats_lock:
             self._stats["functions_processed"] += 1
         return skeleton_summary
@@ -445,24 +480,31 @@ class FreeSummarizer:
 
         callee_attrs = self._get_callee_attributes(list(callee_summaries.keys()))
 
+        def _format_ops(ops: list[FreeOp]) -> str:
+            parts = []
+            for f in ops:
+                part = f"{f.deallocator}({f.target})"
+                extras = []
+                if f.conditional:
+                    cond_text = f"when {f.condition}" if f.condition else "conditional"
+                    extras.append(cond_text)
+                if f.nulled_after:
+                    extras.append("nulled_after")
+                if extras:
+                    part += f" [{', '.join(extras)}]"
+                parts.append(part)
+            return ", ".join(parts)
+
         lines = []
         for name, summary in callee_summaries.items():
             attr_suffix = f" {callee_attrs[name]}" if name in callee_attrs else ""
+            parts = []
             if summary.frees:
-                free_parts = []
-                for f in summary.frees:
-                    part = f"{f.deallocator}({f.target})"
-                    extras = []
-                    if f.conditional:
-                        cond_text = f"when {f.condition}" if f.condition else "conditional"
-                        extras.append(cond_text)
-                    if f.nulled_after:
-                        extras.append("nulled_after")
-                    if extras:
-                        part += f" [{', '.join(extras)}]"
-                    free_parts.append(part)
-                free_desc = ", ".join(free_parts)
-                lines.append(f"- `{name}`: Frees {free_desc}{attr_suffix}")
+                parts.append(f"Frees {_format_ops(summary.frees)}")
+            if summary.resource_releases:
+                parts.append(f"Releases {_format_ops(summary.resource_releases)}")
+            if parts:
+                lines.append(f"- `{name}`: {'; '.join(parts)}{attr_suffix}")
             else:
                 desc = summary.description or 'Does not free memory'
                 lines.append(
@@ -506,28 +548,31 @@ class FreeSummarizer:
 
         data = extract_json(response)
 
-        # Parse frees
         valid_kinds = {"parameter", "field", "local", "return_value"}
-        frees = []
-        for f in data.get("frees", []):
-            target_kind = f.get("target_kind", "local")
-            if target_kind not in valid_kinds:
-                target_kind = "local"
-            conditional = f.get("conditional", False)
-            condition = f.get("condition") if conditional else None
-            frees.append(
-                FreeOp(
-                    target=f.get("target", ""),
-                    target_kind=target_kind,
-                    deallocator=f.get("deallocator", "free"),
-                    conditional=conditional,
-                    nulled_after=f.get("nulled_after", False),
-                    condition=condition,
+
+        def _parse_ops(items: list[dict]) -> list[FreeOp]:
+            ops = []
+            for f in items:
+                target_kind = f.get("target_kind", "local")
+                if target_kind not in valid_kinds:
+                    target_kind = "local"
+                conditional = f.get("conditional", False)
+                condition = f.get("condition") if conditional else None
+                ops.append(
+                    FreeOp(
+                        target=f.get("target", ""),
+                        target_kind=target_kind,
+                        deallocator=f.get("deallocator", "free"),
+                        conditional=conditional,
+                        nulled_after=f.get("nulled_after", False),
+                        condition=condition,
+                    )
                 )
-            )
+            return ops
 
         return FreeSummary(
             function_name=data.get("function", func_name),
-            frees=frees,
+            frees=_parse_ops(data.get("frees", [])),
+            resource_releases=_parse_ops(data.get("resource_releases", [])),
             description=data.get("description", ""),
         )

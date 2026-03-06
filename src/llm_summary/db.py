@@ -831,20 +831,25 @@ class SummaryDB:
     def _json_to_free_summary(self, json_str: str) -> FreeSummary:
         """Convert JSON string to FreeSummary."""
         data = json.loads(json_str)
-        frees = []
-        for f in data.get("frees", []):
-            conditional = f.get("conditional", False)
-            frees.append(FreeOp(
-                target=f.get("target", ""),
-                target_kind=f.get("target_kind", "local"),
-                deallocator=f.get("deallocator", "free"),
-                conditional=conditional,
-                nulled_after=f.get("nulled_after", False),
-                condition=f.get("condition") if conditional else None,
-            ))
+
+        def _parse_ops(items: list[dict]) -> list[FreeOp]:
+            ops = []
+            for f in items:
+                conditional = f.get("conditional", False)
+                ops.append(FreeOp(
+                    target=f.get("target", ""),
+                    target_kind=f.get("target_kind", "local"),
+                    deallocator=f.get("deallocator", "free"),
+                    conditional=conditional,
+                    nulled_after=f.get("nulled_after", False),
+                    condition=f.get("condition") if conditional else None,
+                ))
+            return ops
+
         return FreeSummary(
             function_name=data.get("function", ""),
-            frees=frees,
+            frees=_parse_ops(data.get("frees", [])),
+            resource_releases=_parse_ops(data.get("resource_releases", [])),
             description=data.get("description", ""),
         )
 

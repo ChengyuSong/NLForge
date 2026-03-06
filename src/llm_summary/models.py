@@ -276,14 +276,18 @@ class FreeSummary:
 
     function_name: str
     frees: list[FreeOp] = field(default_factory=list)
+    resource_releases: list[FreeOp] = field(default_factory=list)
     description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "function": self.function_name,
             "frees": [f.to_dict() for f in self.frees],
             "description": self.description,
         }
+        if self.resource_releases:
+            d["resource_releases"] = [r.to_dict() for r in self.resource_releases]
+        return d
 
 
 @dataclass
