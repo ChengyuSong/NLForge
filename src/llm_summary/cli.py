@@ -133,11 +133,16 @@ def main():
     "--function", "function_names", multiple=True,
     help="Only summarize these function(s). Can be specified multiple times.",
 )
+@click.option(
+    "--incremental", is_flag=True,
+    help="Only re-summarize dirty functions (missing, source-changed, or callee-updated) "
+         "and their transitive callers.",
+)
 def summarize(
     db_path, backend, model, llm_host, llm_port,
     disable_thinking, verbose, force, log_llm, init_stdlib,
     allocator_file, summary_types, deallocator_file, vsnap,
-    jobs, cache_mode, function_names,
+    jobs, cache_mode, function_names, incremental,
 ):
     """Generate allocation, free, init, memsafe, and/or verify
     summaries on a pre-populated database.
@@ -434,6 +439,20 @@ def summarize(
             console.print(f"  Targeting {len(target_ids)} function(s): {', '.join(function_names)}")
             force = True  # always re-summarize targeted functions
 
+        # Compute dirty_ids for incremental mode
+        dirty_ids = None
+        if incremental and not function_names:
+            from .driver import PASS_TABLE_MAP
+            dirty_ids = set()
+            for p in passes:
+                table = PASS_TABLE_MAP.get(p.name)
+                if table:
+                    dirty_ids |= db.find_dirty_function_ids(table)
+            console.print(f"  Incremental: {len(dirty_ids)} dirty function(s) detected")
+            if not dirty_ids:
+                console.print("  Nothing to do — all summaries up to date.")
+                return
+
         pool = None
         if jobs > 1:
             from .llm.pool import LLMPool
@@ -443,7 +462,7 @@ def summarize(
 
         driver = BottomUpDriver(db, verbose=verbose, pool=pool)
         try:
-            results = driver.run(passes, force=force, target_ids=target_ids)
+            results = driver.run(passes, force=force, dirty_ids=dirty_ids, target_ids=target_ids)
         finally:
             if pool is not None:
                 pool.shutdown()

@@ -726,6 +726,48 @@ class SummaryDB:
         ).fetchone()
         return row["source_hash"] if row else None
 
+    def find_dirty_function_ids(self, pass_table: str) -> set[int]:
+        """Find function IDs that need re-summarization for a given pass.
+
+        A function is dirty if:
+        1. No summary exists for this pass
+        2. Source hash doesn't match (source code changed)
+        3. Any callee's summary updated_at > this function's summary updated_at
+        """
+        # Whitelist valid table names to prevent SQL injection
+        valid_tables = {
+            "allocation_summaries", "free_summaries", "init_summaries",
+            "memsafe_summaries", "verification_summaries",
+        }
+        if pass_table not in valid_tables:
+            raise ValueError(f"Invalid pass table: {pass_table}")
+
+        dirty: set[int] = set()
+
+        # 1. No summary exists for this pass
+        rows = self.conn.execute(
+            f"""
+            SELECT f.id FROM functions f
+            LEFT JOIN {pass_table} s ON s.function_id = f.id
+            WHERE s.id IS NULL AND f.source IS NOT NULL
+            """,
+        ).fetchall()
+        dirty.update(row["id"] for row in rows)
+
+        # 2. Any callee's summary is newer than this function's summary
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT ce.caller_id
+            FROM call_edges ce
+            JOIN {pass_table} callee_s ON callee_s.function_id = ce.callee_id
+            JOIN {pass_table} caller_s ON caller_s.function_id = ce.caller_id
+            WHERE callee_s.updated_at > caller_s.updated_at
+            """,
+        ).fetchall()
+        dirty.update(row["caller_id"] for row in rows)
+
+        return dirty
+
     # ========== Free Summary Operations ==========
 
     def upsert_free_summary(

@@ -40,6 +40,15 @@ class SummaryPass(Protocol):
         ...
 
 
+PASS_TABLE_MAP: dict[str, str] = {
+    "allocation": "allocation_summaries",
+    "free": "free_summaries",
+    "init": "init_summaries",
+    "memsafe": "memsafe_summaries",
+    "verify": "verification_summaries",
+}
+
+
 class AllocationPass:
     """Adapter that wraps AllocationSummarizer as a SummaryPass."""
 
