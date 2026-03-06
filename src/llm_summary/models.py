@@ -147,8 +147,9 @@ class AllocationType(str, Enum):
     """Type of memory allocation."""
 
     HEAP = "heap"
-    STACK = "stack"
-    STATIC = "static"
+    STACK = "stack"  # kept for backwards compat with existing DBs
+    STATIC = "static"  # kept for backwards compat with existing DBs
+    ESCAPED_STACK = "escaped_stack"  # stack buffer that escapes — a bug
     UNKNOWN = "unknown"
 
 

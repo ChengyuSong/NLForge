@@ -701,7 +701,9 @@ def extract(
 @click.option("--file", "file_path", help="Filter by file path")
 @click.option("--allocating-only", is_flag=True, help="Only show allocating functions")
 @click.option("--format", "fmt", type=click.Choice(["table", "json"]), default="table")
-def show(db_path, name, file_path, allocating_only, fmt):
+@click.option("--limit", type=int, default=0, help="Limit number of results (0 = unlimited)")
+@click.option("--offset", type=int, default=0, help="Skip first N results")
+def show(db_path, name, file_path, allocating_only, fmt, limit, offset):
     """Show stored summaries."""
     db = SummaryDB(db_path)
 
@@ -713,6 +715,11 @@ def show(db_path, name, file_path, allocating_only, fmt):
 
         if file_path:
             functions = [f for f in functions if file_path in f.file_path]
+
+        if offset:
+            functions = functions[offset:]
+        if limit:
+            functions = functions[:limit]
 
         if fmt == "json":
             output = []

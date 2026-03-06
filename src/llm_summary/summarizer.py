@@ -37,14 +37,23 @@ File: {file_path}
 
 Generate a memory allocation summary for this function. Identify:
 
-1. **Allocations**: Any memory allocations (malloc, calloc, realloc, new, etc.)
-   - Type: heap, stack, or static
+1. **Allocations**: Any **heap** memory allocations (malloc, calloc, realloc, \
+mmap, new, etc.) or allocations via wrapper/helper functions that ultimately \
+call heap allocators.
+   - Type: "heap" for normal heap allocations. Use "escaped_stack" ONLY if a \
+stack-allocated buffer (local variable, VLA, alloca) escapes the function \
+(returned or stored to a caller-visible location) — this is a bug worth flagging.
    - Source: The allocating function/operator
    - Size expression: How size is computed
    - Size parameters: Which function parameters affect size
    - Returned: Is the allocation returned?
    - Stored to: Is it stored to a field/global?
    - May be null: Can allocation fail?
+
+   **Do NOT report**: ordinary local variables, fixed-size stack arrays, \
+compound literals, static const tables, struct declarations on the stack, \
+or assembly push instructions. These are normal stack/static usage, not \
+allocations of interest.
 
 2. **Parameters**: Role of each parameter
    - Role: size_indicator, buffer, count, pointer_out, etc.
@@ -81,7 +90,7 @@ Respond in JSON format:
   "function": "{name}",
   "allocations": [
     {{
-      "type": "heap|stack|static",
+      "type": "heap",
       "source": "allocator function name",
       "size_expr": "size expression or null",
       "size_params": ["parameter names affecting size"],
@@ -132,14 +141,23 @@ You are analyzing C/C++ code to generate memory allocation summaries.
 Generate a memory allocation summary for the function provided \
 in the user message. Identify:
 
-1. **Allocations**: Any memory allocations (malloc, calloc, realloc, new, etc.)
-   - Type: heap, stack, or static
+1. **Allocations**: Any **heap** memory allocations (malloc, calloc, realloc, \
+mmap, new, etc.) or allocations via wrapper/helper functions that ultimately \
+call heap allocators.
+   - Type: "heap" for normal heap allocations. Use "escaped_stack" ONLY if a \
+stack-allocated buffer (local variable, VLA, alloca) escapes the function \
+(returned or stored to a caller-visible location) — this is a bug worth flagging.
    - Source: The allocating function/operator
    - Size expression: How size is computed
    - Size parameters: Which function parameters affect size
    - Returned: Is the allocation returned?
    - Stored to: Is it stored to a field/global?
    - May be null: Can allocation fail?
+
+   **Do NOT report**: ordinary local variables, fixed-size stack arrays, \
+compound literals, static const tables, struct declarations on the stack, \
+or assembly push instructions. These are normal stack/static usage, not \
+allocations of interest.
 
 2. **Parameters**: Role of each parameter
    - Role: size_indicator, buffer, count, pointer_out, etc.
@@ -176,7 +194,7 @@ Respond in JSON format:
   "function": "<function_name>",
   "allocations": [
     {{
-      "type": "heap|stack|static",
+      "type": "heap",
       "source": "allocator function name",
       "size_expr": "size expression or null",
       "size_params": ["parameter names affecting size"],
@@ -240,14 +258,23 @@ ALLOC_TASK_PROMPT = """\
 
 Generate a memory allocation summary for the function in the system message. Identify:
 
-1. **Allocations**: Any memory allocations (malloc, calloc, realloc, new, etc.)
-   - Type: heap, stack, or static
+1. **Allocations**: Any **heap** memory allocations (malloc, calloc, realloc, \
+mmap, new, etc.) or allocations via wrapper/helper functions that ultimately \
+call heap allocators.
+   - Type: "heap" for normal heap allocations. Use "escaped_stack" ONLY if a \
+stack-allocated buffer (local variable, VLA, alloca) escapes the function \
+(returned or stored to a caller-visible location) — this is a bug worth flagging.
    - Source: The allocating function/operator
    - Size expression: How size is computed
    - Size parameters: Which function parameters affect size
    - Returned: Is the allocation returned?
    - Stored to: Is it stored to a field/global?
    - May be null: Can allocation fail?
+
+   **Do NOT report**: ordinary local variables, fixed-size stack arrays, \
+compound literals, static const tables, struct declarations on the stack, \
+or assembly push instructions. These are normal stack/static usage, not \
+allocations of interest.
 
 2. **Parameters**: Role of each parameter
    - Role: size_indicator, buffer, count, pointer_out, etc.
@@ -284,7 +311,7 @@ Respond in JSON format:
   "function": "{name}",
   "allocations": [
     {{{{
-      "type": "heap|stack|static",
+      "type": "heap",
       "source": "allocator function name",
       "size_expr": "size expression or null",
       "size_params": ["parameter names affecting size"],
@@ -340,9 +367,14 @@ File: {file_path}
 
 ## Task
 
-Analyze this code block for memory allocations. Also suggest a descriptive
-pseudo-function name and signature for this block (as if it were extracted into its
-own function).
+Analyze this code block for **heap** memory allocations (malloc, calloc, \
+realloc, mmap, new, etc.). Also suggest a descriptive pseudo-function name \
+and signature for this block (as if it were extracted into its own function).
+
+Do NOT report ordinary local variables, fixed-size stack arrays, compound \
+literals, static const tables, or struct declarations on the stack. Only \
+report "escaped_stack" if a stack buffer escapes (returned or stored to a \
+caller-visible location) — this is a bug.
 
 Respond in JSON:
 ```json
@@ -351,7 +383,7 @@ Respond in JSON:
   "suggested_signature": "void descriptive_name(args)",
   "allocations": [
     {{{{
-      "type": "heap|stack|static",
+      "type": "heap",
       "source": "allocator function name",
       "size_expr": "size expression or null",
       "size_params": [],
