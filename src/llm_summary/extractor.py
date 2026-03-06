@@ -371,6 +371,13 @@ class FunctionExtractor:
                     # Reconstruct as __attribute__((...))
                     attrs.append(f"__attribute__(({token_text}))")
 
+        # Extract __attribute__((...)) from type spelling (catches header-declared attrs)
+        type_spelling = cursor.type.spelling if cursor.type else ""
+        for m in re.finditer(r"__attribute__\(\(([^)]*)\)\)", type_spelling):
+            attr_text = m.group(1).strip()
+            if not any(attr_text in a for a in attrs):
+                attrs.append(f"__attribute__(({attr_text}))")
+
         # Check declaration line for C11 _Noreturn / C++11 [[noreturn]]
         if source:
             first_line = source.split("\n")[0]
