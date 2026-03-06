@@ -570,7 +570,8 @@ class VerificationSummarizer:
                     desc = f"{f.deallocator}({f.target})"
                     extras = []
                     if f.conditional:
-                        extras.append("conditional")
+                        cond_text = f"when {f.condition}" if f.condition else "conditional"
+                        extras.append(cond_text)
                     if f.nulled_after:
                         extras.append("nulled_after")
                     if extras:

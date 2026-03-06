@@ -254,15 +254,19 @@ class FreeOp:
     deallocator: str  # "free", "png_free", "g_free", custom
     conditional: bool  # True if free is inside an if/error path
     nulled_after: bool  # True if pointer is set to NULL after free
+    condition: str | None = None  # condition expression, e.g. "do_close != 0"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "target": self.target,
             "target_kind": self.target_kind,
             "deallocator": self.deallocator,
             "conditional": self.conditional,
             "nulled_after": self.nulled_after,
         }
+        if self.condition:
+            d["condition"] = self.condition
+        return d
 
 
 @dataclass
