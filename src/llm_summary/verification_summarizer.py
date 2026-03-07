@@ -470,8 +470,10 @@ class VerificationSummarizer:
             self._stats["issues_found"] += len(skeleton_summary.issues)
         return skeleton_summary
 
-    def _build_type_defs_section(self, source: str) -> str:
-        """Build a section with struct/union/typedef definitions referenced in source.
+    def _build_type_defs_section(self, source: str, file_path: str = "") -> str:
+        """Build a section with struct/union/typedef definitions referenced in source,
+        plus file-scope static variable declarations from the same source file.
+
 
         Extracts type names from the source text, looks them up in the DB, and
         returns a formatted section string (empty string if no definitions found).
@@ -483,16 +485,19 @@ class VerificationSummarizer:
         for m in re.finditer(r'\b(?:struct|union|enum)\s+(\w+)', source):
             names.add(m.group(1))
 
-        if not names:
-            return ""
+        rows = self.db.get_typedefs_by_names(list(names)) if names else []
 
-        rows = self.db.get_typedefs_by_names(list(names))
-        if not rows:
-            return ""
+        # Also include file-scope static variables from the same source file that
+        # are actually referenced by name in the function source.
+        all_identifiers = set(re.findall(r'\b([A-Za-z_]\w*)\b', source))
+        static_rows = [
+            r for r in (self.db.get_static_vars_by_file(file_path) if file_path else [])
+            if r["name"] in all_identifiers
+        ]
 
         # Deduplicate by name (prefer shortest definition if multiple)
         seen: dict[str, str] = {}
-        for row in rows:
+        for row in rows + static_rows:
             name = row["name"]
             defn = row.get("definition") or ""
             if defn and (name not in seen or len(defn) < len(seen[name])):
@@ -501,10 +506,14 @@ class VerificationSummarizer:
         if not seen:
             return ""
 
+        # Emit each unique definition block only once (multiple vars may share a block)
+        emitted: set[str] = set()
         lines = ["## Referenced Type Definitions\n", "```c"]
         for defn in seen.values():
-            lines.append(defn)
-            lines.append("")
+            if defn not in emitted:
+                emitted.add(defn)
+                lines.append(defn)
+                lines.append("")
         lines.append("```\n\n")
         return "\n".join(lines)
 
@@ -518,7 +527,7 @@ class VerificationSummarizer:
         The complex Hoare-logic reasoning requires source, contracts, and callee
         context tightly coupled in a single prompt.
         """
-        type_defs_section = self._build_type_defs_section(source)
+        type_defs_section = self._build_type_defs_section(source, func.file_path)
         prompt = VERIFICATION_PROMPT.format(
             source=source,
             name=func.name,

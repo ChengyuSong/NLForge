@@ -227,6 +227,7 @@ CREATE INDEX IF NOT EXISTS idx_flow_summaries_function ON address_flow_summaries
 CREATE INDEX IF NOT EXISTS idx_build_configs_name ON build_configs(project_name);
 CREATE INDEX IF NOT EXISTS idx_container_summaries_function ON container_summaries(function_id);
 CREATE INDEX IF NOT EXISTS idx_typedefs_name ON typedefs(name);
+CREATE INDEX IF NOT EXISTS idx_typedefs_file ON typedefs(file_path);
 
 -- Issue reviews (human annotations on verification issues)
 CREATE TABLE IF NOT EXISTS issue_reviews (
@@ -314,6 +315,12 @@ class SummaryDB:
             # is complex; instead just create a new unique index
             # (old UNIQUE(function_id) stays as-is for old DBs)
             self.conn.commit()
+
+        # Ensure file-path index on typedefs exists (added for static_var support)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_typedefs_file ON typedefs(file_path)"
+        )
+        self.conn.commit()
 
         # Add kind column to typedefs if missing
         cursor = self.conn.execute("PRAGMA table_info(typedefs)")
@@ -1626,6 +1633,14 @@ class SummaryDB:
         rows = self.conn.execute(
             f"SELECT * FROM typedefs WHERE name IN ({placeholders}) AND definition IS NOT NULL",
             names,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_static_vars_by_file(self, file_path: str) -> list[dict]:
+        """Get all file-scope static variable declarations for a given source file."""
+        rows = self.conn.execute(
+            "SELECT * FROM typedefs WHERE file_path = ? AND kind = 'static_var' AND definition IS NOT NULL",
+            (file_path,),
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -9,6 +9,7 @@ from clang.cindex import (
     Cursor,
     CursorKind,
     Index,
+    StorageClass,
     TranslationUnit,
 )
 
@@ -839,6 +840,28 @@ class FunctionExtractor:
                         "line_number": child.location.line,
                         "definition": definition,
                     })
+
+            elif child.kind == CursorKind.VAR_DECL:
+                # Capture file-scope static variables (static const arrays, etc.)
+                # Only from main_file to avoid pulling in system-header statics.
+                # Only static storage class (not extern globals).
+                if (child_file == main_file
+                        and child.storage_class == StorageClass.STATIC):
+                    loc_key = (child_file, child.location.line)
+                    if loc_key not in seen_locations:
+                        seen_locations.add(loc_key)
+                        type_spelling = child.type.spelling
+                        canonical = child.type.get_canonical().spelling
+                        definition = self._get_full_source(child) or None
+                        results.append({
+                            "name": child.spelling,
+                            "kind": "static_var",
+                            "underlying_type": type_spelling,
+                            "canonical_type": canonical,
+                            "file_path": child_file,
+                            "line_number": child.location.line,
+                            "definition": definition,
+                        })
 
             # Recurse into namespaces and class/struct bodies for nested types,
             # but only if in main_file (avoid deep recursion into system headers)
