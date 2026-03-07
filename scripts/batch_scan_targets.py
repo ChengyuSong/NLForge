@@ -120,11 +120,23 @@ def _source_files_for_bc(
     sources: list[str] = []
     seen: set[str] = set()
     for bc_file in bc_files:
+        key = None
         try:
             rel = bc_file.relative_to(build_dir)
+            key = (str(rel.parent), _bare_stem(rel))
         except ValueError:
+            # bc_file is under a different prefix (e.g., recompiled_bc/).
+            # Walk suffixes to find the embedded relative path that matches
+            # a compile_commands output key.
+            parts = bc_file.parts
+            for i in range(1, len(parts)):
+                candidate = Path(*parts[i:])
+                k = (str(candidate.parent), _bare_stem(candidate))
+                if k in idx:
+                    key = k
+                    break
+        if key is None:
             continue
-        key = (str(rel.parent), _bare_stem(rel))
         src = idx.get(key)
         if src and src not in seen:
             sources.append(src)
