@@ -146,6 +146,9 @@ def parse_ninja_targets(build_ninja: Path) -> dict[str, Any]:
     return {"targets": targets}
 
 
+ASM_EXTENSIONS = {".s", ".S", ".asm"}
+
+
 def map_objects_to_bc(
     objects: list[str],
     build_dir: Path,
@@ -157,7 +160,8 @@ def map_objects_to_bc(
     - Tier 1: Look for .bc next to .o (from -save-temps=obj)
     - Tier 2: If -flto in compile flags, .o itself is LLVM bitcode
 
-    No tier-3 recompilation (that would modify files).
+    Assembly source files (.s/.S/.asm) never produce .bc; their resolved
+    source paths are collected separately in the returned 'asm_sources' list.
 
     Args:
         objects: List of object file paths (relative to build_dir)
@@ -165,9 +169,10 @@ def map_objects_to_bc(
         compile_commands: Optional loaded compile_commands.json entries
 
     Returns:
-        Dict with 'mappings' (obj -> bc path) and 'stats'
+        Dict with 'mappings' (obj -> bc path), 'asm_sources', and 'stats'
     """
     mappings: dict[str, str | None] = {}
+    asm_sources: list[str] = []
     stats = {"total": len(objects), "tier1": 0, "tier2": 0, "not_found": 0}
 
     # Build a lookup from output path to compile_commands entry
@@ -208,11 +213,21 @@ def map_objects_to_bc(
                 stats["tier2"] += 1
 
         if bc_path is None:
+            # Check if this object came from an assembly source file
+            resolved_obj = str(obj_path.resolve())
+            cc_entry = cc_by_output.get(resolved_obj)
+            if cc_entry:
+                src = cc_entry.get("file", "")
+                if src and Path(src).suffix in ASM_EXTENSIONS:
+                    directory = cc_entry.get("directory", "")
+                    src_path = Path(src) if Path(src).is_absolute() else Path(directory) / src
+                    asm_sources.append(str(src_path.resolve()))
+                    continue  # not counted as not_found
             stats["not_found"] += 1
 
         mappings[obj] = bc_path
 
-    return {"mappings": mappings, "stats": stats}
+    return {"mappings": mappings, "asm_sources": asm_sources, "stats": stats}
 
 
 def _get_source_stem(obj_path: Path) -> str | None:
@@ -749,6 +764,7 @@ def discover_deterministic(
             bc for bc in bc_result["mappings"].values()
             if bc is not None
         ]
+        asm_sources = bc_result.get("asm_sources", [])
 
         link_unit = {
             "name": target["name"],
@@ -756,17 +772,20 @@ def discover_deterministic(
             "output": target["output"],
             "objects": target["objects"],
             "bc_files": bc_files,
+            "asm_sources": asm_sources,
             "link_deps": target["link_deps"],
         }
         link_units.append(link_unit)
 
         if verbose:
             s = bc_result["stats"]
+            asm_str = f", {len(asm_sources)} asm sources" if asm_sources else ""
             print(
                 f"[link-units]   {target['name']}: "
                 f"{len(target['objects'])} objects, "
                 f"{len(bc_files)} bc files "
                 f"(tier1={s['tier1']}, tier2={s['tier2']}, missing={s['not_found']})"
+                f"{asm_str}"
             )
 
     return {
