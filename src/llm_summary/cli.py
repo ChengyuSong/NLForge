@@ -852,7 +852,7 @@ def clear(db_path):
 
 
 @main.command("init-stdlib")
-@click.option("--db", "db_path", required=True, help="Database file path")
+@click.option("--db", "db_path", default=None, help="Target project database file path")
 @click.option(
     "--abilist",
     "extra_abilists",
@@ -861,9 +861,21 @@ def clear(db_path):
     help="Additional abilist file(s) to merge with the bundled list (repeatable)",
 )
 @click.option(
-    "--cache-db",
+    "--stdlib-db",
+    "stdlib_db",
     default=None,
-    help="Global stdlib cache path (default: ~/.llm-summary/stdlib_cache.db)",
+    help="Stdlib cache path (default: ~/.llm-summary/stdlib_cache.db)",
+)
+@click.option(
+    "--seed-from",
+    "seed_from_paths",
+    multiple=True,
+    type=click.Path(exists=True),
+    help="Seed stdlib cache from this project DB before applying (repeatable)",
+)
+@click.option(
+    "--force", "-f", is_flag=True,
+    help="Overwrite existing stdlib cache entries when seeding with --seed-from",
 )
 @click.option(
     "--backend",
@@ -880,41 +892,131 @@ def clear(db_path):
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def init_stdlib(
-    db_path, extra_abilists, cache_db, backend, model,
+    db_path, extra_abilists, stdlib_db, seed_from_paths, force, backend, model,
     llm_host, llm_port, log_llm, verbose,
 ):
     """Populate external-function summaries using a persistent global cache.
 
-    For each function in the project DB that has no source body:
-
     \b
-      1. If it is in the known-externals list (bundled abilist + --abilist):
-           a. Cache hit  → copy summaries from the global cache into the project DB.
-           b. Cache miss → generate summaries via LLM, save to cache, then copy.
-      2. If not in the known-externals list → skip (let the main summarizer handle it).
+    Seeding the cache (--seed-from):
+      Import summaries from a reviewed project DB (e.g. musl) into the global
+      stdlib cache so they are reused for all future projects.
 
-    The global cache (~/.llm-summary/stdlib_cache.db) is pre-seeded with
-    hand-crafted entries for common libc functions (malloc, free, memcpy, …).
-    A --backend is only required when the cache is missing entries for
-    functions that appear in the project.
+        llm-summary init-stdlib --seed-from func-scans/musl/c/functions.db
+
+    Applying to a project (--db):
+      For each function in the project DB that has no source body:
+
+        1. If it is in the known-externals list (bundled abilist + --abilist):
+             a. Cache hit  → copy summaries from the stdlib cache.
+             b. Cache miss → generate via LLM, save to cache, then copy.
+        2. Not in known-externals list → skip (main summarizer handles it).
+
+    Both steps can be combined in one invocation.  --stdlib-db overrides the
+    default cache location (~/.llm-summary/stdlib_cache.db).
     """
     from .external_summarizer import ExternalFunctionSummarizer
     from .models import Function, VerificationSummary
     from .stdlib_cache import StdlibCache, load_known_externals
 
-    # 1. Load known-externals set
+    if not db_path and not seed_from_paths:
+        console.print("[red]Error: provide --db and/or --seed-from.[/red]")
+        sys.exit(1)
+
+    # 1. Load known-externals — needed both for filtering seed-from and for apply
     known_externals = load_known_externals(list(extra_abilists) if extra_abilists else None)
     console.print(f"Known-externals registry: {len(known_externals):,} function names")
 
-    # 2. Open and seed the global stdlib cache
-    cache = StdlibCache(cache_db)
+    # 2. Open the stdlib cache
+    cache = StdlibCache(stdlib_db)
+
+    # 3. Seed from project DBs (--seed-from) — runs before builtins so reviewed
+    #    contracts from a real libc DB take priority over hand-crafted entries.
+    #    Only exported (known-external) names are seeded; internal statics are skipped.
+    summary_tables = [
+        ("allocation_summaries", "allocation_json"),
+        ("free_summaries",       "free_json"),
+        ("init_summaries",       "init_json"),
+        ("memsafe_summaries",    "memsafe_json"),
+    ]
+    for src_path in seed_from_paths:
+        src_db = SummaryDB(src_path)
+        tag = f"libc:{Path(src_path).parent.name}"
+        added = skipped_cached = skipped_internal = alias_fallbacks = 0
+
+        # Build name->id map for fast weak_alias fallback lookup (__name -> name)
+        all_src_funcs = src_db.get_all_functions()
+        name_to_ids: dict[str, list[int]] = {}
+        for sf in all_src_funcs:
+            name_to_ids.setdefault(sf.name, []).append(sf.id)
+
+        def _fetch_blobs(func_id: int) -> dict[str, str | None]:
+            blobs: dict[str, str | None] = {col: None for _, col in summary_tables}
+            for table, col in summary_tables:
+                row = src_db.conn.execute(
+                    f"SELECT summary_json FROM {table} WHERE function_id = ?",
+                    (func_id,),
+                ).fetchone()
+                if row:
+                    blobs[col] = row[0]
+            return blobs
+
+        try:
+            for src_func in all_src_funcs:
+                if src_func.name not in known_externals:
+                    skipped_internal += 1
+                    continue
+                if not force and cache.has(src_func.name):
+                    skipped_cached += 1
+                    continue
+                blobs = _fetch_blobs(src_func.id)
+                if not any(blobs.values()):
+                    # weak_alias fallback: try __<name> (e.g. pthread_exit -> __pthread_exit)
+                    private_name = f"__{src_func.name}"
+                    for fid in name_to_ids.get(private_name, []):
+                        candidate = _fetch_blobs(fid)
+                        if any(candidate.values()):
+                            blobs = candidate
+                            alias_fallbacks += 1
+                            if verbose:
+                                console.print(
+                                    f"  [alias] {src_func.name} -> {private_name}"
+                                )
+                            break
+                if not any(blobs.values()):
+                    continue
+                cache.put(
+                    name=src_func.name,
+                    allocation_json=blobs["allocation_json"],
+                    free_json=blobs["free_json"],
+                    init_json=blobs["init_json"],
+                    memsafe_json=blobs["memsafe_json"],
+                    model_used=tag,
+                )
+                added += 1
+                if verbose:
+                    console.print(f"  [seed] {src_func.name} ({tag})")
+        finally:
+            src_db.close()
+        console.print(
+            f"Seeded from {src_path}: {added} exported symbols added"
+            + (f" ({alias_fallbacks} via weak_alias)" if alias_fallbacks else "")
+            + (f", {skipped_cached} already cached" if skipped_cached else "")
+            + (f", {skipped_internal} internal symbols skipped" if skipped_internal else "")
+        )
+
+    # 4. Seed hand-crafted builtins as fallback for anything not covered above
     seeded = cache.seed_builtins()
     if seeded:
-        console.print(f"  Seeded {seeded} hand-crafted builtin entries into cache")
+        console.print(f"  Seeded {seeded} hand-crafted builtin entries into cache (fallback)")
+
+    if not db_path:
+        cache.close()
+        return
 
     db = SummaryDB(db_path)
     try:
-        # 3. Identify functions that have no source and need summaries
+        # 4. Identify functions that have no source and need summaries
         all_funcs = db.get_all_functions()
         sourceless = [f for f in all_funcs if not f.source]
 
@@ -946,7 +1048,7 @@ def init_stdlib(
             f"{len(cache_misses)} cache misses"
         )
 
-        # 4. Require --backend if there are cache misses
+        # 5. Require --backend if there are cache misses
         if cache_misses and not backend:
             names = sorted(f.name for f in cache_misses)
             console.print(
@@ -957,7 +1059,7 @@ def init_stdlib(
             console.print(f"  Missing: {', '.join(names)}")
             sys.exit(1)
 
-        # 5. Helper: get-or-create a function stub in the project DB
+        # 6. Helper: get-or-create a function stub in the project DB
         def _get_or_create(name: str) -> Function:
             existing = db.get_function_by_name(name)
             if existing:
@@ -974,7 +1076,7 @@ def init_stdlib(
             stub.id = db.insert_function(stub)
             return stub
 
-        # 6. Helper: apply a cache entry to the project DB
+        # 7. Helper: apply a cache entry to the project DB
         def _apply_entry(func: Function, entry) -> None:
             model_used = entry.model_used
 
@@ -1002,7 +1104,7 @@ def init_stdlib(
                 )
                 db.upsert_verification_summary(func, ver, model_used=model_used)
 
-        # 7. Apply cache hits
+        # 8. Apply cache hits
         if cache_hits:
             console.print(f"\nApplying {len(cache_hits)} cached summaries...")
             for f in cache_hits:
@@ -1012,7 +1114,7 @@ def init_stdlib(
                 if verbose:
                     console.print(f"  [cache] {f.name}")
 
-        # 8. LLM-generate cache misses
+        # 9. LLM-generate cache misses
         if cache_misses and backend:
             backend_kwargs = _build_backend_kwargs(backend, llm_host, llm_port, False)
             llm = create_backend(backend, model=model, **backend_kwargs)
@@ -1049,7 +1151,7 @@ def init_stdlib(
                 f"errors: {s['errors']}"
             )
 
-        # 9. Report skipped unknowns
+        # 10. Report skipped unknowns
         if not_known:
             names = sorted(f.name for f in not_known)
             console.print(
@@ -2059,6 +2161,59 @@ def _load_compile_commands(
     return CompileCommandsDB(compile_commands_path), None
 
 
+def _asm_sources_from_objects(
+    objects: list[str],
+    compile_commands_path: str,
+    build_dir: str | None = None,
+) -> set[str]:
+    """Derive assembly source paths from a link unit's object list.
+
+    For each object in the list, looks up the compile_commands entry and
+    returns source files with assembly extensions (.s/.S/.asm).  Used when
+    link_units.json has no explicit 'asm_sources' field (e.g. older files
+    populated by batch_call_graph_gen before this field existed).
+    """
+    import json as _json
+
+    if not objects or not compile_commands_path:
+        return set()
+
+    asm_extensions = {".s", ".S", ".asm"}
+    try:
+        with open(compile_commands_path) as f:
+            entries = _json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+    # Build output -> source map
+    out_to_src: dict[str, str] = {}
+    for entry in entries:
+        output = entry.get("output", "")
+        src = entry.get("file", "")
+        directory = entry.get("directory", "")
+        if not output or not src:
+            continue
+        out_path = Path(output) if Path(output).is_absolute() else Path(directory) / output
+        src_path = Path(src) if Path(src).is_absolute() else Path(directory) / src
+        out_to_src[str(out_path.resolve())] = str(src_path.resolve())
+        # Also index by basename for flat ar-t member names like "longjmp.lo"
+        out_to_src[out_path.name] = str(src_path.resolve())
+
+    build_dir_path = Path(build_dir) if build_dir else None
+    result: set[str] = set()
+    for obj in objects:
+        obj_path = Path(obj)
+        if not obj_path.is_absolute() and build_dir_path:
+            obj_path = build_dir_path / obj_path
+        src = (
+            out_to_src.get(str(obj_path.resolve()))
+            or out_to_src.get(obj_path.name)
+        )
+        if src and Path(src).suffix in asm_extensions:
+            result.add(src)
+    return result
+
+
 def _source_files_for_target(
     compile_commands_path: str,
     bc_files: set[str],
@@ -2213,6 +2368,7 @@ def scan(
 
     # Resolve bc_files filter from link_units.json
     bc_files_filter: set[str] | None = None
+    asm_sources_filter: set[str] | None = None
     lu_build_dir: str | None = None
     if link_units_path:
         with open(link_units_path) as f:
@@ -2223,9 +2379,29 @@ def scan(
             console.print(f"[red]Target '{target_name}' not found in {link_units_path}[/red]")
             console.print(f"  Available targets: {available}")
             return
-        bc_files_filter = set(targets_map[target_name].get("bc_files", []))
+        target_entry = targets_map[target_name]
+        bc_files_filter = set(target_entry.get("bc_files", []))
         lu_build_dir = lu_data.get("build_dir")
-        console.print(f"Link-unit filter: target '{target_name}', {len(bc_files_filter)} bc files")
+
+        # asm_sources: prefer explicit field, fall back to deriving from objects
+        if "asm_sources" in target_entry:
+            asm_sources_filter = set(target_entry["asm_sources"])
+        else:
+            asm_sources_filter = _asm_sources_from_objects(
+                target_entry.get("objects", []),
+                compile_commands_path,
+                lu_build_dir,
+            )
+            if asm_sources_filter and verbose:
+                console.print(
+                    f"  Derived {len(asm_sources_filter)} asm sources from objects list"
+                )
+
+        console.print(
+            f"Link-unit filter: target '{target_name}', "
+            f"{len(bc_files_filter)} bc files"
+            + (f", {len(asm_sources_filter)} asm sources" if asm_sources_filter else "")
+        )
 
     # Load compile_commands.json, remapping Docker paths if needed.
     try:
@@ -2254,11 +2430,14 @@ def scan(
             if f in scoped
             and Path(f).suffix.lower() in c_extensions
         ]
-        asm_files = [
-            f for f in all_files
-            if f in scoped
-            and Path(f).suffix in asm_extensions
-        ]
+        # Assembly files don't produce .bc — use asm_sources_filter from link_units.json
+        if asm_sources_filter:
+            asm_files = [
+                f for f in all_files
+                if Path(f).suffix in asm_extensions and f in asm_sources_filter
+            ]
+        else:
+            asm_files = []
     else:
         source_files = [f for f in all_files if Path(f).suffix.lower() in c_extensions]
         asm_files = [f for f in all_files if Path(f).suffix in asm_extensions]
