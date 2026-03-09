@@ -101,6 +101,15 @@ class StdlibCache:
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS dep_headers (
+                header_path     TEXT PRIMARY KEY,
+                library_name    TEXT NOT NULL,
+                dep_db_path     TEXT,
+                resolved_by     TEXT NOT NULL DEFAULT 'heuristic',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -192,6 +201,56 @@ class StdlibCache:
     def list_names(self) -> list[str]:
         rows = self.conn.execute("SELECT name FROM stdlib_cache ORDER BY name").fetchall()
         return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------
+    # Dependency header resolution cache
+    # ------------------------------------------------------------------
+
+    def get_dep_header(self, header_path: str) -> tuple[str, str, str] | None:
+        """Look up a cached header resolution.
+
+        Returns (library_name, dep_db_path, resolved_by) or None.
+        """
+        row = self.conn.execute(
+            "SELECT library_name, dep_db_path, resolved_by "
+            "FROM dep_headers WHERE header_path = ?",
+            (header_path,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1], row[2])
+
+    def put_dep_header(
+        self,
+        header_path: str,
+        library_name: str,
+        dep_db_path: str | None,
+        resolved_by: str = "heuristic",
+    ) -> None:
+        """Cache a header -> library resolution."""
+        self.conn.execute(
+            """
+            INSERT INTO dep_headers (header_path, library_name, dep_db_path, resolved_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(header_path) DO UPDATE SET
+                library_name = excluded.library_name,
+                dep_db_path  = excluded.dep_db_path,
+                resolved_by  = excluded.resolved_by
+            """,
+            (header_path, library_name, dep_db_path, resolved_by),
+        )
+        self.conn.commit()
+
+    def get_all_dep_headers(self) -> list[tuple[str, str, str | None, str]]:
+        """Return all cached header resolutions.
+
+        Returns list of (header_path, library_name, dep_db_path, resolved_by).
+        """
+        rows = self.conn.execute(
+            "SELECT header_path, library_name, dep_db_path, resolved_by "
+            "FROM dep_headers ORDER BY header_path"
+        ).fetchall()
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
 
     def close(self) -> None:
         self.conn.close()

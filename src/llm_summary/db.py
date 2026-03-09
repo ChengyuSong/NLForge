@@ -493,6 +493,7 @@ class SummaryDB:
             callsites=_json.loads(callsites_raw) if callsites_raw else [],
             pp_source=_col("pp_source"),
             attributes=_col("attributes", "") or "",
+            decl_header=_col("decl_header"),
         )
 
     # ========== Function Block Operations ==========

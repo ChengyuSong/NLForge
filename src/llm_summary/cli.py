@@ -3410,6 +3410,382 @@ def import_dep_summaries(db_path, dep_db_paths, force, verbose):
         target_db.close()
 
 
+@main.command("import-dep")
+@click.option("--db", "db_path", required=True, help="Target project database path")
+@click.option(
+    "--from", "from_db_path", default=None,
+    help="Source dependency database path "
+         "(e.g. func-scans/zlib/zlibstatic/functions.db)",
+)
+@click.option(
+    "--scan-dir", "scan_dir", default="func-scans",
+    help="Directory to auto-discover dependency DBs "
+         "(default: func-scans)",
+)
+@click.option(
+    "--link-units", "link_units_path", default=None,
+    type=click.Path(),
+    help="link_units.json to record resolved dep_dbs into",
+)
+@click.option(
+    "--target", "target_name", default=None,
+    help="Link-unit target name (for recording dep_dbs in link_units.json)",
+)
+@click.option("--force", "-f", is_flag=True,
+              help="Overwrite existing summaries in target DB")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be imported without writing")
+@click.option("--verbose", "-v", is_flag=True)
+def import_dep(db_path, from_db_path, scan_dir, link_units_path, target_name,
+               force, dry_run, verbose):
+    """Import summaries from dependency project DBs using decl_header matching.
+
+    Uses the decl_header column (populated by 'scan' Phase 4) to determine
+    which external functions belong to which dependency, then copies summaries
+    from the dependency's DB.  Standard library functions (libc/libm/POSIX)
+    are always skipped — use init-stdlib for those.
+
+    Resolved header -> dep DB mappings are cached globally in
+    ~/.llm-summary/stdlib_cache.db so they don't need re-resolving.
+
+    \b
+    Explicit mode (--from):
+        llm-summary import-dep \\
+            --db func-scans/libpng/png_static/functions.db \\
+            --from func-scans/zlib/zlibstatic/functions.db
+
+    Auto-discover mode (no --from):
+        llm-summary import-dep \\
+            --db func-scans/libpng/png_static/functions.db
+
+    Record deps in link_units.json:
+        llm-summary import-dep \\
+            --db func-scans/libpng/png_static/functions.db \\
+            --from func-scans/zlib/zlibstatic/functions.db \\
+            --link-units func-scans/libpng/link_units.json \\
+            --target png_static
+    """
+    from .extern_headers import classify_header
+    from .stdlib_cache import StdlibCache
+
+    summary_tables = [
+        "allocation_summaries",
+        "free_summaries",
+        "init_summaries",
+        "memsafe_summaries",
+        "verification_summaries",
+    ]
+
+    target_db = SummaryDB(db_path)
+    cache = StdlibCache()
+
+    try:
+        # 1. Find externals with decl_header set (populated by scan Phase 4)
+        all_funcs = target_db.get_all_functions()
+        externals = [
+            f for f in all_funcs
+            if (not f.source) and f.decl_header
+        ]
+
+        if not externals:
+            rows = target_db.conn.execute(
+                "SELECT id, name, decl_header FROM functions "
+                "WHERE (source IS NULL OR source = '') AND decl_header IS NOT NULL"
+            ).fetchall()
+            ext_info = [(r[0], r[1], r[2]) for r in rows]
+        else:
+            ext_info = [(f.id, f.name, f.decl_header) for f in externals]
+
+        if not ext_info:
+            console.print(
+                "[yellow]No external functions with decl_header found.[/yellow]\n"
+                "Run 'llm-summary scan' first to populate declaration headers."
+            )
+            return
+
+        # 2. Separate stdlib vs third-party
+        thirdparty: list[tuple[int, str, str]] = []  # (func_id, name, header)
+        stdlib_count = 0
+        for func_id, name, header in ext_info:
+            if classify_header(header):
+                stdlib_count += 1
+            else:
+                thirdparty.append((func_id, name, header))
+
+        if not thirdparty:
+            console.print(
+                f"All {stdlib_count} externals with headers are stdlib — "
+                "nothing to import (use init-stdlib for libc)."
+            )
+            return
+
+        # Group by header
+        from collections import defaultdict
+        by_header: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for func_id, name, header in thirdparty:
+            by_header[header].append((func_id, name))
+
+        console.print(
+            f"External functions: {len(ext_info)} total, "
+            f"{stdlib_count} stdlib (skipped), "
+            f"{len(thirdparty)} third-party across {len(by_header)} headers"
+        )
+        for hdr, funcs in sorted(by_header.items()):
+            console.print(f"  {hdr}: {len(funcs)} functions")
+
+        # 3. Resolve headers to dependency DBs
+        if from_db_path:
+            # Explicit: all third-party functions come from this DB
+            dep_mapping: dict[str, str] = {hdr: from_db_path for hdr in by_header}
+            # Cache the explicit mapping
+            for hdr in by_header:
+                basename = Path(hdr).stem
+                cache.put_dep_header(hdr, basename, from_db_path, resolved_by="explicit")
+        else:
+            # Auto-discover: check global cache first, then heuristic
+            dep_mapping = _resolve_dep_dbs(by_header.keys(), scan_dir, db_path,
+                                           cache, verbose)
+
+        if not dep_mapping:
+            console.print("[yellow]No dependency DBs found for the headers.[/yellow]")
+            return
+
+        # 4. Import summaries
+        total_funcs = 0
+        total_summaries = 0
+
+        for header, dep_path in sorted(dep_mapping.items()):
+            funcs_for_header = by_header.get(header, [])
+            if not funcs_for_header:
+                continue
+
+            dep_db = SummaryDB(dep_path)
+            dep_tag = f"dep:{Path(dep_path).parent.name}/{Path(dep_path).stem}"
+            copied_funcs = 0
+            copied_summaries = 0
+
+            try:
+                for func_id, func_name in funcs_for_header:
+                    # Find the function in the dep DB (by name, with source)
+                    dep_candidates = dep_db.get_function_by_name(func_name)
+                    # Prefer the one with source (real implementation)
+                    dep_func = None
+                    for c in dep_candidates:
+                        if c.source:
+                            dep_func = c
+                            break
+                    if dep_func is None and dep_candidates:
+                        dep_func = dep_candidates[0]
+                    if dep_func is None:
+                        if verbose:
+                            console.print(f"  [dim]{func_name}: not found in {dep_path}[/dim]")
+                        continue
+
+                    # Collect summaries from dep DB
+                    src_summaries: dict[str, str] = {}
+                    for table in summary_tables:
+                        row = dep_db.conn.execute(
+                            f"SELECT summary_json FROM {table} WHERE function_id = ?",
+                            (dep_func.id,),
+                        ).fetchone()
+                        if row:
+                            src_summaries[table] = row[0]
+
+                    if not src_summaries:
+                        if verbose:
+                            console.print(f"  [dim]{func_name}: no summaries in {dep_path}[/dim]")
+                        continue
+
+                    if dry_run:
+                        kinds = [t.replace("_summaries", "") for t in src_summaries]
+                        console.print(f"  [dry-run] {func_name}: would import {', '.join(kinds)}")
+                        copied_funcs += 1
+                        copied_summaries += len(src_summaries)
+                        continue
+
+                    func_imported = False
+                    for table, summary_json in src_summaries.items():
+                        existing = target_db.conn.execute(
+                            f"SELECT id FROM {table} WHERE function_id = ?",
+                            (func_id,),
+                        ).fetchone()
+                        if existing and not force:
+                            continue
+
+                        target_db.conn.execute(
+                            f"INSERT INTO {table} (function_id, summary_json, model_used)"
+                            " VALUES (?, ?, ?)"
+                            " ON CONFLICT(function_id) DO UPDATE SET"
+                            "   summary_json = excluded.summary_json,"
+                            "   updated_at   = CURRENT_TIMESTAMP,"
+                            "   model_used   = excluded.model_used",
+                            (func_id, summary_json, dep_tag),
+                        )
+                        copied_summaries += 1
+                        func_imported = True
+
+                    if func_imported:
+                        copied_funcs += 1
+                        if verbose:
+                            kinds = [t.replace("_summaries", "") for t in src_summaries]
+                            console.print(f"  {func_name}: {', '.join(kinds)}")
+
+                if not dry_run:
+                    target_db.conn.commit()
+            finally:
+                dep_db.close()
+
+            total_funcs += copied_funcs
+            total_summaries += copied_summaries
+            console.print(
+                f"  {Path(dep_path).name} ({header}): "
+                f"{copied_funcs} functions, {copied_summaries} summaries"
+                + (" (dry-run)" if dry_run else "")
+            )
+
+        # 5. Record dep_dbs in link_units.json if requested
+        if link_units_path and not dry_run:
+            _record_dep_dbs_in_link_units(
+                link_units_path, target_name, dep_mapping, verbose,
+            )
+
+        action = "would import" if dry_run else "imported"
+        console.print(
+            f"\n[bold]Total:[/bold] {total_funcs} functions, "
+            f"{total_summaries} summaries {action}"
+        )
+    finally:
+        target_db.close()
+        cache.close()
+
+
+def _resolve_dep_dbs(
+    headers: "Iterable[str]",
+    scan_dir: str,
+    target_db_path: str,
+    cache: "StdlibCache",
+    verbose: bool,
+) -> dict[str, str]:
+    """Map header paths to dependency DB paths.
+
+    Checks the global cache first, then falls back to basename heuristic.
+    Resolved mappings are persisted in the global cache for future use.
+    """
+    import glob as _glob
+
+    target_db_resolved = str(Path(target_db_path).resolve())
+    scan_root = Path(scan_dir)
+    mapping: dict[str, str] = {}
+
+    # Check global cache first
+    headers_to_resolve: list[str] = []
+    for header in headers:
+        cached = cache.get_dep_header(header)
+        if cached:
+            lib_name, dep_db_path, resolved_by = cached
+            if dep_db_path and Path(dep_db_path).exists():
+                mapping[header] = dep_db_path
+                if verbose:
+                    console.print(f"  [cache] {header} -> {dep_db_path} ({resolved_by})")
+            else:
+                # Cached path no longer exists, re-resolve
+                headers_to_resolve.append(header)
+        else:
+            headers_to_resolve.append(header)
+
+    if not headers_to_resolve:
+        return mapping
+
+    # Build index of available projects from func-scans/
+    available: dict[str, list[str]] = {}
+    for db_file in _glob.glob(str(scan_root / "*/*/functions.db")):
+        if str(Path(db_file).resolve()) == target_db_resolved:
+            continue
+        parts = Path(db_file).relative_to(scan_root).parts
+        project_name = parts[0]
+        available.setdefault(project_name, []).append(db_file)
+
+    for header in headers_to_resolve:
+        basename = Path(header).stem
+        parent = Path(header).parent.name
+
+        candidates = []
+        if basename in available:
+            candidates.append(basename)
+        if parent not in ("include", "local") and parent in available:
+            candidates.append(parent)
+        if f"lib{basename}" in available:
+            candidates.append(f"lib{basename}")
+
+        if len(candidates) == 1:
+            project = candidates[0]
+            dbs = available[project]
+            best = max(dbs, key=lambda p: Path(p).stat().st_size)
+            mapping[header] = best
+            cache.put_dep_header(header, project, best, resolved_by="heuristic")
+            if verbose:
+                console.print(f"  [resolve] {header} -> {best}")
+        elif len(candidates) > 1:
+            console.print(
+                f"  [yellow]Ambiguous: {header} matches projects: "
+                f"{', '.join(candidates)}[/yellow]"
+            )
+        else:
+            console.print(
+                f"  [yellow]No match: {header} "
+                f"(tried: {basename}, {parent}, lib{basename})[/yellow]"
+            )
+
+    return mapping
+
+
+def _record_dep_dbs_in_link_units(
+    link_units_path: str,
+    target_name: str | None,
+    dep_mapping: dict[str, str],
+    verbose: bool,
+) -> None:
+    """Record resolved dep_dbs in link_units.json for the target link unit."""
+    lu_path = Path(link_units_path)
+    if not lu_path.exists():
+        console.print(f"  [yellow]link_units.json not found: {lu_path}[/yellow]")
+        return
+
+    with open(lu_path) as f:
+        lu_data = json.load(f)
+
+    link_units = lu_data.get("link_units", lu_data.get("targets", []))
+
+    # Collect unique dep DB paths
+    dep_db_paths = sorted(set(dep_mapping.values()))
+
+    if target_name:
+        # Update specific target
+        for lu in link_units:
+            if lu.get("name") == target_name:
+                lu["dep_dbs"] = dep_db_paths
+                break
+        else:
+            console.print(f"  [yellow]Target '{target_name}' not found in {lu_path}[/yellow]")
+            return
+    else:
+        # Update all link units
+        for lu in link_units:
+            lu.setdefault("dep_dbs", [])
+            for p in dep_db_paths:
+                if p not in lu["dep_dbs"]:
+                    lu["dep_dbs"].append(p)
+
+    with open(lu_path, "w") as f:
+        json.dump(lu_data, f, indent=2)
+        f.write("\n")
+
+    if verbose:
+        console.print(f"  [link-units] Recorded {len(dep_db_paths)} dep DBs in {lu_path}")
+        for p in dep_db_paths:
+            console.print(f"    {p}")
+
+
 @main.command("review-issue")
 @click.argument("function_name")
 @click.argument("issue_index", type=int)

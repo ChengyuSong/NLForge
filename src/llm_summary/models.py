@@ -174,6 +174,8 @@ class Function:
     pp_source: str | None = None
     # Raw function attributes text, e.g. "__attribute__((noreturn))"
     attributes: str = ""
+    # Header file where this external function is declared (from clang -E)
+    decl_header: str | None = None
     # Switch-case blocks extracted from large functions (not persisted on Function itself)
     blocks: list["FunctionBlock"] = field(default_factory=list)
 
