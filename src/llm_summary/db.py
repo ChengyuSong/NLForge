@@ -372,7 +372,7 @@ class SummaryDB:
         source_hash = compute_source_hash(hash_source) if hash_source else None
         params_json = _json.dumps(func.params) if func.params else None
         callsites_json = _json.dumps(func.callsites) if func.callsites else None
-        cursor = self.conn.execute(
+        row = self.conn.execute(
             """
             INSERT INTO functions
             (name, signature, canonical_signature, file_path, line_start, line_end,
@@ -388,6 +388,7 @@ class SummaryDB:
               params_json         = excluded.params_json,
               callsites_json      = excluded.callsites_json,
               attributes          = excluded.attributes
+            RETURNING id
             """,
             (
                 func.name,
@@ -403,17 +404,9 @@ class SummaryDB:
                 callsites_json,
                 func.attributes or "",
             ),
-        )
+        ).fetchone()
         self.conn.commit()
-        # ON CONFLICT DO UPDATE doesn't update lastrowid; fetch the real ID.
-        if cursor.lastrowid == 0:
-            row = self.conn.execute(
-                "SELECT id FROM functions WHERE name=? AND signature=? AND file_path=?",
-                (func.name, func.signature, func.file_path),
-            ).fetchone()
-            return row["id"] if row else 0
-        assert cursor.lastrowid is not None, "lastrowid should be set after INSERT"
-        return cursor.lastrowid
+        return row["id"]
 
     def insert_functions_batch(self, functions: list[Function]) -> dict[Function, int]:
         """Batch insert functions and return mapping to IDs.

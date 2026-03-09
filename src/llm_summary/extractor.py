@@ -17,6 +17,20 @@ from .compile_commands import CompileCommandsDB
 from .models import Function, FunctionBlock
 from .preprocessor import PreprocessedFile, SourcePreprocessor
 
+_SYSTEM_HEADER_PREFIXES = (
+    "/usr/",
+    "/lib/",
+    "/include/",
+    "/opt/",
+    "/System/",
+    "/Library/",
+)
+
+
+def _is_system_header(file_path: str) -> bool:
+    """Return True if file_path looks like a system header (not project-local)."""
+    return any(file_path.startswith(p) for p in _SYSTEM_HEADER_PREFIXES)
+
 
 def configure_libclang(libclang_path: str | None = None) -> None:
     """Configure libclang library path if needed."""
@@ -843,10 +857,12 @@ class FunctionExtractor:
 
             elif child.kind == CursorKind.VAR_DECL:
                 # Capture file-scope static variables (static const arrays, etc.)
-                # Only from main_file to avoid pulling in system-header statics.
-                # Only static storage class (not extern globals).
-                if (child_file == main_file
-                        and child.storage_class == StorageClass.STATIC):
+                # Include vars from main_file and from project-local headers.
+                # System headers (under /usr/, /lib/, etc.) are excluded.
+                # Vars from included headers are stored under main_file so that
+                # get_static_vars_by_file(main_file) finds them at verify time.
+                if (child.storage_class == StorageClass.STATIC
+                        and not _is_system_header(child_file)):
                     loc_key = (child_file, child.location.line)
                     if loc_key not in seen_locations:
                         seen_locations.add(loc_key)
@@ -858,7 +874,7 @@ class FunctionExtractor:
                             "kind": "static_var",
                             "underlying_type": type_spelling,
                             "canonical_type": canonical,
-                            "file_path": child_file,
+                            "file_path": main_file,
                             "line_number": child.location.line,
                             "definition": definition,
                         })
