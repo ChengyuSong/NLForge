@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llm_summary.compile_commands import CompileCommandsDB
 from llm_summary.db import SummaryDB
+from llm_summary.extern_headers import extract_extern_headers
 from llm_summary.extractor import FunctionExtractor
 from llm_summary.indirect.callsites import IndirectCallsiteFinder
 from llm_summary.indirect.scanner import AddressTakenScanner
@@ -151,6 +152,7 @@ def _scan_files(
     project_root: Path | None,
     verbose: bool,
     preprocess: bool = False,
+    cc_path: str | Path | None = None,
 ) -> tuple[int, int, int]:
     """Extract functions, scan address-taken, find callsites. Returns (funcs, targets, callsites)."""
     extractor = FunctionExtractor(
@@ -183,6 +185,23 @@ def _scan_files(
             callsites.extend(finder.find_in_files([f]))
         except Exception:
             pass
+
+    # Extract extern declaration headers (for import-dep)
+    if cc_path:
+        try:
+            header_map = extract_extern_headers(
+                compile_commands_path=cc_path,
+                project_root=project_root,
+                source_files=source_files,
+                verbose=verbose,
+            )
+            if header_map:
+                updated = db.update_decl_headers(header_map)
+                if verbose:
+                    print(f"      Extern headers: {len(header_map)} mapped, {updated} DB rows updated")
+        except Exception as e:
+            if verbose:
+                print(f"      Extern headers: failed ({e})")
 
     return len(all_functions), len(atfs), len(callsites)
 
@@ -273,6 +292,7 @@ def scan_project_link_units(
                 n_funcs, n_targets, n_callsites = _scan_files(
                     source_files, cc, db, project_root, verbose,
                     preprocess=preprocess,
+                    cc_path=tmp_path,
                 )
             finally:
                 db.close()
@@ -394,6 +414,7 @@ def scan_project(
                 n_funcs, n_targets, n_callsites = _scan_files(
                     source_files, cc, db, project_root, verbose,
                     preprocess=preprocess,
+                    cc_path=tmp_cc2_path,
                 )
                 atfs = db.get_address_taken_functions()
                 type_counts: Counter[str] = Counter()

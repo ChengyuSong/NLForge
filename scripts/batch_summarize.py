@@ -129,7 +129,7 @@ def run_import_dep_summaries(
     force: bool,
     verbose: bool,
 ) -> tuple[bool, str]:
-    """Invoke llm-summary import-dep-summaries. Returns (success, error)."""
+    """Invoke llm-summary import-dep-summaries (intra-project). Returns (success, error)."""
     if not dep_db_paths:
         return True, ""
     cmd = ["llm-summary", "import-dep-summaries", "--db", str(db_path)]
@@ -149,6 +149,38 @@ def run_import_dep_summaries(
         return False, error
     except subprocess.TimeoutExpired:
         return False, "import-dep-summaries timeout"
+    except FileNotFoundError:
+        return False, "llm-summary not found (activate venv?)"
+    except Exception as e:
+        return False, str(e)
+
+
+def run_import_dep(
+    db_path: Path,
+    link_units_path: Path | None = None,
+    target_name: str | None = None,
+    scan_dir: str = "func-scans",
+    verbose: bool = False,
+) -> tuple[bool, str]:
+    """Invoke llm-summary import-dep (cross-project). Returns (success, error)."""
+    cmd = ["llm-summary", "import-dep", "--db", str(db_path),
+           "--scan-dir", scan_dir]
+    if link_units_path:
+        cmd += ["--link-units", str(link_units_path)]
+    if target_name:
+        cmd += ["--target", target_name]
+    if verbose:
+        cmd.append("--verbose")
+    try:
+        result = subprocess.run(cmd, capture_output=not verbose, text=True, timeout=300)
+        if result.returncode == 0:
+            return True, ""
+        error = f"exit code {result.returncode}"
+        if not verbose and result.stderr:
+            error += f"\n{result.stderr[-300:]}"
+        return False, error
+    except subprocess.TimeoutExpired:
+        return False, "import-dep timeout"
     except FileNotFoundError:
         return False, "llm-summary not found (activate venv?)"
     except Exception as e:
@@ -317,6 +349,17 @@ def process_project_link_units(
                 result["targets"].append(target_result)
                 target_errors.append(f"{target}: no_functions_db")
                 continue
+
+        # Import cross-project dep summaries (e.g. zlib for libpng)
+        ok, err = run_import_dep(
+            db_path=db_path,
+            link_units_path=link_units_path,
+            target_name=target,
+            scan_dir=str(func_scans_dir),
+            verbose=verbose,
+        )
+        if not ok and verbose:
+            print(f"    [{target}] import-dep warning: {err}")
 
         # Import dep summaries from intra-project deps
         dep_db_paths = resolve_dep_db_paths(lu, by_output, project_scan_dir)

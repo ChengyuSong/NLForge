@@ -53,9 +53,9 @@ Optional:
 Phases:
   0  build-learn          (batch_build_learn.py)
   1  discover-link-units  (batch_discover_link_units.py)
-  2  scan targets         (batch_scan_targets.py)
+  2  scan targets         (batch_scan_targets.py, incl. extern header extraction)
   3  call graph           (batch_call_graph_gen.py)
-  4  summarize            (batch_summarize.py)
+  4  summarize            (batch_summarize.py, incl. cross-project import-dep)
   5  verify               (batch_verify.py)
   6  container detect     (batch_container_detect.py, requires --with-containers)
 EOF
