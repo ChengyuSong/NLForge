@@ -957,8 +957,8 @@ CMAKE_TOOL_DEFINITIONS = [
             "cmake_configure. The build runs in a Docker "
             "container. On success, returns an assembly_check "
             "result showing if any assembly code (.s files, "
-            "inline asm) was compiled. If assembly is detected, "
-            "try different cmake_configure flags to avoid it "
+            "inline asm) was compiled. Assembly is acceptable "
+            "but you may try one round of flags to reduce it "
             "(e.g., -DDISABLE_ASM=ON, -DENABLE_SIMD=OFF)."
         ),
         "input_schema": {
@@ -1048,8 +1048,8 @@ CONFIGURE_MAKE_TOOL_DEFINITIONS = [
             "a successful run_configure, or directly if only a Makefile exists. Bear wraps "
             "make to generate compile_commands.json. "
             "On success, returns an assembly_check result showing if any assembly code (.s files, "
-            "inline asm) was compiled. If assembly is detected, try different configure flags "
-            "to avoid it (e.g., --disable-asm, --disable-simd)."
+            "inline asm) was compiled. Assembly is acceptable but you may try one round of "
+            "configure flags to reduce it (e.g., --disable-asm, --disable-simd)."
         ),
         "input_schema": {
             "type": "object",
