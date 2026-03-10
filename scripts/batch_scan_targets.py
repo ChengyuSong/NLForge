@@ -81,69 +81,6 @@ def _bare_stem(p: Path) -> str:
     return s
 
 
-def _source_files_for_bc(
-    cc_entries: list[dict],
-    bc_files: list[Path],
-    build_dir: Path,
-) -> list[str]:
-    """Return source files whose compiled output corresponds to a bc_file.
-
-    compile_commands output fields may be relative to build_dir and use
-    -save-temps=obj naming (adler32.c.o). bc_files are absolute host paths
-    (adler32.bc). Match by (relative parent dir, bare stem) — stripping all
-    extensions from both sides.
-    """
-    # Build index: (rel_parent, bare_stem) -> source_file
-    idx: dict[tuple[str, str], str] = {}
-    for entry in cc_entries:
-        output = entry.get("output", "")
-        src = entry.get("file", "")
-        if not (src and Path(src).suffix.lower() in C_EXTENSIONS):
-            continue
-        if output:
-            out_path = Path(output)
-        else:
-            # bear sometimes omits output when -o is absent (implicit naming).
-            # Default: compiler writes <stem>.o into the directory field.
-            directory = entry.get("directory", "")
-            if not directory:
-                continue
-            out_path = Path(directory) / (Path(src).stem + ".o")
-        # Make relative to build_dir if absolute
-        if out_path.is_absolute():
-            try:
-                out_path = out_path.relative_to(build_dir)
-            except ValueError:
-                pass
-        key = (str(out_path.parent), _bare_stem(out_path))
-        idx[key] = src
-
-    sources: list[str] = []
-    seen: set[str] = set()
-    for bc_file in bc_files:
-        key = None
-        try:
-            rel = bc_file.relative_to(build_dir)
-            key = (str(rel.parent), _bare_stem(rel))
-        except ValueError:
-            # bc_file is under a different prefix (e.g., recompiled_bc/).
-            # Walk suffixes to find the embedded relative path that matches
-            # a compile_commands output key.
-            parts = bc_file.parts
-            for i in range(1, len(parts)):
-                candidate = Path(*parts[i:])
-                k = (str(candidate.parent), _bare_stem(candidate))
-                if k in idx:
-                    key = k
-                    break
-        if key is None:
-            continue
-        src = idx.get(key)
-        if src and src not in seen:
-            sources.append(src)
-            seen.add(src)
-    return sources
-
 
 def _source_files_for_objects(
     cc_entries: list[dict],
@@ -381,14 +318,13 @@ def scan_project_link_units(
         work_items = []
         for lu in link_units:
             target = lu["name"]
-            bc_files = [Path(p) for p in lu.get("bc_files", []) if Path(p).exists()]
-            if bc_files:
-                source_files = _source_files_for_bc(cc_entries, bc_files, build_dir)
-                match_desc = f"{len(bc_files)} bc files"
-            else:
-                objects = lu.get("objects", [])
-                source_files = _source_files_for_objects(cc_entries, objects, build_dir)
-                match_desc = f"{len(objects)} objects (no bc)"
+            objects = lu.get("objects", [])
+            # Always resolve source files from objects (which come from the
+            # linker command and match compile_commands output paths directly).
+            # bc_files are recompiled derivatives with different stems/paths,
+            # so they're unreliable for source resolution.
+            source_files = _source_files_for_objects(cc_entries, objects, build_dir)
+            match_desc = f"{len(objects)} objects"
 
             if dry_run:
                 db_path_str = ":memory:"
