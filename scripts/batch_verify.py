@@ -180,6 +180,7 @@ def process_project(
         backend=backend,
         model=model,
         force=force,
+        incremental=incremental,
         llm_host=llm_host,
         llm_port=llm_port,
         log_llm=log_llm,
