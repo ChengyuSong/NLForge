@@ -162,67 +162,120 @@ run_phase 1 "prepare + scan + callgraph" \
         --kamain-bin "$KAMAIN_BIN" \
         $FILTER_ARGS $VERBOSE
 
-# ── Phase 3: summarize ───────────────────────────────────────────────────────
-run_phase 3 "summarize" \
-    python3 scripts/batch_summarize.py \
-        --projects-json scripts/cgc_projects.json \
-        --func-scans-dir "$FUNC_SCANS_DIR" \
-        $FILTER_ARGS $LLM_ARGS --init-stdlib $FORCE $INCREMENTAL $VERBOSE
-
-# ── Phase 4: verify ──────────────────────────────────────────────────────────
-run_phase 4 "verify" \
-    python3 scripts/batch_verify.py \
-        --func-scans-dir "$FUNC_SCANS_DIR" \
-        $FILTER_ARGS $LLM_ARGS $FORCE $INCREMENTAL $VERBOSE
-
-# ── Phase 5: patch re-scan ───────────────────────────────────────────────────
-run_phase 5 "patch re-scan" \
-    python3 scripts/cgc_prepare.py \
-        --cgc-dir "$CGC_DIR" --func-scans-dir "$FUNC_SCANS_DIR" \
-        --patch $FILTER_ARGS $VERBOSE
-
-# ── Phase 6: patched incremental summarize + verify ──────────────────────────
-if [[ 6 -ge $FROM_PHASE ]]; then
+# ── Phases 3-7: per-challenge pipeline ───────────────────────────────────────
+if [[ 3 -le $FROM_PHASE ]] && [[ $FROM_PHASE -le 7 ]] || [[ $FROM_PHASE -le 3 ]]; then
     echo ""
-    echo "=== Phase 6: patched incremental summarize + verify ==="
+    echo "=== Phases 3-7: per-challenge summarize + verify + patch + evaluate ==="
 
-    # Find all patched DBs matching the filter
-    for patched_db in "$FUNC_SCANS_DIR"/*/functions_patched.db; do
-        [[ -f "$patched_db" ]] || continue
-        challenge_name="$(basename "$(dirname "$patched_db")")"
+    # Collect challenge dirs matching filter
+    CHALLENGE_DIRS=()
+    for db in "$FUNC_SCANS_DIR"/*/functions.db; do
+        [[ -f "$db" ]] || continue
+        challenge_name="$(basename "$(dirname "$db")")"
 
-        # Apply filter if set
         if [[ -n "$FILTER" ]]; then
             if ! echo "$challenge_name" | grep -qi "$FILTER"; then
                 continue
             fi
         fi
 
-        echo "  [$challenge_name] summarize (incremental)..."
-        llm-summary summarize \
-            --db "$patched_db" \
-            --type allocation --type free --type init --type memsafe \
-            $LLM_ARGS --incremental --init-stdlib $VERBOSE
-
-        echo "  [$challenge_name] verify (incremental)..."
-        llm-summary summarize \
-            --db "$patched_db" \
-            --type verify \
-            $LLM_ARGS --incremental $VERBOSE
+        CHALLENGE_DIRS+=("$challenge_name")
     done
 
-    echo "--- Phase 6 done ---"
-else
+    if [[ -n "$LIMIT" ]]; then
+        CHALLENGE_DIRS=("${CHALLENGE_DIRS[@]:0:$LIMIT}")
+    fi
+
+    TOTAL=${#CHALLENGE_DIRS[@]}
+    echo "  Challenges to process: $TOTAL"
     echo ""
-    echo "--- Phase 6: patched incremental summarize + verify [SKIPPED] ---"
+
+    N_OK=0
+    N_FAIL=0
+
+    for i in "${!CHALLENGE_DIRS[@]}"; do
+        challenge_name="${CHALLENGE_DIRS[$i]}"
+        idx=$((i + 1))
+        db_path="$FUNC_SCANS_DIR/$challenge_name/functions.db"
+
+        echo "[$idx/$TOTAL] $challenge_name"
+        challenge_start=$(date +%s)
+
+        # Phase 3: summarize
+        if [[ $FROM_PHASE -le 3 ]]; then
+            echo "  summarize..."
+            if ! llm-summary summarize \
+                --db "$db_path" \
+                --type allocation --type free --type init --type memsafe \
+                $LLM_ARGS --init-stdlib $FORCE $INCREMENTAL $VERBOSE; then
+                echo "  FAILED summarize"
+                N_FAIL=$((N_FAIL + 1))
+                continue
+            fi
+        fi
+
+        # Phase 4: verify
+        if [[ $FROM_PHASE -le 4 ]]; then
+            echo "  verify..."
+            if ! llm-summary summarize \
+                --db "$db_path" \
+                --type verify \
+                $LLM_ARGS $FORCE $INCREMENTAL $VERBOSE; then
+                echo "  FAILED verify"
+                N_FAIL=$((N_FAIL + 1))
+                continue
+            fi
+        fi
+
+        # Phase 5: patch re-scan
+        if [[ $FROM_PHASE -le 5 ]]; then
+            echo "  patch re-scan..."
+            python3 scripts/cgc_prepare.py \
+                --cgc-dir "$CGC_DIR" --func-scans-dir "$FUNC_SCANS_DIR" \
+                --patch --filter "$challenge_name" $VERBOSE
+        fi
+
+        # Phase 6: patched incremental summarize + verify
+        patched_db="$FUNC_SCANS_DIR/$challenge_name/functions_patched.db"
+        if [[ $FROM_PHASE -le 6 ]] && [[ -f "$patched_db" ]]; then
+            echo "  patched summarize (incremental)..."
+            llm-summary summarize \
+                --db "$patched_db" \
+                --type allocation --type free --type init --type memsafe \
+                $LLM_ARGS --incremental --init-stdlib $VERBOSE
+
+            echo "  patched verify (incremental)..."
+            llm-summary summarize \
+                --db "$patched_db" \
+                --type verify \
+                $LLM_ARGS --incremental $VERBOSE
+        fi
+
+        challenge_elapsed=$(( $(date +%s) - challenge_start ))
+        echo "  done (${challenge_elapsed}s)"
+        N_OK=$((N_OK + 1))
+
+        # Phase 7: evaluate (running total)
+        if [[ $FROM_PHASE -le 7 ]]; then
+            python3 scripts/cgc_evaluate.py \
+                --ground-truth "$GT_FILE" \
+                --func-scans-dir "$FUNC_SCANS_DIR" \
+                $FILTER_ARGS -o cgc_eval_report.json 2>/dev/null | grep -E "True Pos|False Neg|False Pos|Precision|Recall|F1|Confirmed"
+        fi
+
+        echo ""
+    done
+
+    echo "=== Per-challenge pipeline done: $N_OK ok, $N_FAIL failed ==="
 fi
 
-# ── Phase 7: evaluate ────────────────────────────────────────────────────────
-run_phase 7 "evaluate" \
-    python3 scripts/cgc_evaluate.py \
-        --ground-truth "$GT_FILE" \
-        --func-scans-dir "$FUNC_SCANS_DIR" \
-        $FILTER_ARGS $VERBOSE
+# ── Final evaluation ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Final evaluation ==="
+python3 scripts/cgc_evaluate.py \
+    --ground-truth "$GT_FILE" \
+    --func-scans-dir "$FUNC_SCANS_DIR" \
+    $FILTER_ARGS $VERBOSE
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 TOTAL_ELAPSED=$(( $(date +%s) - TOTAL_START ))
