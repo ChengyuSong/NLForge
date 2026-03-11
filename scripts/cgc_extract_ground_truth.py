@@ -11,8 +11,11 @@ Usage:
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
+
+import clang.cindex as ci
 
 # CWE -> issue_kind mapping (only memory safety CWEs we can verify)
 CWE_TO_ISSUE_KIND = {
@@ -24,6 +27,10 @@ CWE_TO_ISSUE_KIND = {
     125: "buffer_overflow",   # Out-of-bounds Read
     126: "buffer_overflow",   # Buffer Over-read
     127: "buffer_overflow",   # Buffer Under-read
+    131: "buffer_overflow",   # Incorrect Calculation of Buffer Size
+    190: "buffer_overflow",   # Integer Overflow or Wraparound (often leads to buffer overflow)
+    193: "buffer_overflow",   # Off-by-one Error
+    680: "buffer_overflow",   # Integer Overflow to Buffer Overflow
     787: "buffer_overflow",   # Out-of-bounds Write
     788: "buffer_overflow",   # Access of Memory Location After End of Buffer
     415: "double_free",
@@ -32,12 +39,115 @@ CWE_TO_ISSUE_KIND = {
     457: "uninitialized_use",
     824: "use_after_free",    # Access of Uninitialized Pointer
     # CWEs that don't map to our issue_kinds get None:
-    # 134 (format string), 190 (integer overflow), 191 (integer underflow),
-    # 193 (off-by-one), 194 (unexpected sign extension),
+    # 134 (format string), 191 (integer underflow),
+    # 194 (unexpected sign extension),
     # 195 (signed to unsigned conversion), 200/201 (info exposure),
-    # 285/287 (improper auth), 468 (incorrect pointer scaling),
-    # 680 (integer overflow to buffer overflow), etc.
+    # 285/287 (improper auth), 468 (incorrect pointer scaling), etc.
 }
+
+# Reverse mapping for prompt construction
+CWE_DESCRIPTIONS = {
+    119: "CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer",
+    120: "CWE-120: Buffer Copy without Checking Size of Input",
+    121: "CWE-121: Stack-based Buffer Overflow",
+    122: "CWE-122: Heap-based Buffer Overflow",
+    124: "CWE-124: Buffer Underwrite",
+    125: "CWE-125: Out-of-bounds Read",
+    126: "CWE-126: Buffer Over-read",
+    127: "CWE-127: Buffer Under-read",
+    131: "CWE-131: Incorrect Calculation of Buffer Size",
+    134: "CWE-134: Use of Externally-Controlled Format String",
+    190: "CWE-190: Integer Overflow or Wraparound",
+    191: "CWE-191: Integer Underflow",
+    193: "CWE-193: Off-by-one Error",
+    194: "CWE-194: Unexpected Sign Extension",
+    195: "CWE-195: Signed to Unsigned Conversion Error",
+    200: "CWE-200: Exposure of Sensitive Information",
+    415: "CWE-415: Double Free",
+    416: "CWE-416: Use After Free",
+    457: "CWE-457: Use of Uninitialized Variable",
+    468: "CWE-468: Incorrect Pointer Scaling",
+    469: "CWE-469: Use of Pointer Subtraction to Determine Size",
+    476: "CWE-476: NULL Pointer Dereference",
+    680: "CWE-680: Integer Overflow to Buffer Overflow",
+    787: "CWE-787: Out-of-bounds Write",
+    788: "CWE-788: Access of Memory Location After End of Buffer",
+    824: "CWE-824: Access of Uninitialized Pointer",
+}
+
+
+def assign_cwes_with_llm(
+    llm_backend,
+    challenge_name: str,
+    cwes: list[int],
+    vuln_desc: str,
+    blocks: list[dict],
+) -> None:
+    """Use an LLM to assign the most appropriate CWE(s) to each PATCHED block.
+
+    Modifies blocks in-place, setting ``cwes`` and ``issue_kind`` on each.
+    Only called when there are multiple CWEs and unnumbered blocks.
+    """
+    cwe_list = "\n".join(
+        f"  - {CWE_DESCRIPTIONS.get(c, f'CWE-{c}')}"
+        for c in cwes
+    )
+
+    block_texts = []
+    for i, b in enumerate(blocks):
+        vuln_code = b.get("vulnerable_code", "") or "(code removed by patch)"
+        patch_code = b.get("patched_code", "") or "(no replacement code)"
+        block_texts.append(
+            f"--- Patch {i+1} (in function `{b.get('function', '?')}`, "
+            f"file `{b['file']}` line {b['line']}) ---\n"
+            f"Vulnerable code:\n```c\n{vuln_code}\n```\n"
+            f"Patched code:\n```c\n{patch_code}\n```"
+        )
+
+    prompt = f"""You are a vulnerability analyst. A CGC challenge "{challenge_name}" has these CWEs:
+{cwe_list}
+
+Vulnerability description from README:
+{vuln_desc[:500] if vuln_desc else "(none)"}
+
+The challenge has {len(blocks)} patches. For each patch, determine which CWE(s) from the list above it specifically fixes.
+
+{chr(10).join(block_texts)}
+
+Reply with a JSON array of objects, one per patch, in order:
+[
+  {{"patch": 1, "cwes": [<cwe_numbers>], "reasoning": "<brief explanation>"}},
+  ...
+]
+
+Only assign CWEs from the provided list. Each patch should get the CWE(s) it specifically addresses.
+Reply with ONLY the JSON array, no other text."""
+
+    try:
+        response = llm_backend.complete(prompt)
+        # Extract JSON from response
+        text = response.strip()
+        # Handle markdown code blocks
+        if text.startswith("```"):
+            text = re.sub(r"^```\w*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        assignments = json.loads(text)
+
+        for i, assignment in enumerate(assignments):
+            if i >= len(blocks):
+                break
+            assigned_cwes = assignment.get("cwes", cwes)
+            blocks[i]["cwes"] = assigned_cwes
+            issue_kinds = [CWE_TO_ISSUE_KIND.get(c) for c in assigned_cwes]
+            blocks[i]["issue_kind"] = next((ik for ik in issue_kinds if ik), None)
+    except Exception as e:
+        print(f"  LLM CWE assignment failed for {challenge_name}: {e}",
+              file=sys.stderr)
+        # Fall back to assigning all CWEs
+        for b in blocks:
+            b["cwes"] = cwes
+            issue_kinds = [CWE_TO_ISSUE_KIND.get(c) for c in cwes]
+            b["issue_kind"] = next((ik for ik in issue_kinds if ik), None)
 
 
 def find_challenges(cgc_dir: Path) -> list[Path]:
@@ -81,37 +191,82 @@ def parse_vuln_description(readme_path: Path) -> str:
     return ""
 
 
-def find_enclosing_function(lines: list[str], target_line: int) -> str | None:
-    """Scan backwards from target_line to find the enclosing function name."""
-    brace_depth = 0
-    for i in range(target_line - 1, -1, -1):
-        line = lines[i]
-        # Count braces (reversed: } increases depth, { decreases)
-        brace_depth += line.count("}") - line.count("{")
-        if brace_depth <= 0:
-            # We're at or above the function's opening brace level.
-            # Scan this line and nearby lines for a function signature.
-            for j in range(i, max(i - 5, -1), -1):
-                candidate_line = lines[j].strip()
-                if candidate_line.startswith("#") or candidate_line.startswith("//"):
-                    continue
-                # Match: word followed by ( — typical function definition
-                m = re.search(r"\b([a-zA-Z_]\w*)\s*\(", candidate_line)
-                if m:
-                    name = m.group(1)
-                    # Skip C keywords
-                    if name not in (
-                        "if", "for", "while", "switch", "return",
-                        "sizeof", "typeof", "defined", "else",
-                    ):
-                        return name
-            # If we found brace_depth <= 0 but no function name,
-            # keep scanning upward
-    return None
+class FunctionLocator:
+    """Uses libclang to map source lines to enclosing function names."""
+
+    def __init__(self, path_remap: tuple[str, str] | None = None):
+        self._index = ci.Index.create()
+        # file_path -> sorted list of (start_line, end_line, func_name)
+        self._cache: dict[str, list[tuple[int, int, str]]] = {}
+        # e.g. ("/workspace/", "/data/csong/cgc/cb-multios/")
+        self._remap = path_remap
+
+    def _remap_str(self, s: str) -> str:
+        """Replace all occurrences of remap src with dst in s."""
+        if self._remap and self._remap[0] in s:
+            return s.replace(self._remap[0], self._remap[1])
+        return s
+
+    def _parse_file(self, file_path: str, compile_args: list[str]) -> None:
+        """Parse a file with libclang and cache its function ranges."""
+        if file_path in self._cache:
+            return
+        try:
+            tu = self._index.parse(file_path, args=compile_args)
+        except ci.TranslationUnitLoadError:
+            self._cache[file_path] = []
+            return
+
+        funcs: list[tuple[int, int, str]] = []
+        for c in tu.cursor.get_children():
+            if c.kind == ci.CursorKind.FUNCTION_DECL and c.is_definition():
+                if c.location.file and c.location.file.name == file_path:
+                    funcs.append(
+                        (c.extent.start.line, c.extent.end.line, c.spelling)
+                    )
+        funcs.sort()
+        self._cache[file_path] = funcs
+
+    def find(self, file_path: str, target_line: int,
+             compile_args: list[str]) -> str | None:
+        """Find the function enclosing target_line (1-based)."""
+        self._parse_file(file_path, compile_args)
+        for start, end, name in self._cache[file_path]:
+            if start <= target_line <= end:
+                return name
+        return None
+
+    def compile_args_for_file(
+        self, file_path: str, compile_commands: list[dict],
+    ) -> list[str]:
+        """Extract clean compile flags for file_path from compile_commands."""
+        for entry in compile_commands:
+            entry_file = self._remap_str(entry.get("file", ""))
+            if entry_file == file_path:
+                args = shlex.split(entry["command"])
+                clean: list[str] = []
+                skip = False
+                for a in args[1:]:  # skip compiler
+                    if skip:
+                        skip = False
+                        continue
+                    if a == "-o":
+                        skip = True
+                        continue
+                    if a in ("-c",):
+                        continue
+                    # Skip the source file argument
+                    if self._remap_str(a) == file_path:
+                        continue
+                    clean.append(self._remap_str(a))
+                return clean
+        return ["-x", "c", "-std=c11"]
 
 
 def parse_patched_blocks(
-    file_path: Path, rel_path: str
+    file_path: Path, rel_path: str,
+    locator: FunctionLocator | None = None,
+    compile_commands: list[dict] | None = None,
 ) -> list[dict]:
     """Parse #ifdef PATCHED / #ifndef PATCHED blocks from a source file."""
     try:
@@ -170,7 +325,13 @@ def parse_patched_blocks(
             else:
                 patched_code = ""  # No else → patch is to remove the vulnerable code
 
-        func_name = find_enclosing_function(lines, ifdef_line)
+        if locator and compile_commands is not None:
+            cc_args = locator.compile_args_for_file(
+                str(file_path), compile_commands
+            )
+            func_name = locator.find(str(file_path), ifdef_line + 1, cc_args)
+        else:
+            func_name = None
 
         blocks.append({
             "patch_id": int(patch_id) if patch_id else None,
@@ -203,7 +364,12 @@ def extract_patch_defines(
     return sorted(defines)
 
 
-def extract_challenge(challenge_dir: Path) -> dict | None:
+def extract_challenge(
+    challenge_dir: Path,
+    locator: FunctionLocator | None = None,
+    compile_commands: list[dict] | None = None,
+    llm_backend=None,
+) -> dict | None:
     """Extract ground truth for a single challenge."""
     name = challenge_dir.name
     readme = challenge_dir / "README.md"
@@ -228,7 +394,9 @@ def extract_challenge(challenge_dir: Path) -> dict | None:
     all_blocks = []
     for sf in source_files:
         rel = str(sf.relative_to(challenge_dir))
-        all_blocks.extend(parse_patched_blocks(sf, rel))
+        all_blocks.extend(parse_patched_blocks(
+            sf, rel, locator, compile_commands,
+        ))
 
     if not all_blocks:
         return None
@@ -265,19 +433,35 @@ def extract_challenge(challenge_dir: Path) -> dict | None:
                 "patched_code": block["patched_code"],
             })
 
-    for block in unnumbered_blocks:
-        issue_kinds = [CWE_TO_ISSUE_KIND.get(c) for c in cwes]
-        issue_kind = next((ik for ik in issue_kinds if ik), None)
-        vulnerabilities.append({
-            "patch_id": block["patch_id"],
-            "file": block["file"],
-            "line": block["line"],
-            "function": block["function"],
-            "issue_kind": issue_kind,
-            "cwes": cwes,
-            "vulnerable_code": block["vulnerable_code"],
-            "patched_code": block["patched_code"],
-        })
+    if unnumbered_blocks and llm_backend and len(cwes) > 1:
+        assign_cwes_with_llm(
+            llm_backend, name, cwes, vuln_desc, unnumbered_blocks,
+        )
+        for block in unnumbered_blocks:
+            vulnerabilities.append({
+                "patch_id": block["patch_id"],
+                "file": block["file"],
+                "line": block["line"],
+                "function": block["function"],
+                "issue_kind": block.get("issue_kind"),
+                "cwes": block.get("cwes", cwes),
+                "vulnerable_code": block["vulnerable_code"],
+                "patched_code": block["patched_code"],
+            })
+    else:
+        for block in unnumbered_blocks:
+            issue_kinds = [CWE_TO_ISSUE_KIND.get(c) for c in cwes]
+            issue_kind = next((ik for ik in issue_kinds if ik), None)
+            vulnerabilities.append({
+                "patch_id": block["patch_id"],
+                "file": block["file"],
+                "line": block["line"],
+                "function": block["function"],
+                "issue_kind": issue_kind,
+                "cwes": cwes,
+                "vulnerable_code": block["vulnerable_code"],
+                "patched_code": block["patched_code"],
+            })
 
     return {
         "cwes": cwes,
@@ -304,6 +488,14 @@ def main():
         "--filter", type=str, default=None,
         help="Only extract challenges matching this substring",
     )
+    parser.add_argument(
+        "--backend", type=str, default=None,
+        help="LLM backend for CWE-to-patch assignment (claude, gemini, etc.)",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Model override for LLM backend",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -324,13 +516,41 @@ def main():
         with open(cc_path) as f:
             all_cc_entries = json.load(f)
 
+    # Build a per-challenge compile_commands lookup from the master file.
+    # Keys are challenge names, values are the list of CC entries.
+    cc_by_challenge: dict[str, list[dict]] = {}
+    for entry in all_cc_entries:
+        m_ch = re.search(r"/challenges/([^/]+)/", entry.get("file", ""))
+        if m_ch:
+            cc_by_challenge.setdefault(m_ch.group(1), []).append(entry)
+
+    locator = FunctionLocator(
+        path_remap=("/workspace/", str(args.cgc_dir) + "/"),
+    )
+
+    # Create LLM backend if requested
+    llm_backend = None
+    if args.backend:
+        from llm_summary.llm import create_backend
+        kwargs = {}
+        if args.model:
+            kwargs["model"] = args.model
+        llm_backend = create_backend(args.backend, **kwargs)
+        print(f"Using LLM backend '{args.backend}' for CWE assignment")
+
     result = {"challenges": {}}
     stats = {"total": 0, "extracted": 0, "no_cwes": 0, "no_patches": 0,
-             "mappable": 0, "unmappable": 0}
+             "mappable": 0, "unmappable": 0, "llm_assigned": 0}
 
     for cdir in challenges:
         stats["total"] += 1
-        entry = extract_challenge(cdir)
+        challenge_cc = cc_by_challenge.get(cdir.name, [])
+        # Filter to unpatched entries only (no -DPATCHED in command)
+        challenge_cc = [
+            e for e in challenge_cc
+            if "-DPATCHED" not in e.get("command", "")
+        ]
+        entry = extract_challenge(cdir, locator, challenge_cc, llm_backend)
         if entry is None:
             if args.verbose:
                 cwes = parse_cwes(cdir / "README.md")

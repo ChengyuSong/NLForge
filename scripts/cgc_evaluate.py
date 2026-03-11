@@ -22,6 +22,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FUNC_SCANS_DIR = REPO_ROOT / "func-scans" / "cgc"
 
 
+def has_verification_results(db_path: Path) -> bool:
+    """Check if a functions.db has any verification summaries."""
+    if not db_path.exists():
+        return False
+    db = SummaryDB(str(db_path))
+    try:
+        row = db.conn.execute(
+            "SELECT COUNT(*) FROM verification_summaries"
+        ).fetchone()
+        return row is not None and row[0] > 0
+    except Exception:
+        return False
+    finally:
+        db.close()
+
+
 def load_verifier_issues(db_path: Path) -> dict[str, list[dict]]:
     """Load all verification issues from a functions.db, keyed by function name.
 
@@ -189,6 +205,10 @@ def main():
         "--filter", type=str, default=None,
         help="Only evaluate challenges matching this substring",
     )
+    parser.add_argument(
+        "--verified-only", action="store_true",
+        help="Only evaluate challenges that have verification results",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -210,6 +230,13 @@ def main():
             if filt in k.lower()
         }
         print(f"Filter '{args.filter}': {len(challenges)} challenges")
+
+    if args.verified_only:
+        challenges = {
+            k: v for k, v in challenges.items()
+            if has_verification_results(args.func_scans_dir / k / "functions.db")
+        }
+        print(f"Verified-only: {len(challenges)} challenges with verification results")
 
     # Evaluate each challenge
     all_results = []
