@@ -4004,5 +4004,138 @@ def show_issues(db_path, name, filter_status, severity, fmt):
         db.close()
 
 
+@main.command("gen-harness")
+@click.option("--db", "db_path", required=True, help="Database file path")
+@click.option(
+    "--backend",
+    type=click.Choice(["claude", "openai", "ollama", "llamacpp", "gemini"]),
+    default="claude",
+)
+@click.option("--model", default=None, help="Model name to use")
+@click.option("--llm-host", default="localhost", help="Hostname for local LLM backends")
+@click.option("--llm-port", default=None, type=int, help="Port for local LLM backends")
+@click.option("--disable-thinking", is_flag=True, help="Disable extended thinking")
+@click.option("-v", "--verbose", is_flag=True)
+@click.option("--log-llm", default=None, help="Log LLM interactions to file")
+@click.option(
+    "-o", "--output-dir", default=None,
+    help="Output directory for harness files (default: harnesses/<project>/)",
+)
+@click.option(
+    "-f", "--function", "function_names", multiple=True,
+    help="Function name(s) to generate harnesses for. "
+         "If omitted, generates for all functions with memsafe contracts.",
+)
+@click.option(
+    "--ko-clang-path", default=None,
+    help="Path to ko-clang binary. When set, compiles the shim and "
+         "uses LLM to fix compilation errors (up to 3 attempts).",
+)
+@click.option(
+    "--symsan-dir", default=None,
+    help="Path to SymSan install directory (auto-detected from ko-clang-path if not set).",
+)
+@click.option(
+    "--compile-commands", "compile_commands_path",
+    type=click.Path(exists=True), default=None,
+    help="Path to compile_commands.json for re-compiling source to bitcode.",
+)
+@click.option(
+    "--project-path", default=None,
+    help="Host path to project source root. Required when "
+         "compile_commands.json uses Docker container paths.",
+)
+@click.option(
+    "--build-dir", default=None,
+    help="Host path to build directory (for remapping container build paths).",
+)
+@click.option(
+    "--bc-file", default=None,
+    help="Path to pre-compiled project bitcode (.bc). "
+         "If not set, re-compiles from compile_commands.json.",
+)
+def gen_harness(
+    db_path, backend, model, llm_host, llm_port,
+    disable_thinking, verbose, log_llm, output_dir, function_names,
+    ko_clang_path, symsan_dir, compile_commands_path, project_path,
+    build_dir, bc_file,
+):
+    """Generate test harnesses for contract-guided symbolic execution.
+
+    Generates thin C shims with __dfsw_ callee stubs and test() entry points
+    that link against instrumented project bitcode via SymSan/ucsan.
+
+    Example:
+        llm-summary gen-harness --db func-scans/zlib/zlibstatic/functions.db \\
+            -f gzputc --ko-clang-path ~/fuzzing/symsan/b3/bin/ko-clang \\
+            --compile-commands /data/csong/build-artifacts/zlib/compile_commands.json \\
+            --project-path /data/csong/opensource/zlib -v
+    """
+    from pathlib import Path
+    from .harness_generator import HarnessGenerator
+
+    db = SummaryDB(db_path)
+    tmp_cc_path = None
+    try:
+        # Determine output directory
+        if output_dir is None:
+            db_p = Path(db_path)
+            project_name = db_p.parent.name
+            output_dir = str(Path("harnesses") / project_name)
+
+        # Load compile_commands.json with path remapping
+        compile_commands = None
+        if compile_commands_path:
+            compile_commands, tmp_cc_path = _load_compile_commands(
+                compile_commands_path, project_path, build_dir,
+            )
+            if verbose:
+                console.print(f"Loaded compile_commands: {len(compile_commands)} entries")
+
+        # Build LLM backend
+        backend_kwargs = _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)
+        llm = create_backend(backend, model=model, **backend_kwargs)
+        console.print(f"Using {backend} backend ({llm.model})")
+
+        generator = HarnessGenerator(
+            db, llm, verbose=verbose, log_file=log_llm,
+            ko_clang_path=ko_clang_path,
+            symsan_dir=symsan_dir,
+            compile_commands=compile_commands,
+        )
+
+        # Determine which functions to process
+        if function_names:
+            targets = list(function_names)
+        else:
+            rows = db.conn.execute(
+                "SELECT f.name FROM functions f "
+                "JOIN memsafe_summaries m ON m.function_id = f.id"
+            ).fetchall()
+            targets = [r[0] for r in rows]
+
+        console.print(f"Generating harnesses for {len(targets)} function(s)")
+        console.print(f"Output: {output_dir}/")
+
+        successes = 0
+        for func_name in targets:
+            result = generator.generate(func_name, output_dir=output_dir,
+                                        bc_file=bc_file)
+            if result:
+                successes += 1
+
+        stats = generator.stats
+        fix_msg = f", {stats['fix_attempts']} fix attempts" if stats.get('fix_attempts') else ""
+        console.print(
+            f"\nDone: {successes}/{len(targets)} harnesses generated, "
+            f"{stats['llm_calls']} LLM calls, {stats['errors']} errors{fix_msg}"
+        )
+
+    finally:
+        db.close()
+        if tmp_cc_path:
+            Path(tmp_cc_path).unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     main()
