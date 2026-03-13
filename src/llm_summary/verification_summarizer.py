@@ -513,6 +513,24 @@ class VerificationSummarizer:
             if r["name"] in all_identifiers
         ]
 
+        # Resolve types referenced in static var declarations
+        # e.g., "static engine_t *engine;" → look up engine_t typedef
+        static_type_names: set[str] = set()
+        for srow in static_rows:
+            defn = srow.get("definition") or ""
+            # Extract type name: skip 'static', 'const', 'volatile', 'unsigned', etc.
+            for tok in re.findall(r'\b([A-Za-z_]\w*)\b', defn):
+                if tok not in ("static", "const", "volatile", "unsigned",
+                               "signed", "char", "int", "long", "short",
+                               "float", "double", "void", "bool",
+                               srow["name"]):
+                    static_type_names.add(tok)
+        new_names = static_type_names - set(r["name"] for r in rows) - names
+        if new_names:
+            extra = self.db.get_typedefs_by_names(list(new_names))
+            rows.extend(extra)
+            names.update(new_names)
+
         # Deduplicate by name: same-file definition wins; among cross-file,
         # prefer shortest (least likely to be the wrong variant).
         seen: dict[str, str] = {}
