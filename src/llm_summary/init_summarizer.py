@@ -5,7 +5,7 @@ import re
 import threading
 
 from .db import SummaryDB
-from .llm.base import LLMBackend
+from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Function,
     FunctionBlock,
@@ -184,6 +184,41 @@ BLOCK_INIT_PROMPT = (
 )
 
 
+_INIT_ITEM = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "initializer": {"type": "string"},
+        "byte_count": {"type": "string"},
+        "conditional": {"type": "boolean"},
+        "condition": {"type": "string"},
+    },
+    "required": ["target", "target_kind", "initializer"],
+}
+
+INIT_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "inits": {"type": "array", "items": _INIT_ITEM},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "inits", "description"],
+})
+
+INIT_BLOCK_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "suggested_name": {"type": "string"},
+        "suggested_signature": {"type": "string"},
+        "inits": {"type": "array", "items": _INIT_ITEM},
+        "summary": {"type": "string"},
+    },
+    "required": ["suggested_name", "suggested_signature", "inits", "summary"],
+})
+
+
 class InitSummarizer:
     """Generates initialization summaries for functions using LLM."""
 
@@ -250,6 +285,7 @@ class InitSummarizer:
 
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=INIT_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
@@ -324,7 +360,9 @@ class InitSummarizer:
             try:
                 if self.verbose:
                     print(f"    Block {i+1}/{len(blocks)}: {block.label[:60]}")
-                response = self.llm.complete(prompt)
+                response = self.llm.complete(
+                    prompt, response_format=INIT_BLOCK_RESPONSE_FORMAT,
+                )
                 with self._stats_lock:
                     self._stats["llm_calls"] += 1
 
@@ -366,6 +404,7 @@ class InitSummarizer:
         try:
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=INIT_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1

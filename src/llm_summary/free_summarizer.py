@@ -5,7 +5,7 @@ import re
 import threading
 
 from .db import SummaryDB
-from .llm.base import LLMBackend
+from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     FreeOp,
     FreeSummary,
@@ -210,6 +210,42 @@ BLOCK_FREE_PROMPT = (
 )
 
 
+_FREE_ITEM = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "deallocator": {"type": "string"},
+        "conditional": {"type": "boolean"},
+        "condition": {"type": "string"},
+        "nulled_after": {"type": "boolean"},
+    },
+    "required": ["target", "target_kind", "deallocator"],
+}
+
+FREE_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "frees": {"type": "array", "items": _FREE_ITEM},
+        "resource_releases": {"type": "array", "items": _FREE_ITEM},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "frees", "resource_releases", "description"],
+})
+
+FREE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "suggested_name": {"type": "string"},
+        "suggested_signature": {"type": "string"},
+        "frees": {"type": "array", "items": _FREE_ITEM},
+        "summary": {"type": "string"},
+    },
+    "required": ["suggested_name", "suggested_signature", "frees", "summary"],
+})
+
+
 class FreeSummarizer:
     """Generates free/deallocation summaries for functions using LLM."""
 
@@ -279,6 +315,7 @@ class FreeSummarizer:
 
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=FREE_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
@@ -369,7 +406,9 @@ class FreeSummarizer:
             try:
                 if self.verbose:
                     print(f"    Block {i+1}/{len(blocks)}: {block.label[:60]}")
-                response = self.llm.complete(prompt)
+                response = self.llm.complete(
+                    prompt, response_format=FREE_BLOCK_RESPONSE_FORMAT,
+                )
                 with self._stats_lock:
                     self._stats["llm_calls"] += 1
 
@@ -402,6 +441,7 @@ class FreeSummarizer:
         try:
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=FREE_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1

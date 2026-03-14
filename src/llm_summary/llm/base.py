@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def make_json_response_format(schema: dict) -> dict:
+    """Wrap a JSON Schema dict into OpenAI-compatible response_format."""
+    return {
+        "type": "json_schema",
+        "json_schema": {"schema": schema},
+    }
+
+
 @dataclass
 class LLMResponse:
     """Response from an LLM."""

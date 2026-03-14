@@ -5,7 +5,7 @@ import re
 import threading
 
 from .db import SummaryDB
-from .llm.base import LLMBackend
+from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Function,
     FunctionBlock,
@@ -175,6 +175,54 @@ _VALID_ISSUE_KINDS = {
 _VALID_SEVERITIES = {"high", "medium", "low"}
 _VALID_CONTRACT_KINDS = {"not_null", "nullable", "not_freed", "initialized", "buffer_size"}
 
+_CONTRACT_ITEM = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string"},
+        "contract_kind": {"type": "string"},
+        "description": {"type": "string"},
+        "size_expr": {"type": "string"},
+        "relationship": {"type": "string"},
+    },
+    "required": ["target", "contract_kind", "description"],
+}
+
+_ISSUE_ITEM = {
+    "type": "object",
+    "properties": {
+        "location": {"type": "string"},
+        "issue_kind": {"type": "string"},
+        "description": {"type": "string"},
+        "severity": {"type": "string"},
+        "callee": {"type": "string"},
+        "contract_kind": {"type": "string"},
+    },
+    "required": ["location", "issue_kind", "description", "severity"],
+}
+
+VERIFY_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "simplified_contracts": {"type": "array", "items": _CONTRACT_ITEM},
+        "issues": {"type": "array", "items": _ISSUE_ITEM},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "simplified_contracts", "issues", "description"],
+})
+
+VERIFY_BLOCK_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "suggested_name": {"type": "string"},
+        "suggested_signature": {"type": "string"},
+        "issues": {"type": "array", "items": _ISSUE_ITEM},
+        "summary": {"type": "string"},
+    },
+    "required": ["suggested_name", "suggested_signature", "issues", "summary"],
+})
+
+
 class VerificationSummarizer:
     """Verifies memory safety and simplifies contracts using cross-pass data."""
 
@@ -246,6 +294,7 @@ class VerificationSummarizer:
 
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=VERIFY_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
@@ -341,7 +390,9 @@ class VerificationSummarizer:
             try:
                 if self.verbose:
                     print(f"    Block {i+1}/{len(blocks)}: {block.label[:60]}")
-                response = self.llm.complete(prompt)
+                response = self.llm.complete(
+                    prompt, response_format=VERIFY_BLOCK_RESPONSE_FORMAT,
+                )
                 with self._stats_lock:
                     self._stats["llm_calls"] += 1
 
@@ -390,6 +441,7 @@ class VerificationSummarizer:
         try:
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=VERIFY_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1

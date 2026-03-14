@@ -5,7 +5,7 @@ import re
 import threading
 
 from .db import SummaryDB
-from .llm.base import LLMBackend
+from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Allocation,
     AllocationSummary,
@@ -232,6 +232,57 @@ BLOCK_ALLOCATION_PROMPT = (
 )
 
 
+_ALLOC_ITEM = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string"},
+        "source": {"type": "string"},
+        "size_expr": {"type": "string"},
+        "size_params": {"type": "array", "items": {"type": "string"}},
+        "returned": {"type": "boolean"},
+        "stored_to": {"type": "string"},
+        "may_be_null": {"type": "boolean"},
+    },
+    "required": ["type", "source"],
+}
+
+_BSP_ITEM = {
+    "type": "object",
+    "properties": {
+        "buffer": {"type": "string"},
+        "size": {"type": "string"},
+        "kind": {"type": "string"},
+        "relationship": {"type": "string"},
+    },
+    "required": ["buffer", "size", "kind", "relationship"],
+}
+
+ALLOC_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "allocations": {"type": "array", "items": _ALLOC_ITEM},
+        "parameters": {"type": "object"},
+        "buffer_size_pairs": {"type": "array", "items": _BSP_ITEM},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "allocations", "parameters",
+                  "buffer_size_pairs", "description"],
+})
+
+ALLOC_BLOCK_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "suggested_name": {"type": "string"},
+        "suggested_signature": {"type": "string"},
+        "allocations": {"type": "array", "items": _ALLOC_ITEM},
+        "summary": {"type": "string"},
+    },
+    "required": ["suggested_name", "suggested_signature",
+                  "allocations", "summary"],
+})
+
+
 class AllocationSummarizer:
     """Generates allocation summaries for functions using LLM."""
 
@@ -312,6 +363,7 @@ class AllocationSummarizer:
 
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=ALLOC_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
@@ -403,7 +455,9 @@ class AllocationSummarizer:
                 if self.verbose:
                     print(f"    Block {i+1}/{len(blocks)}: {block.label[:60]}")
 
-                response = self.llm.complete(prompt)
+                response = self.llm.complete(
+                    prompt, response_format=ALLOC_BLOCK_RESPONSE_FORMAT,
+                )
                 with self._stats_lock:
                     self._stats["llm_calls"] += 1
 
@@ -460,6 +514,7 @@ class AllocationSummarizer:
         try:
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=ALLOC_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1

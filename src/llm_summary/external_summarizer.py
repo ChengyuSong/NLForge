@@ -12,6 +12,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from .llm.base import make_json_response_format
+
 EXTERNAL_SUMMARY_PROMPT = """\
 You are an expert in C memory safety analysis. Given the name of a function
 from libc or a common POSIX/system library, provide memory-safety summaries
@@ -113,6 +115,59 @@ class ExternalSummaryResult:
     memsafe_json: str | None
 
 
+_EXTERNAL_ALLOC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "allocations": {"type": "array", "items": {"type": "object"}},
+        "parameters": {"type": "object"},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "allocations", "parameters", "description"],
+}
+
+_EXTERNAL_FREE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "frees": {"type": "array", "items": {"type": "object"}},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "frees", "description"],
+}
+
+_EXTERNAL_INIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "inits": {"type": "array", "items": {"type": "object"}},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "inits", "description"],
+}
+
+_EXTERNAL_MEMSAFE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "contracts": {"type": "array", "items": {"type": "object"}},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "contracts", "description"],
+}
+
+EXTERNAL_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "allocation": _EXTERNAL_ALLOC_SCHEMA,
+        "free": _EXTERNAL_FREE_SCHEMA,
+        "init": _EXTERNAL_INIT_SCHEMA,
+        "memsafe": _EXTERNAL_MEMSAFE_SCHEMA,
+    },
+    "required": ["memsafe"],
+})
+
+
 class ExternalFunctionSummarizer:
     """Generates stdlib/external function summaries from function name only."""
 
@@ -134,7 +189,9 @@ class ExternalFunctionSummarizer:
         """Generate all four summary types for the named external function."""
         prompt = EXTERNAL_SUMMARY_PROMPT.format(name=name)
         try:
-            response = self.llm.complete(prompt)
+            response = self.llm.complete(
+                prompt, response_format=EXTERNAL_RESPONSE_FORMAT,
+            )
             self._stats["llm_calls"] += 1
             if self.log_file:
                 self._log(name, prompt, response)

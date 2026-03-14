@@ -5,7 +5,7 @@ import re
 import threading
 
 from .db import SummaryDB
-from .llm.base import LLMBackend
+from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Function,
     FunctionBlock,
@@ -176,6 +176,42 @@ _CALLEE_NOTE_FLAT = """\
 {flat_list}\
 """
 
+_MEMSAFE_CONTRACT_ITEM = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string"},
+        "contract_kind": {"type": "string"},
+        "description": {"type": "string"},
+        "size_expr": {"type": "string"},
+        "relationship": {"type": "string"},
+        "condition": {"type": "string"},
+    },
+    "required": ["target", "contract_kind", "description"],
+}
+
+MEMSAFE_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "function": {"type": "string"},
+        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
+        "description": {"type": "string"},
+    },
+    "required": ["function", "contracts", "description"],
+})
+
+MEMSAFE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
+    "type": "object",
+    "properties": {
+        "suggested_name": {"type": "string"},
+        "suggested_signature": {"type": "string"},
+        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
+        "summary": {"type": "string"},
+    },
+    "required": ["suggested_name", "suggested_signature",
+                  "contracts", "summary"],
+})
+
+
 class MemsafeSummarizer:
     """Generates safety contract summaries for functions using LLM."""
 
@@ -263,6 +299,7 @@ class MemsafeSummarizer:
 
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=MEMSAFE_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
@@ -338,7 +375,9 @@ class MemsafeSummarizer:
             try:
                 if self.verbose:
                     print(f"    Block {i+1}/{len(blocks)}: {block.label[:60]}")
-                response = self.llm.complete(prompt)
+                response = self.llm.complete(
+                    prompt, response_format=MEMSAFE_BLOCK_RESPONSE_FORMAT,
+                )
                 with self._stats_lock:
                     self._stats["llm_calls"] += 1
 
@@ -410,6 +449,7 @@ class MemsafeSummarizer:
         try:
             llm_response = self.llm.complete_with_metadata(
                 prompt, system=system, cache_system=cache_system,
+                response_format=MEMSAFE_RESPONSE_FORMAT,
             )
             with self._stats_lock:
                 self._stats["llm_calls"] += 1
