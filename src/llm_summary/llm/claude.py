@@ -66,6 +66,7 @@ class ClaudeBackend(LLMBackend):
 
     def complete(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> str:
         """Generate a completion using Claude."""
         response = self.complete_with_metadata(prompt, system, cache_system=cache_system)
@@ -109,6 +110,7 @@ class ClaudeBackend(LLMBackend):
 
     def complete_with_metadata(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
         kwargs = {

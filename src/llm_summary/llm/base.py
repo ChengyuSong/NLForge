@@ -33,6 +33,7 @@ class LLMBackend(ABC):
     @abstractmethod
     def complete(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> str:
         """
         Generate a completion for the given prompt.
@@ -41,6 +42,7 @@ class LLMBackend(ABC):
             prompt: The user prompt
             system: Optional system message
             cache_system: If True, request caching of the system message (backend-specific)
+            response_format: Optional response format constraint (e.g. JSON schema)
 
         Returns:
             The completion text
@@ -50,6 +52,7 @@ class LLMBackend(ABC):
     @abstractmethod
     def complete_with_metadata(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """
         Generate a completion with metadata.

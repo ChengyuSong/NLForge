@@ -73,13 +73,16 @@ class LlamaCppBackend(LLMBackend):
 
     def complete(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> str:
         """Generate a completion using llama.cpp."""
-        response = self.complete_with_metadata(prompt, system)
+        response = self.complete_with_metadata(prompt, system,
+                                               response_format=response_format)
         return response.content
 
     def complete_with_metadata(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
         # Use OpenAI-compatible chat completions endpoint for better control
@@ -98,6 +101,9 @@ class LlamaCppBackend(LLMBackend):
             # "max_tokens": 8192,
             "stream": False,
         }
+
+        if response_format:
+            payload["response_format"] = response_format
 
         # Add thinking mode control for Nemotron models
         if not self.enable_thinking:

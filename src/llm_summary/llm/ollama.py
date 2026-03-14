@@ -24,6 +24,7 @@ class OllamaBackend(LLMBackend):
 
     def complete(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> str:
         """Generate a completion using Ollama."""
         response = self.complete_with_metadata(prompt, system)
@@ -31,6 +32,7 @@ class OllamaBackend(LLMBackend):
 
     def complete_with_metadata(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
         url = f"{self.base_url}/api/generate"

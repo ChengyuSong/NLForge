@@ -49,6 +49,7 @@ class OpenAIBackend(LLMBackend):
 
     def complete(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> str:
         """Generate a completion using OpenAI."""
         response = self.complete_with_metadata(prompt, system)
@@ -56,6 +57,7 @@ class OpenAIBackend(LLMBackend):
 
     def complete_with_metadata(
         self, prompt: str, system: str | None = None, cache_system: bool = False,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
         messages = []
