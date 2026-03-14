@@ -40,9 +40,17 @@ Assume this function's own pre-conditions (contracts from the memory safety pass
 are ALREADY SATISFIED by its callers.
 Your job is to check what the function does *given* those \
 pre-conditions hold — not to re-flag them as bugs.
+An issue is only real if it can occur even when all pre-conditions are satisfied.
 
-An issue is only real if it can occur even when all \
-pre-conditions are satisfied.
+Walk the function statement by statement, tracking two kinds of state:
+- **Pointer/buffer properties**: null, non-null, freed, initialized, allocated size
+- **Integer value ranges**: bounds from checks, assignments, return values
+
+At each statement or call:
+1. **Check**: Do the tracked pre-conditions satisfy this statement's memory safety \
+requirements and each callee's pre-conditions? If not → report an issue.
+2. **Update**: Update post-conditions from the statement's effect \
+or the callee's post-conditions (allocations, frees, nullability, etc.).
 
 ## Function Under Verification
 
@@ -54,7 +62,7 @@ Function: `{name}`
 Signature: `{signature}`
 File: {file_path}
 
-{type_defs_section}## This Function's Pre-conditions (from memory safety analysis) — assume these hold
+{type_defs_section}## Pre-conditions (assume these hold)
 
 {own_contracts}
 
@@ -64,84 +72,32 @@ File: {file_path}
 
 {alias_context}
 
-## Verification Tasks
+## Verification
 
-### Check 1: Internal Safety
-Assuming all pre-conditions hold, does the function perform any unsafe operations
-(null dereference, buffer overflow, use-after-free, double-free, use of uninitialized memory)?
-Report ALL issues you find — do not omit or consolidate similar issues.
-Note: calling through a NULL function pointer (indirect call via a null pointer) is a `null_deref`.
+Report ALL issues — do not omit or consolidate.
+Calling through a NULL function pointer (indirect call via a null pointer) is a `null_deref`.
+A `nullable` callee parameter accepts NULL safely — not a bug.
+Unchecked `may_be_null` return dereferenced → `null_deref`.
+Use after callee frees → `use_after_free`.
 
 Pay special attention to these commonly missed patterns:
-- **Integer overflow in size calculations**: Can a size variable overflow its type \
-(e.g., narrow integer used in multiplication for allocation or VLA sizing)?
-- **Off-by-one in bounds checks**: Are loop bounds, size comparisons, or fence-post \
-conditions off by one?
-- **Struct field overflow**: Check struct/union type definitions to determine actual \
-field sizes. When a write targets a struct field, verify the write length does not \
-exceed the field's declared size — adjacent fields can be silently corrupted.
-- **Wrong size/length variable**: Is the correct variable used for buffer size — \
-e.g., total vs remaining length, container size vs payload size?
-- **Type confusion**: Are pointers cast to incompatible types, causing access at \
-wrong offsets or sizes?
-- **Format string misuse**: Is a non-literal string passed as the format argument \
-to printf/sprintf/fprintf-family functions? This can cause OOB reads/writes. \
-Classify as `buffer_overflow`, not `null_deref`.
+- **Integer overflow in size calculations**: narrow integer in multiplication for allocation/VLA
+- **Off-by-one in bounds checks**: loop bounds, size comparisons, fence-post errors
+- **Struct field overflow**: write length exceeds field's declared size — check type defs
+- **Wrong size variable**: total vs remaining length, container vs payload size
+- **Type confusion**: pointer cast to incompatible type, wrong offset/size
+- **Format string misuse**: non-literal format arg to printf-family → `buffer_overflow`
 
-**Do NOT report an issue if:**
-- The unsafe operation is guarded by a runtime check (e.g., `if (ptr)` before deref)
-- The condition is already covered by one of this function's own pre-conditions listed above
-- The value is guaranteed safe by a callee's post-condition \
-(e.g., successful malloc returns non-null)
-- The variable has static storage duration (file-scope `static`, `static const`, or global) \
-— the C standard guarantees these are initialized before program startup \
-(zero-initialized, then set to their declared initializer). \
-Never flag file-scope or global variables as `uninitialized_use`.
+**Not a bug if:**
+- Guarded by runtime check (e.g., `if (ptr)` before deref)
+- Covered by this function's own pre-conditions above
+- Guaranteed by callee post-condition
+- Static/global variable (C guarantees zero-init before startup)
 
-### Check 2: Callee Pre-condition Satisfaction
-For EACH call to a callee that has pre-conditions, determine whether this function
-establishes those pre-conditions before the call — given its own pre-conditions hold.
+**Contract simplification**: Drop pre-conditions satisfied internally. \
+Keep only those callers must provide.
 
-A callee pre-condition is SATISFIED if:
-- The argument is guarded before the call (e.g., null check)
-- The value comes from an allocation that guarantees the property (e.g., calloc → initialized)
-- The value flows from a parameter covered by this function's \
-own pre-conditions (propagation)
-- The callee has a `nullable` contract on that parameter (meaning it accepts NULL safely)
-
-A callee pre-condition is VIOLATED if none of the above hold — this is a real bug.
-
-**nullable contracts**: If a callee has `nullable` on a parameter, passing NULL to that parameter
-is explicitly safe — the callee handles NULL internally. Do NOT report null_deref for such calls.
-
-Also use callee post-conditions to detect internal issues:
-- If a callee's post-condition says a returned pointer may_be_null, and the caller dereferences
-  it without a null check, that is a real null_deref issue.
-- If a callee's post-condition says it frees a pointer, and the caller uses it afterwards,
-  that is a real use_after_free issue.
-
-### Check 3: Sequential Call Chain Consistency
-Track the state of each value across the sequence of calls in the function body.
-After each call, apply its post-conditions to update the state of affected values,
-then check whether the next call's pre-conditions are satisfied given that updated state.
-
-Examples of violations to detect:
-- `foo(x)` post-condition: x is freed → `bar(x)` pre-condition: x must not be freed
-  → use_after_free at the call to bar
-- `foo(x)` post-condition: x->field is initialized → `bar(x)` pre-condition: x must be initialized
-  → satisfied (no issue)
-- `p = alloc()` post-condition: may_be_null → `foo(p)` pre-condition: p not_null
-  → null_deref at the call to foo if no null check between alloc and foo
-
-### Check 4: Contract Simplification
-For each of this function's own pre-conditions: is it actually needed, or is it satisfied
-internally before first use? Keep only those that callers must genuinely satisfy.
-
-## Severity Guidelines
-
-- **high**: Definite violation unconditionally reachable given valid inputs
-- **medium**: Violation reachable on a specific code path with valid inputs
-- **low**: Violation only reachable on error paths or under highly unusual conditions
+**Severity**: high = unconditional, medium = specific path, low = error path
 
 ## Output
 
@@ -150,35 +106,15 @@ Respond with JSON:
 {{
   "function": "{name}",
   "simplified_contracts": [
-    {{
-      "target": "parameter or expression",
-      "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
-      "description": "brief description",
-      "size_expr": "n (buffer_size only, omit otherwise)",
-      "relationship": "byte_count (buffer_size only, omit otherwise)"
-    }}
+    {{"target": "param", "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
+      "description": "brief", "size_expr": "buffer_size only", "relationship": "buffer_size only"}}
   ],
   "issues": [
-    {{
-      "location": "line 42 or call to foo at line 42",
-      "issue_kind": "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use",
-      "description": "what the problem is",
-      "severity": "high|medium|low",
-      "callee": "callee_name (if callee contract violation, omit if internal)",
-      "contract_kind": "which contract kind was violated (omit if internal)"
-    }}
+    {{"location": "line N", "issue_kind": "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use",
+      "description": "the problem", "severity": "high|medium|low",
+      "callee": "if contract violation", "contract_kind": "if contract violation"}}
   ],
-  "description": "One-sentence verification summary"
-}}
-```
-
-If no issues and no contracts remain:
-```json
-{{
-  "function": "{name}",
-  "simplified_contracts": [],
-  "issues": [],
-  "description": "Function is internally safe with no propagated contracts"
+  "description": "One-sentence summary"
 }}
 ```
 """
