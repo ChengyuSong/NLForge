@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS typedefs (
     file_path TEXT NOT NULL,
     line_number INTEGER,
     definition TEXT,
+    pp_definition TEXT,
     UNIQUE(name, kind, file_path)
 );
 
@@ -333,6 +334,9 @@ class SummaryDB:
             self.conn.commit()
         if columns and "definition" not in columns:
             self.conn.execute("ALTER TABLE typedefs ADD COLUMN definition TEXT")
+            self.conn.commit()
+        if columns and "pp_definition" not in columns:
+            self.conn.execute("ALTER TABLE typedefs ADD COLUMN pp_definition TEXT")
             self.conn.commit()
 
         # Add canonical_signature, params_json, callsites_json columns to functions if missing
@@ -1622,13 +1626,16 @@ class SummaryDB:
         """Batch insert type declarations.
 
         Each dict has name, kind, underlying_type, canonical_type, file_path,
-        line_number, and optionally definition.
+        line_number, and optionally definition and pp_definition.
         """
         self.conn.executemany(
             """
-            INSERT OR IGNORE INTO typedefs
-            (name, kind, underlying_type, canonical_type, file_path, line_number, definition)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO typedefs
+            (name, kind, underlying_type, canonical_type, file_path, line_number,
+             definition, pp_definition)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, kind, file_path) DO UPDATE SET
+                pp_definition = COALESCE(excluded.pp_definition, typedefs.pp_definition)
             """,
             [
                 (
@@ -1639,6 +1646,7 @@ class SummaryDB:
                     td["file_path"],
                     td.get("line_number"),
                     td.get("definition"),
+                    td.get("pp_definition"),
                 )
                 for td in typedefs
             ],

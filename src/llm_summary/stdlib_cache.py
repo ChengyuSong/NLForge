@@ -164,11 +164,13 @@ class StdlibCache:
         )
         self.conn.commit()
 
-    def seed_builtins(self) -> int:
-        """Populate cache with hand-crafted entries from stdlib.py (idempotent).
+    def seed_builtins(self, force: bool = False) -> int:
+        """Populate cache with hand-crafted entries from stdlib.py.
 
-        Only inserts rows that do not already exist.  Returns the number of
-        new entries added.
+        When force=False (default), only inserts rows that do not already
+        exist.  When force=True, overwrites any existing DB-seeded entry so
+        that hand-crafted builtins always take priority.  Returns the number
+        of entries written.
         """
         from .stdlib import (
             get_all_stdlib_free_summaries,
@@ -185,7 +187,7 @@ class StdlibCache:
         all_names = set(alloc) | set(free) | set(init) | set(memsafe)
         added = 0
         for name in sorted(all_names):
-            if self.has(name):
+            if not force and self.has(name):
                 continue
             self.put(
                 name=name,

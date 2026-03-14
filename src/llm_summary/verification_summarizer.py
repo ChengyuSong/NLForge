@@ -523,11 +523,13 @@ class VerificationSummarizer:
 
         # Deduplicate by name: same-file definition wins; among cross-file,
         # prefer shortest (least likely to be the wrong variant).
+        # pp_definition stores the annotated macro-expanded form (// (macro) lines)
+        # produced at scan time; use it when available so the LLM sees concrete values.
         seen: dict[str, str] = {}
         seen_from_same_file: set[str] = set()
         for row in rows + static_rows:
             name = row["name"]
-            defn = row.get("definition") or ""
+            defn = row.get("pp_definition") or row.get("definition") or ""
             if not defn:
                 continue
             same_file = row.get("file_path") == file_path

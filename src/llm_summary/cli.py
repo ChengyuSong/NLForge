@@ -1019,10 +1019,11 @@ def init_stdlib(
             + (f", {skipped_internal} internal symbols skipped" if skipped_internal else "")
         )
 
-    # 4. Seed hand-crafted builtins as fallback for anything not covered above
-    seeded = cache.seed_builtins()
+    # 4. Seed hand-crafted builtins — always wins over DB-seeded entries so
+    #    carefully reviewed contracts take priority over LLM-generated ones.
+    seeded = cache.seed_builtins(force=True)
     if seeded:
-        console.print(f"  Seeded {seeded} hand-crafted builtin entries into cache (fallback)")
+        console.print(f"  Seeded {seeded} hand-crafted builtin entries into cache (priority)")
 
     if not db_path:
         cache.close()
@@ -1035,6 +1036,8 @@ def init_stdlib(
         sourceless = [f for f in all_funcs if not f.source]
 
         def _needs_summary(f: Function) -> bool:
+            if force:
+                return True  # re-apply all when --force is given
             assert f.id is not None
             return (
                 db.get_summary_by_function_id(f.id) is None

@@ -706,8 +706,10 @@ STDLIB_MEMSAFE_SUMMARIES: dict[str, MemsafeSummary] = {
             ),
         ],
         description=(
-            "Requires str to have at least size bytes"
-            " and format to be non-NULL."
+            "Writes at most size bytes to str (including the null terminator);"
+            " output is truncated if the formatted result would exceed size-1"
+            " chars — str can never overflow regardless of argument values."
+            " Requires str to point to at least size bytes and format to be non-NULL."
         ),
     ),
     "printf": MemsafeSummary(

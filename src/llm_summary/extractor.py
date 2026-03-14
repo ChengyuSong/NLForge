@@ -15,7 +15,7 @@ from clang.cindex import (
 )
 
 from .compile_commands import CompileCommandsDB
-from .models import Function, FunctionBlock
+from .models import Function, FunctionBlock, _annotate_macro_diff
 from .preprocessor import PreprocessedFile, SourcePreprocessor
 
 _SYSTEM_HEADER_PREFIXES = (
@@ -31,6 +31,21 @@ _SYSTEM_HEADER_PREFIXES = (
 def _is_system_header(file_path: str) -> bool:
     """Return True if file_path looks like a system header (not project-local)."""
     return any(file_path.startswith(p) for p in _SYSTEM_HEADER_PREFIXES)
+
+
+def _annotate_pp_definition(definition: str | None, pp_definition: str | None) -> str | None:
+    """Return annotated diff of definition vs pp_definition when they differ.
+
+    When a typedef/struct/static_var definition contains macros, the
+    preprocessed form has concrete values (e.g. 200 instead of
+    JMSG_LENGTH_MAX).  Annotating the diff with ``// (macro)`` comments lets
+    the LLM see both the symbolic name and the expanded value.
+    """
+    if not definition or not pp_definition:
+        return pp_definition
+    if pp_definition == definition:
+        return pp_definition
+    return _annotate_macro_diff(definition, pp_definition)
 
 
 def configure_libclang(libclang_path: str | None = None) -> None:
@@ -768,12 +783,15 @@ class FunctionExtractor:
         """Extract type declarations from a pre-parsed translation unit."""
         file_path = Path(file_path).resolve()
         results: list[dict] = []
-        self._extract_type_decls_recursive(tu.cursor, str(file_path), results)
+        # Reuse pp_file from cache if preprocessing was done for this file
+        pp_file = self._pp_cache.get(str(file_path))
+        self._extract_type_decls_recursive(tu.cursor, str(file_path), results, pp_file=pp_file)
         return results
 
     def _extract_type_decls_recursive(
         self, cursor: Cursor, main_file: str, results: list[dict],
         seen_locations: set[tuple[str, int]] | None = None,
+        pp_file: PreprocessedFile | None = None,
     ) -> None:
         """Recursively extract type declarations from AST.
 
@@ -798,6 +816,12 @@ class FunctionExtractor:
                 underlying = child.underlying_typedef_type.spelling
                 canonical = child.underlying_typedef_type.get_canonical().spelling
                 definition = self._get_full_source(child) or None
+                pp_definition = _annotate_pp_definition(
+                    definition,
+                    pp_file.extract_pp_source(
+                        child_file, child.extent.start.line, child.extent.end.line
+                    ) if pp_file else None,
+                )
                 results.append({
                     "name": child.spelling,
                     "kind": "typedef",
@@ -806,6 +830,7 @@ class FunctionExtractor:
                     "file_path": child_file,
                     "line_number": child.location.line,
                     "definition": definition,
+                    "pp_definition": pp_definition,
                 })
 
             elif child.kind == CursorKind.TYPE_ALIAS_DECL:
@@ -817,6 +842,12 @@ class FunctionExtractor:
                 underlying = child.underlying_typedef_type.spelling
                 canonical = child.underlying_typedef_type.get_canonical().spelling
                 definition = self._get_full_source(child) or None
+                pp_definition = _annotate_pp_definition(
+                    definition,
+                    pp_file.extract_pp_source(
+                        child_file, child.extent.start.line, child.extent.end.line
+                    ) if pp_file else None,
+                )
                 results.append({
                     "name": child.spelling,
                     "kind": "using",
@@ -825,6 +856,7 @@ class FunctionExtractor:
                     "file_path": child_file,
                     "line_number": child.location.line,
                     "definition": definition,
+                    "pp_definition": pp_definition,
                 })
 
             elif child.kind in (
@@ -848,6 +880,12 @@ class FunctionExtractor:
                     type_spelling = child.type.spelling
                     canonical = child.type.get_canonical().spelling
                     definition = self._get_full_source(child) or None
+                    pp_definition = _annotate_pp_definition(
+                        definition,
+                        pp_file.extract_pp_source(
+                            child_file, child.extent.start.line, child.extent.end.line
+                        ) if pp_file else None,
+                    )
                     results.append({
                         "name": child.spelling,
                         "kind": kind_map[child.kind],
@@ -856,6 +894,7 @@ class FunctionExtractor:
                         "file_path": child_file,
                         "line_number": child.location.line,
                         "definition": definition,
+                        "pp_definition": pp_definition,
                     })
 
             elif child.kind == CursorKind.VAR_DECL:
@@ -872,6 +911,12 @@ class FunctionExtractor:
                         type_spelling = child.type.spelling
                         canonical = child.type.get_canonical().spelling
                         definition = self._get_full_source(child) or None
+                        pp_definition = _annotate_pp_definition(
+                            definition,
+                            pp_file.extract_pp_source(
+                                child_file, child.extent.start.line, child.extent.end.line
+                            ) if pp_file else None,
+                        )
                         results.append({
                             "name": child.spelling,
                             "kind": "static_var",
@@ -880,6 +925,7 @@ class FunctionExtractor:
                             "file_path": main_file,
                             "line_number": child.location.line,
                             "definition": definition,
+                            "pp_definition": pp_definition,
                         })
 
             # Recurse into namespaces and class/struct bodies for nested types,
@@ -890,7 +936,9 @@ class FunctionExtractor:
                 CursorKind.STRUCT_DECL,
                 CursorKind.UNION_DECL,
             ) and child_file == main_file:
-                self._extract_type_decls_recursive(child, main_file, results, seen_locations)
+                self._extract_type_decls_recursive(
+                    child, main_file, results, seen_locations, pp_file=pp_file
+                )
 
     def _get_file_lines(self, file_path: str) -> list[str]:
         """Return cached splitlines(keepends=True) for a file."""
