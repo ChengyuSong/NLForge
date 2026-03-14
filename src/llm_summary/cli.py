@@ -3187,7 +3187,7 @@ def discover_link_units(
         console.print("[green]Deterministic discovery succeeded (no LLM needed)[/green]")
     else:
         # Try heuristic path (prescan + Makefile parsing)
-        console.print("[yellow]No deterministic path found — trying heuristic discovery...[/yellow]")
+        console.print("[yellow]No build.ninja — trying heuristic discovery...[/yellow]")
 
         from .link_units.skills import discover_heuristic
 
@@ -4054,11 +4054,21 @@ def show_issues(db_path, name, filter_status, severity, fmt):
     help="Path to pre-compiled project bitcode (.bc). "
          "If not set, re-compiles from compile_commands.json.",
 )
+@click.option(
+    "--plan", is_flag=True, default=False,
+    help="After generating harnesses, also generate LLM trace plans "
+         "(annotate source with BB IDs and query LLM for exploration strategy).",
+)
+@click.option(
+    "--plan-only", is_flag=True, default=False,
+    help="Only generate trace plans (skip harness generation). "
+         "Requires existing harness files in the output directory.",
+)
 def gen_harness(
     db_path, backend, model, llm_host, llm_port,
     disable_thinking, verbose, log_llm, output_dir, function_names,
     ko_clang_path, symsan_dir, compile_commands_path, project_path,
-    build_dir, bc_file,
+    build_dir, bc_file, plan, plan_only,
 ):
     """Generate test harnesses for contract-guided symbolic execution.
 
@@ -4068,6 +4078,12 @@ def gen_harness(
     Example:
         llm-summary gen-harness --db func-scans/zlib/zlibstatic/functions.db \\
             -f gzputc --ko-clang-path ~/fuzzing/symsan/b3/bin/ko-clang \\
+            --compile-commands /data/csong/build-artifacts/zlib/compile_commands.json \\
+            --project-path /data/csong/opensource/zlib -v
+
+        # Plan only (skip shim regeneration):
+        llm-summary gen-harness --db func-scans/zlib/zlibstatic/functions.db \\
+            -f gzputc --plan-only --symsan-dir ~/fuzzing/symsan/b3 \\
             --compile-commands /data/csong/build-artifacts/zlib/compile_commands.json \\
             --project-path /data/csong/opensource/zlib -v
     """
@@ -4114,22 +4130,40 @@ def gen_harness(
             ).fetchall()
             targets = [r[0] for r in rows]
 
-        console.print(f"Generating harnesses for {len(targets)} function(s)")
-        console.print(f"Output: {output_dir}/")
+        # Generate harnesses (unless --plan-only)
+        if not plan_only:
+            console.print(f"Generating harnesses for {len(targets)} function(s)")
+            console.print(f"Output: {output_dir}/")
 
-        successes = 0
-        for func_name in targets:
-            result = generator.generate(func_name, output_dir=output_dir,
-                                        bc_file=bc_file)
-            if result:
-                successes += 1
+            successes = 0
+            for func_name in targets:
+                result = generator.generate(func_name, output_dir=output_dir,
+                                            bc_file=bc_file)
+                if result:
+                    successes += 1
 
-        stats = generator.stats
-        fix_msg = f", {stats['fix_attempts']} fix attempts" if stats.get('fix_attempts') else ""
-        console.print(
-            f"\nDone: {successes}/{len(targets)} harnesses generated, "
-            f"{stats['llm_calls']} LLM calls, {stats['errors']} errors{fix_msg}"
-        )
+            stats = generator.stats
+            fix_msg = f", {stats['fix_attempts']} fix attempts" if stats.get('fix_attempts') else ""
+            console.print(
+                f"\nDone: {successes}/{len(targets)} harnesses generated, "
+                f"{stats['llm_calls']} LLM calls, {stats['errors']} errors{fix_msg}"
+            )
+        else:
+            successes = len(targets)  # assume harnesses exist
+
+        # Generate trace plans
+        if (plan or plan_only) and successes > 0:
+            console.print("\nGenerating trace plans...")
+            plan_ok = 0
+            for func_name in targets:
+                result = generator.generate_plan(
+                    func_name, output_dir=output_dir, bc_file=bc_file,
+                )
+                if result:
+                    plan_ok += 1
+                    plan_file = Path(output_dir) / f"plan_{func_name}.json"
+                    console.print(f"  Plan: {plan_file}")
+            console.print(f"Plans generated: {plan_ok}/{len(targets)}")
 
     finally:
         db.close()

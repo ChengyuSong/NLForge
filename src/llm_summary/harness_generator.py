@@ -93,9 +93,12 @@ Parameters: {params_json}
 ## Important: Callee stub convention
 
 Callee stubs receive extra `dfsan_label` arguments — one per original parameter, \
-plus a `dfsan_label *ret_label` pointer at the end.
+plus a `dfsan_label *ret_label` pointer at the end (ONLY if the function returns non-void).
 
-Example: for `int foo(char *buf, size_t len)`, the stub is:
+**CRITICAL**: If the callee returns `void`, do NOT add `ret_label` — dfsan does \
+not pass one for void functions, so reading/writing it causes a segfault.
+
+Example for non-void: `int foo(char *buf, size_t len)`:
 ```c
 int foo(char *buf, size_t len,
         dfsan_label buf_label, dfsan_label len_label,
@@ -104,6 +107,15 @@ int foo(char *buf, size_t len,
     __taint_check_bounds(buf_label, (uintptr_t)buf, len_label, len);  // buffer_size
     *ret_label = 0;
     return 0;
+}}
+```
+
+Example for void: `void bar(void *state, int err, const char *msg)`:
+```c
+void bar(void *state, int err, const char *msg,
+         dfsan_label state_label, dfsan_label err_label, dfsan_label msg_label) {{
+    __taint_assert((uint64_t)state, state_label, 0, 0, bvneq);
+    // NO ret_label parameter, NO *ret_label = 0
 }}
 ```
 
@@ -120,7 +132,8 @@ for buffer_size contracts (triggers GEP bounds check)
 
 For each callee that has contracts above, generate a stub with the **original callee name**:
 - Each stub receives the original parameters PLUS a `dfsan_label` for each \
-parameter AND a `dfsan_label *ret_label` at the end
+parameter AND a `dfsan_label *ret_label` at the end (ONLY if non-void return)
+- **If the callee returns void**: NO `ret_label` parameter, NO `*ret_label = 0`
 - For `not_null` contracts: \
 `__taint_assert((uint64_t)ptr, ptr_label, 0, 0, bvneq);`
 - For `buffer_size` contracts: \
@@ -134,16 +147,22 @@ parameter AND a `dfsan_label *ret_label` at the end
 
 ### Section 2: test() function (```test ... ```)
 
-A plain `void test(...)` C function — only plain C types in the signature, \
-no dfsan_label parameters, no ret_label pointer. \
+A plain `void test(...)` C function. \
 Its arguments are auto-symbolized by SymSan:
-- **All scalar parameters** of the target function become `test()` arguments \
-(use plain C types: `int`, `unsigned long`, `size_t`, etc.)
-- **Pointer parameters** are NOT `test()` arguments — allocate them inside:
-  - If the pointer has a `buffer_size` contract: `ptr = malloc(size_expr)` \
-(if `relationship` is `element_count`, multiply by element size)
-  - If the pointer has only `not_null` (no `buffer_size`): `ptr = malloc(64)`
-  - For struct/opaque pointer params: `ptr = malloc(256)` (opaque, don't set fields)
+- **Pointer parameters** of the target become `void *` arguments in `test()`. \
+Inside test(), allocate a fresh buffer and **memcpy** from the symbolic input \
+to give it a valid concrete address while preserving symbolic taint on fields:
+  ```c
+  void test(void *input_ptr, int x) {{
+      void *ptr = malloc(256);
+      memcpy(ptr, input_ptr, 256);
+      target_func(ptr, x);
+  }}
+  ```
+  - For `buffer_size` contracts: use the contract size instead of 256
+  - The `malloc + memcpy` pattern is required — without memcpy the struct fields \
+are concrete zeros and branches on them won't be symbolic
+- **Scalar parameters** become plain C type arguments (`int`, `size_t`, etc.)
 - SymSan auto-tracks malloc buffer sizes, no guards or assumes needed
 - Call the target function, casting `void *` to the expected type if needed
 - **After the call**, assert post-conditions using these primitives:
@@ -212,6 +231,98 @@ __symsan_assume, __taint_check_bounds) are NOT your responsibility.
 ```test
 ... fixed test() ...
 ```
+"""
+
+
+PLAN_PROMPT = """\
+You are a concolic execution planner. Given a function's source code annotated \
+with BB IDs and branch successors, its memory safety contracts, and callee \
+contracts, produce a trace plan that tells the concolic executor which \
+edges (transitions between BBs) to target.
+
+## How concolic execution works
+
+The executor starts with an empty input and runs the function symbolically. \
+At each conditional branch, the SMT solver can generate a new input ("seed") \
+that flips the branch. The scheduler picks which seed to run next.
+
+Each conditional branch is annotated as:
+  `/* [BB:X cond <pred> T:Y F:Z] */`
+where X is the branch's BB ID, Y is the BB entered when the condition is true, \
+and Z is the BB entered when false.
+
+IMPORTANT: Source-level true/false may be INVERTED at the IR level. \
+Always use the T: and F: annotations to determine which BB is reached \
+for each direction — do NOT assume source-level if/else maps directly.
+
+A branch marked `loop` is a loop back-edge.
+
+## Target Function
+
+Name: `{name}`
+Signature: `{signature}`
+
+## Contracts to Assess
+
+{contracts_section}
+
+## Callee Contracts
+
+{callee_section}
+
+## Post-conditions
+
+{postconds_section}
+
+## Annotated Source Code (with BB IDs and branch successors)
+
+```c
+{annotated_source}
+```
+
+## Your Task
+
+Analyze the code and contracts. For each contract/post-condition, determine \
+which execution path exercises it by identifying the **edge** (BB transition) \
+that must be taken.
+
+Output a JSON trace plan with edges:
+
+```json
+{{
+  "function": "{name}",
+  "traces": [
+    {{
+      "goal": "what contract/post-condition this trace assesses",
+      "description": "brief explanation of the path",
+      "target_edges": [{{"from": 100000, "to": 100001}}],
+      "priority": 1
+    }}
+  ],
+  "deprioritize": [
+    {{
+      "bb_id": 100004,
+      "reason": "why this branch is not worth exploring for contract assessment"
+    }}
+  ]
+}}
+```
+
+Guidelines:
+- `target_edges`: Each edge is `{{"from": X, "to": Y}}` meaning we want execution \
+to transition from BB X to BB Y. Use the T:/F: annotations to pick the right \
+successor. A trace may have multiple edges if the path requires multiple branches.
+- `priority`: 1 = must explore, 2 = nice to have, 3 = low priority.
+- `deprioritize`: branches that are redundant for contract assessment \
+(e.g., deeper loop iterations, arithmetic branches unrelated to memory safety).
+- Focus on paths that exercise **different** contract-relevant behaviors \
+(e.g., different buffer access patterns, null vs non-null paths, error vs success).
+- Don't plan traces for unreachable paths or paths that test the exact same \
+contract clause as another trace.
+- Loops: typically one iteration is enough to test bounds. Mark loop back-edges \
+as deprioritize unless the access pattern changes across iterations.
+
+Output ONLY the JSON block, no other text.
 """
 
 
@@ -341,6 +452,8 @@ class HarnessGenerator:
 
             # Post-process: add __dfsw_ prefix to callee stub function names
             stubs = self._add_dfsw_prefix(stubs, callee_contracts)
+            # Post-process: fix void stubs that incorrectly have ret_label
+            stubs = self._fix_void_ret_labels(stubs, callee_contracts)
 
             # Assemble shim
             c_code = SHIM_TEMPLATE.format(
@@ -407,8 +520,8 @@ class HarnessGenerator:
                 ucsan_config = self._build_ucsan_config(func_name)
                 config_path.write_text(ucsan_config)
 
-                # Write abilist files
-                if self.symsan_dir and callee_contracts:
+                # Write abilist files (always — even leaf functions need them)
+                if self.symsan_dir:
                     # Shim abilist (same file for both ucsan and taint passes)
                     shim_abl = out / f"shim_abilist_{func_name}.txt"
                     shim_abl.write_text(self._build_shim_abilist())
@@ -420,8 +533,8 @@ class HarnessGenerator:
 
                     # Target taint abilist (callees as uninstrumented+custom)
                     target_taint_abl = out / f"target_taint_abilist_{func_name}.txt"
-                    target_taint_abl.write_text(
-                        self._build_target_taint_abilist(callee_contracts))
+                    taint_abl_content = self._build_target_taint_abilist(callee_contracts)
+                    target_taint_abl.write_text(taint_abl_content or "# No callee contracts\n")
 
                 # Write build script
                 build_script = self._build_script(func_name, out, bc_file)
@@ -444,6 +557,275 @@ class HarnessGenerator:
                 import traceback
                 traceback.print_exc()
             return None
+
+    def generate_plan(
+        self,
+        func_name: str,
+        output_dir: str,
+        source_file: str | None = None,
+        bc_file: str | None = None,
+    ) -> dict | None:
+        """Generate a trace plan for contract-guided exploration.
+
+        Requires an already-built harness (shim + BC). Compiles the target BC
+        with -O1 -g, runs UCSanPass to get BB IDs, annotates the source,
+        and queries the LLM for a trace plan.
+
+        Args:
+            func_name: Target function name.
+            output_dir: Harness output directory (contains shim, abilists, etc).
+            source_file: Path to the source file containing the target function.
+            bc_file: Path to project bitcode (will recompile with -g if needed).
+
+        Returns:
+            Plan dict or None on error.
+        """
+        from .bbid_extractor import (
+            extract_bbids, format_annotated_source, parse_cfg_dump,
+        )
+
+        out = Path(output_dir)
+
+        # Look up function
+        funcs = self.db.get_function_by_name(func_name)
+        if not funcs:
+            if self.verbose:
+                print(f"  Function not found: {func_name}")
+            return None
+        func = funcs[0]
+
+        # Resolve source file
+        if not source_file and func.file_path:
+            source_file = func.file_path
+        if not source_file:
+            if self.verbose:
+                print(f"  No source file for: {func_name}")
+            return None
+
+        # Compile to BC with -O1 -g for debug info + loop detection
+        if not bc_file and self.compile_commands and source_file:
+            bc_file = self._compile_to_bc_debug(source_file, out)
+        if not bc_file:
+            if self.verbose:
+                print(f"  No bitcode available for: {func_name}")
+            return None
+
+        # Run UCSanPass to get BB ID annotations and CFG dump
+        result_path = self._instrument_for_bbids(func_name, bc_file, out)
+        if not result_path:
+            if self.verbose:
+                print(f"  Failed to instrument for BB IDs: {func_name}")
+            return None
+
+        # Extract BB IDs from IR (for source line mapping)
+        ir_path = out / f"bbids_{func_name}.ll"
+        source_dir = str(Path(source_file).parent)
+        infos = extract_bbids(str(ir_path), source_dir)
+
+        # Merge successor info from CFG dump (authoritative T/F mapping)
+        cfg_path = out / f"cfg_{func_name}.txt"
+        if cfg_path.exists():
+            cfg = parse_cfg_dump(str(cfg_path))
+            cfg_bbs = {e["bb_id"]: e for e in cfg.get(func_name, [])}
+            for info in infos:
+                if info.bb_id in cfg_bbs:
+                    entry = cfg_bbs[info.bb_id]
+                    if entry["type"] == "C":
+                        info.is_conditional = True
+                        info.true_bb_id = entry["true_bb"]
+                        info.false_bb_id = entry["false_bb"]
+            if self.verbose:
+                print(f"  Loaded CFG: {len(cfg_bbs)} BBs from {cfg_path.name}")
+
+        annotated = format_annotated_source(infos, source_file)
+
+        if self.verbose:
+            print(f"  Extracted {len(infos)} BB IDs")
+
+        # Get contracts
+        row = self.db.conn.execute(
+            "SELECT summary_json FROM memsafe_summaries WHERE function_id = ?",
+            (func.id,),
+        ).fetchone()
+        memsafe_data = json.loads(row[0]) if row else {}
+        contracts = memsafe_data.get("contracts", [])
+
+        callee_contracts = self._gather_callee_contracts(func.id)
+        postconds = self._gather_postconditions(func.id)
+
+        # Build prompt
+        prompt = PLAN_PROMPT.format(
+            name=func.name,
+            signature=func.signature,
+            contracts_section=self._format_contracts(contracts),
+            callee_section=self._format_callee_contracts(callee_contracts),
+            postconds_section=self._format_postconditions(postconds),
+            annotated_source=annotated,
+        )
+
+        try:
+            if self.verbose:
+                print(f"  Generating trace plan for: {func_name}")
+
+            response = self.llm.complete(prompt)
+            self._stats["llm_calls"] += 1
+
+            if self.log_file:
+                self._log_interaction(f"{func_name}_plan", prompt, response)
+
+            # Parse JSON from response
+            json_match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
+            if json_match:
+                plan = json.loads(json_match.group(1))
+            else:
+                # Try parsing entire response as JSON
+                plan = json.loads(response.strip())
+
+            # Post-process: convert target_edges → target_bids (branch IDs to flip)
+            # Build successor map from BBInfo: bb_id → (true_bb_id, false_bb_id)
+            succ_map = {}
+            for bb in infos:
+                if bb.is_conditional and bb.true_bb_id is not None:
+                    succ_map[bb.bb_id] = (bb.true_bb_id, bb.false_bb_id)
+
+            for trace in plan.get("traces", []):
+                edges = trace.pop("target_edges", [])
+                flip_bids = set()
+                for edge in edges:
+                    src = edge.get("from")
+                    dst = edge.get("to")
+                    if src not in succ_map:
+                        if self.verbose:
+                            print(f"    Warning: BB {src} is not a conditional branch")
+                        continue
+                    true_bb, false_bb = succ_map[src]
+                    if dst == true_bb:
+                        # Want T path — flip needed if default takes F
+                        # Scheduler can't know default direction, so always
+                        # track this branch. Coverage = branch was flipped OR
+                        # destination was visited.
+                        flip_bids.add(src)
+                    elif dst == false_bb:
+                        # Want F path — same: track this branch
+                        flip_bids.add(src)
+                    else:
+                        if self.verbose:
+                            print(
+                                f"    Warning: edge {src}→{dst} doesn't match "
+                                f"successors T:{true_bb} F:{false_bb}"
+                            )
+                trace["target_bids"] = sorted(flip_bids)
+
+            # Write plan
+            plan_path = out / f"plan_{func_name}.json"
+            plan_path.write_text(json.dumps(plan, indent=2))
+
+            if self.verbose:
+                n_traces = len(plan.get("traces", []))
+                n_depri = len(plan.get("deprioritize", []))
+                print(f"    Plan: {n_traces} traces, {n_depri} deprioritized")
+                print(f"    Wrote: {plan_path}")
+
+            return plan
+
+        except Exception as e:
+            self._stats["errors"] += 1
+            if self.verbose:
+                print(f"  Error generating plan for {func_name}: {e}")
+                import traceback
+                traceback.print_exc()
+            return None
+
+    def _compile_to_bc_debug(self, source_file: str, output_dir: Path) -> str | None:
+        """Compile source to BC with -O1 -g (for loop detection + debug info)."""
+        if not self.compile_commands:
+            return None
+
+        source_path = Path(source_file)
+        if not source_path.exists():
+            return None
+
+        flags = self.compile_commands.get_compile_flags(source_file)
+        if not flags:
+            return None
+
+        # Filter and force -O1 -g
+        filtered = []
+        for f in flags:
+            if f.startswith(("-flto", "-save-temps", "-g", "-O")):
+                continue
+            filtered.append(f)
+
+        bc_name = source_path.stem + "_dbg.bc"
+        bc_path = output_dir / bc_name
+
+        cmd = ["clang-14"] + filtered + [
+            "-O1", "-g",
+            "-emit-llvm", "-c", str(source_path), "-o", str(bc_path),
+        ]
+
+        if self.verbose:
+            print(f"    Compiling with -O1 -g: {source_path.name} -> {bc_name}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            if self.verbose:
+                print(f"    Debug BC compilation failed:\n{result.stderr[:500]}")
+            return None
+
+        return str(bc_path)
+
+    def _instrument_for_bbids(
+        self, func_name: str, bc_file: str, output_dir: Path,
+    ) -> str | None:
+        """Run UCSanPass only on BC to get BB ID annotations and CFG dump.
+
+        Returns path to the IR file, or None on failure.
+        CFG dump is written as a side-effect to cfg_{func_name}.txt.
+        """
+        if not self.symsan_dir:
+            return None
+
+        ucsan_pass = self.symsan_dir / "lib" / "symsan" / "UCSanPass.so"
+        # Use target ucsan abilist if it exists, otherwise standard
+        target_abilist = output_dir / f"target_ucsan_abilist_{func_name}.txt"
+        if not target_abilist.exists():
+            target_abilist = self.symsan_dir / "lib" / "symsan" / "ucsan_abilist.txt"
+
+        config_path = output_dir / f"config_{func_name}.yaml"
+        ir_path = output_dir / f"bbids_{func_name}.ll"
+        cfg_path = output_dir / f"cfg_{func_name}.txt"
+
+        env = {
+            "METADATA": str(config_path),
+            "KO_USE_THOROUPY": "1",
+            "KO_CC": "clang-14",
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+        }
+
+        cmd = [
+            "opt-14",
+            "-load", str(ucsan_pass),
+            f"-load-pass-plugin={ucsan_pass}",
+            f"-ucsan-abilist={target_abilist}",
+            "-ucsan-with-taint=true",
+            "-ucsan-trace-bb",
+            f"-ucsan-dump-cfg={cfg_path}",
+            "-passes=ucsan",
+            "-S", "-disable-verify",
+            bc_file, "-o", str(ir_path),
+        ]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, env=env,
+        )
+        if result.returncode != 0:
+            if self.verbose:
+                print(f"    UCSan instrumentation failed:\n{result.stderr[:500]}")
+            return None
+
+        return str(ir_path)
 
     # Primitive C types that don't need void* replacement
     _PRIMITIVE_TYPES = {
@@ -603,6 +985,9 @@ class HarnessGenerator:
             "# Shim abilist: preserve __dfsw_ stub and __taint_* bodies\n"
             "fun:__dfsw_*=uninstrumented\n"
             "fun:__taint_*=uninstrumented\n"
+            "fun:malloc=custom\n"
+            "fun:calloc=custom\n"
+            "fun:realloc=custom\n"
         )
 
     def _build_target_ucsan_abilist(self, callee_contracts: dict[str, dict]) -> str:
@@ -698,6 +1083,7 @@ opt-14 \\
     -load "$UCSAN_PASS" -load-pass-plugin="$UCSAN_PASS" \\
     -ucsan-abilist="$SHIM_ABILIST" \\
     -ucsan-with-taint=true \\
+    -ucsan-trace-bb \\
     -load "$TAINT_PASS" -load-pass-plugin="$TAINT_PASS" \\
     -taint-abilist="$SHIM_ABILIST" \\
     -taint-with-ucsan=true \\
@@ -716,6 +1102,7 @@ opt-14 \\
     -load "$UCSAN_PASS" -load-pass-plugin="$UCSAN_PASS" \\
     -ucsan-abilist="$TARGET_UCSAN_ABILIST" \\
     -ucsan-with-taint=true \\
+    -ucsan-trace-bb \\
     -load "$TAINT_PASS" -load-pass-plugin="$TAINT_PASS" \\
     -taint-abilist="$DFSAN_ABILIST" \\
     -taint-abilist="$TARGET_TAINT_ABILIST" \\
@@ -790,6 +1177,7 @@ echo "Built: $OUT"
                 f"-load-pass-plugin={ucsan_pass}",
                 f"-ucsan-abilist={abilist_path}",
                 "-ucsan-with-taint=true",
+                "-ucsan-trace-bb",
                 "-load", str(taint_pass),
                 f"-load-pass-plugin={taint_pass}",
                 f"-taint-abilist={abilist_path}",
@@ -838,6 +1226,39 @@ echo "Built: $OUT"
                         "contracts": data["contracts"],
                     }
         return result
+
+    def _fix_void_ret_labels(self, stubs: str, callee_contracts: dict[str, dict]) -> str:
+        """Remove ret_label from __dfsw_ stubs for void-returning callees.
+
+        dfsan does not pass ret_label for void functions — having it causes
+        the stub to read garbage from the stack and segfault on *ret_label = 0.
+        """
+        if not stubs or not callee_contracts:
+            return stubs
+        for name, info in callee_contracts.items():
+            sig = info.get("signature", "")
+            # Check if return type is void
+            paren_idx = sig.find("(")
+            if paren_idx < 0:
+                continue
+            ret_type = sig[:paren_idx].strip()
+            if ret_type != "void":
+                continue
+            # Remove ", dfsan_label *ret_label" or ",\n  dfsan_label *ret_label"
+            # from the __dfsw_ stub signature
+            stubs = re.sub(
+                rf'((?:__dfsw_)?{re.escape(name)}\s*\([^)]*?)'
+                r',\s*\n?\s*dfsan_label\s*\*\s*ret_label\)',
+                r'\1)',
+                stubs,
+            )
+            # Remove "*ret_label = 0;" lines
+            stubs = re.sub(
+                r'\s*\*ret_label\s*=\s*0;\s*\n',
+                '\n',
+                stubs,
+            )
+        return stubs
 
     def _add_dfsw_prefix(self, stubs: str, callee_contracts: dict[str, dict]) -> str:
         """Post-process stubs: add __dfsw_ prefix and __attribute__((used))."""
