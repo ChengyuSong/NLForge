@@ -162,6 +162,7 @@ SQLite storage for all analysis data.
 - `build_configs`: Project build system information
 - `container_summaries`: Container/collection function detection results
 - `typedefs`: Type declarations (typedef, using, struct/class/union)
+- `issue_reviews`: Manual triage records for verification issues (status, reason, reviewer)
 
 ### 9. Standard Library (`stdlib.py`)
 
@@ -198,7 +199,22 @@ Heuristic + LLM-based detection of project-specific patterns:
 - **`AllocatorDetector`** (`allocator.py`): Identifies custom allocator/deallocator functions (e.g., `g_malloc`, `png_malloc`)
 - **`ContainerDetector`** (`container.py`): Detects container/collection functions (e.g., list append, hash insert)
 
-### 12. Build-Learn System (`builder/`)
+### 12. Harness Generator (`harness_generator.py`)
+
+Generates C shim harnesses for contract-guided concolic execution via SymSan/ucsan. For a target function, the harness wraps it with a `test()` entry point and synthesizes `__dfsw_`-prefixed stubs for all callees so that SymSan's taint tracking can propagate through them.
+
+**Key features:**
+- LLM-generated shim: reads the function's memsafe contracts and post-conditions, asks the LLM to write a matching `test()` body and callee stubs
+- Compilation loop: when `--ko-clang-path` is set, compiles the shim against project bitcode and iterates with LLM to fix errors (up to 3 attempts)
+- Plan generation (`--plan` / `--plan-only`): instruments the target binary with basic-block IDs and asks the LLM to produce an exploration plan (sequence of BB targets) for the Thoroupy policy scheduler
+- Issue assessment (`--assess-issue N`): injects a targeted assertion for verification issue N into an existing shim, rebuilds, and runs ucsan to confirm or refute the issue
+- Outputs per-function `.c`, `.bc`, `.sh`, `.ucsan.cfg`, `.abilist`, and optionally `plan.json`
+
+**Key class:** `HarnessGenerator`
+
+See [ucsan-harness.md](ucsan-harness.md) for the full workflow.
+
+### 13. Build-Learn System (`builder/`)
 
 LLM-driven incremental build system that can configure, build, and learn from C/C++ projects.
 
@@ -210,7 +226,7 @@ LLM-driven incremental build system that can configure, build, and learn from C/
 
 Supports CMake, Autotools, Meson, Bazel, SCons, and custom build systems. Assembly detection scans `compile_commands.json`, source files, and LLVM IR. See [build-learn.md](build-learn.md) for details.
 
-### 13. Link-Unit Pipeline (`link_units/`)
+### 14. Link-Unit Pipeline (`link_units/`)
 
 Batch analysis pipeline aware of build targets (executables, libraries). One DB per link unit; targets processed in dependency order.
 
@@ -221,7 +237,7 @@ Batch analysis pipeline aware of build targets (executables, libraries). One DB 
 
 See [link-unit-analysis.md](link-unit-analysis.md) for the full design.
 
-### 14. CLI (`cli.py`)
+### 15. CLI (`cli.py`)
 
 Command-line interface using Click.
 
@@ -246,6 +262,9 @@ Command-line interface using Click.
 - `import-callgraph`: Import external call graph (e.g., from kanalyzer)
 - `discover-link-units`: Detect build targets/link units
 - `import-dep-summaries`: Import summaries from dependency databases
+- `gen-harness`: Generate C shims for contract-guided concolic execution (SymSan/ucsan)
+- `show-issues`: List verification issues with review status filters
+- `review-issue`: Triage a verification issue (confirmed / false_positive / wontfix)
 
 ## End-to-End Pipeline
 
@@ -327,6 +346,24 @@ Functions with existing summaries (stdlib, deps, prior runs) are cache hits. Onl
 
 **Output:** `allocation_summaries`, `free_summaries`, `init_summaries`, `memsafe_summaries`, `verification_summaries` in `functions.db`
 
+### Phase 7: Issue Triage (`show-issues`, `review-issue`)
+
+After verification, analysts review flagged issues. `show-issues` lists all `SafetyIssue` records from `verification_summaries` with their current review status. `review-issue` updates the `issue_reviews` table for a specific issue:
+
+- **confirmed** — real bug, ready for downstream use
+- **false_positive** — LLM hallucination or infeasible path
+- **wontfix** — acknowledged but intentionally not fixed
+
+**Output:** `issue_reviews` records in `functions.db`
+
+### Phase 8 (optional): Harness Generation (`gen-harness`)
+
+For issues of interest, generate a C shim harness to drive contract-guided concolic execution with SymSan/ucsan. The harness wraps the target function's contracts and can be used with the Thoroupy policy scheduler for path exploration.
+
+See [ucsan-harness.md](ucsan-harness.md) for details.
+
+**Output:** `harnesses/<project>/<func>.*` — shim, bitcode, build script, ucsan config
+
 ### Batch Processing
 
 Batch scripts under `scripts/` orchestrate the pipeline across multiple projects and link-unit targets. Projects are read from `gpr_projects.json` and filtered by tier, name, or skip list.
@@ -339,8 +376,11 @@ Batch scripts under `scripts/` orchestrate the pipeline across multiple projects
 | `batch_summarize.py` | 5–6 | Seeds stdlib/dep summaries, runs passes 1–3 then pass 4 separately |
 | `batch_verify.py` | 6 | Runs pass 5 (verification) after passes 1–4 complete |
 | `batch_container_detect.py` | aux | Detects container functions (heuristic + LLM) |
+| `cgc_run.sh` | benchmark | Full CGC benchmark: extract GT, scan, verify, evaluate |
 
 All link-unit-aware scripts read `link_units.json` and toposort targets by `link_deps`. `batch_summarize.py` runs `import-dep-summaries` from intra-project dep DBs before each target's summarization. Cross-project dependencies are tracked in `project_deps.json`.
+
+See [cgc-benchmark.md](cgc-benchmark.md) for the CGC benchmark pipeline.
 
 **Supporting scripts:**
 - `gpr_utils.py` — shared utilities (Docker path translation, project discovery)
