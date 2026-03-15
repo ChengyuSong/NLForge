@@ -36,12 +36,14 @@ from llm_summary.callgraph_import import CallGraphImporter
 from llm_summary.db import SummaryDB
 from llm_summary.link_units.pipeline import (
     build_output_index,
+    detect_bc_alias_relations,
     load_link_units,
+    propagate_alias_db_paths,
     resolve_dep_db_paths,
     topo_sort_link_units,
     update_link_units_file,
 )
-from gpr_utils import resolve_compile_commands
+from gpr_utils import find_project_dir, get_artifact_name, resolve_compile_commands
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -575,6 +577,7 @@ def process_project_compositional(
     allocator_file: Path | None = None,
     container_file: Path | None = None,
     kamain_timeout: int = 3600,
+    skip_existing: bool = False,
     verbose: bool = False,
 ) -> list[dict]:
     """Compositional CFL analysis for a project with link_units.json.
@@ -593,6 +596,13 @@ def process_project_compositional(
     lu_data, raw_units = load_link_units(link_units_path)
     if not raw_units:
         return [{"target": project_name, "error": "link_units.json has no targets"}]
+
+    # Detect alias relations before processing (idempotent, no-op if already set)
+    n_aliases = detect_bc_alias_relations(raw_units)
+    if n_aliases and verbose:
+        aliases = [(u["name"], u["alias_of"]) for u in raw_units if u.get("alias_of")]
+        for name, target in aliases:
+            print(f"    [{name}] alias of {target} (bc_files subset)")
 
     link_units = topo_sort_link_units(raw_units)
 
@@ -626,6 +636,27 @@ def process_project_compositional(
 
     for lu in link_units:
         target = lu["name"]
+
+        # Skip alias units — their functions and call graph are covered by the superset
+        if lu.get("alias_of"):
+            if verbose:
+                print(f"      [{target}] Skipped: alias of {lu['alias_of']}")
+            results.append({
+                "target": target,
+                "type": lu.get("type", "unknown"),
+                "bc_files": 0,
+                "phase1_success": True,
+                "phase2_success": True,
+                "edges_imported": 0,
+                "direct_edges": 0,
+                "indirect_edges": 0,
+                "stubs_created": 0,
+                "timing_seconds": 0.0,
+                "error": None,
+                "alias_of": lu["alias_of"],
+            })
+            continue
+
         bc_files = [Path(p) for p in lu.get("bc_files", []) if Path(p).exists()]
         target_dir = project_scan_dir / target
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -652,34 +683,39 @@ def process_project_compositional(
             continue
 
         cflcg_path = target_dir / f"{target}.cflcg"
+        callgraph_json = target_dir / "callgraph.json"
 
         # --- Phase 1: Produce compressed constraint graph ---
-        if verbose:
-            print(f"      [{target}] Phase 1: compress {len(bc_files)} bc files -> {cflcg_path.name}")
-
-        ok, err, dur = run_kamain(
-            bc_files=bc_files,
-            output_json=None,
-            kamain_bin=kamain_bin,
-            cfl_compressed_output=cflcg_path,
-            cfl_compositional=True,
-            allocator_file=allocator_file,
-            container_file=container_file,
-            timeout=kamain_timeout,
-            verbose=verbose,
-        )
-
-        result["phase1_success"] = ok
-        if not ok:
-            result["error"] = f"phase1_failed: {err}"
-            result["timing_seconds"] = round(time.monotonic() - start, 2)
-            results.append(result)
-            continue
+        if skip_existing and cflcg_path.exists():
+            if verbose:
+                print(f"      [{target}] Phase 1: skipped (existing {cflcg_path.name})")
+            result["phase1_success"] = True
+        else:
+            if verbose:
+                print(f"      [{target}] Phase 1: compress {len(bc_files)} bc files -> {cflcg_path.name}")
+            ok, err, dur = run_kamain(
+                bc_files=bc_files,
+                output_json=None,
+                kamain_bin=kamain_bin,
+                cfl_compressed_output=cflcg_path,
+                cfl_compositional=True,
+                allocator_file=allocator_file,
+                container_file=container_file,
+                timeout=kamain_timeout,
+                verbose=verbose,
+            )
+            result["phase1_success"] = ok
+            if not ok:
+                result["error"] = f"phase1_failed: {err}"
+                result["timing_seconds"] = round(time.monotonic() - start, 2)
+                results.append(result)
+                continue
 
         cflcg_by_name[target] = cflcg_path
 
         # --- Phase 2: Compositional whole-program solve ---
         # Collect transitive deps: bc_files + .cflcg for this target and all deps
+        seen_bc: set[Path] = set(bc_files)
         all_bc: list[Path] = list(bc_files)
         all_cflcg: list[Path] = [cflcg_path]
 
@@ -691,8 +727,11 @@ def process_project_compositional(
                 dep_lu = by_output.get(dep_output)
                 if dep_lu and dep_lu["name"] not in visited_deps:
                     visited_deps.add(dep_lu["name"])
-                    dep_bc = [Path(p) for p in dep_lu.get("bc_files", []) if Path(p).exists()]
-                    all_bc.extend(dep_bc)
+                    for p in dep_lu.get("bc_files", []):
+                        bp = Path(p)
+                        if bp.exists() and bp not in seen_bc:
+                            all_bc.append(bp)
+                            seen_bc.add(bp)
                     dep_cflcg = cflcg_by_name.get(dep_lu["name"])
                     if dep_cflcg and dep_cflcg.exists():
                         all_cflcg.append(dep_cflcg)
@@ -700,38 +739,39 @@ def process_project_compositional(
 
         _collect_deps(target, {target})
 
-        callgraph_json = target_dir / "callgraph.json"
-
-        if verbose:
-            print(
-                f"      [{target}] Phase 2: compose {len(all_bc)} bc, "
-                f"{len(all_cflcg)} cflcg -> {callgraph_json.name}"
-            )
-
         vsnapshot_path = target_dir / f"{target}.vsnap"
 
-        ok, err, dur = run_kamain(
-            bc_files=all_bc,
-            output_json=callgraph_json,
-            kamain_bin=kamain_bin,
-            cfl_compressed_inputs=all_cflcg,
-            cfl_compositional=True,
-            snapshot_path=vsnapshot_path,
-            allocator_file=allocator_file,
-            container_file=container_file,
-            timeout=kamain_timeout,
-            verbose=verbose,
-        )
-
-        result["phase2_success"] = ok
-        if not ok:
-            result["error"] = f"phase2_failed: {err}"
-            result["timing_seconds"] = round(time.monotonic() - start, 2)
-            results.append(result)
-            continue
-
-        if verbose:
-            print(f"      [{target}] Phase 2 done in {dur:.1f}s")
+        # --- Phase 2: Compositional whole-program solve ---
+        if skip_existing and callgraph_json.exists():
+            if verbose:
+                print(f"      [{target}] Phase 2: skipped (existing {callgraph_json.name})")
+            result["phase2_success"] = True
+        else:
+            if verbose:
+                print(
+                    f"      [{target}] Phase 2: compose {len(all_bc)} bc, "
+                    f"{len(all_cflcg)} cflcg -> {callgraph_json.name}"
+                )
+            ok, err, dur = run_kamain(
+                bc_files=all_bc,
+                output_json=callgraph_json,
+                kamain_bin=kamain_bin,
+                cfl_compressed_inputs=all_cflcg,
+                cfl_compositional=True,
+                snapshot_path=vsnapshot_path,
+                allocator_file=allocator_file,
+                container_file=container_file,
+                timeout=kamain_timeout,
+                verbose=verbose,
+            )
+            result["phase2_success"] = ok
+            if not ok:
+                result["error"] = f"phase2_failed: {err}"
+                result["timing_seconds"] = round(time.monotonic() - start, 2)
+                results.append(result)
+                continue
+            if verbose:
+                print(f"      [{target}] Phase 2 done in {dur:.1f}s")
 
         # --- Import callgraph into per-target DB ---
         db_path = str(target_dir / "functions.db")
@@ -766,7 +806,8 @@ def process_project_compositional(
         result["timing_seconds"] = round(time.monotonic() - start, 2)
         results.append(result)
 
-    # Write output paths back into link_units.json
+    # Propagate db_path from superset units to their alias units, then persist
+    propagate_alias_db_paths(link_units)
     update_link_units_file(link_units_path, lu_data)
 
     return results
@@ -863,6 +904,7 @@ def process_project(
     kamain_timeout: int = 3600,
     recompile: bool = True,
     compositional: bool | None = None,  # None = auto-detect from link_units.json
+    skip_existing: bool = False,
     verbose: bool = False,
 ) -> dict:
     """Process a single project end-to-end.
@@ -940,6 +982,7 @@ def process_project(
             allocator_file=allocator_json if allocator_json and allocator_json.exists() else None,
             container_file=container_file,
             kamain_timeout=kamain_timeout,
+            skip_existing=skip_existing,
             verbose=verbose,
         )
         total_edges = sum(r.get("edges_imported", 0) for r in target_results)
@@ -1193,6 +1236,14 @@ def main():
         help="Output file for successful project names (append mode)",
     )
     parser.add_argument(
+        "--skip-existing", action="store_true",
+        help=(
+            "Skip KAMain phases for link units that already have artifacts: "
+            "phase 1 if .cflcg exists, phase 2 if callgraph.json exists. "
+            "Import is still attempted when callgraph.json is present."
+        ),
+    )
+    parser.add_argument(
         "--output", "-o", type=str, default=None,
         help="Output JSON report file",
     )
@@ -1291,10 +1342,16 @@ def main():
 
     for i, project in enumerate(projects, 1):
         project_dir = project["project_dir"]
-        print(f"[{i}/{len(projects)}] {project_dir}...", end=" ", flush=True)
+        project_path = find_project_dir(project, args.source_dir)
+        artifact_name = (
+            get_artifact_name(project, project_path)
+            if project_path
+            else project_dir
+        )
+        print(f"[{i}/{len(projects)}] {artifact_name}...", end=" ", flush=True)
 
         result = process_project(
-            project_name=project_dir,
+            project_name=artifact_name,
             build_scripts_dir=args.build_scripts_dir,
             func_scans_dir=args.func_scans_dir,
             source_dir=args.source_dir,
@@ -1305,6 +1362,7 @@ def main():
             kamain_timeout=args.kamain_timeout,
             recompile=not args.no_recompile,
             compositional=compositional,
+            skip_existing=args.skip_existing,
             verbose=args.verbose,
         )
 
@@ -1328,7 +1386,7 @@ def main():
 
             if args.success_list:
                 with open(args.success_list, "a") as f:
-                    f.write(f"{project_dir}\n")
+                    f.write(f"{artifact_name}\n")
 
     # Print summary
     print()
