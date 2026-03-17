@@ -85,6 +85,10 @@ Parameters: {params_json}
 
 {postconds_section}
 
+## Struct Definitions
+
+{struct_defs_section}
+
 ## Callee Contracts
 
 {callee_section}
@@ -138,10 +142,10 @@ parameter AND a `dfsan_label *ret_label` at the end (ONLY if non-void return)
 - For `buffer_size` contracts: \
 `__taint_check_bounds(ptr_label, (uintptr_t)ptr, size_label, size);`
 - Set `*ret_label = 0` and return a reasonable default (0, NULL, etc.)
-- Use `void *` for ALL struct/opaque/typedef pointer types in the signature
-- Do NOT reconstruct struct layouts, do NOT dereference struct fields
-- Do NOT define any typedefs or struct definitions
-- Keep stubs minimal: just check contracts on direct parameters, then return
+- Use `void *` for struct pointer types unless the struct definition is \
+provided above — in that case, you may cast and access fields for \
+pre-condition assertions and post-condition assumes
+- Keep stubs minimal: check contracts, set post-condition state, then return
 - If no callees have contracts, output an empty block
 
 ### Section 2: test() function (```test ... ```)
@@ -171,14 +175,11 @@ are concrete zeros and branches on them won't be symbolic
   - `__assert_freed(ptr)` — assert ptr has been freed
 - Post-condition assertions may be conditional: \
 `if (result == 0) {{ __assert_init(buf, len); }}`
-- **ONLY assert post-conditions on values directly accessible in test()**: \
-return value, direct pointer args passed to the target. \
-**SKIP** any post-condition on struct sub-fields (e.g., `s->a`, `list->next`) \
-— these are not accessible from the shim.
+- When struct definitions are provided above, you MAY cast `void *` to the \
+struct pointer type and access fields for pre-/post-condition checks. \
+Include the struct definition in your shim (copy from above). \
+When no struct definition is available, use `void *` and skip field checks.
 - Do NOT call `free()`. Do NOT define `main()`
-- Do NOT define any typedefs, structs, or type definitions
-- Do NOT try to initialize struct fields — treat all structs as opaque
-- Use `void *` for ALL non-primitive pointer types
 
 ### Section 3: Scheduling policy (```json ... ```)
 
@@ -338,12 +339,12 @@ Output ONLY the JSON block, no other text.
 """
 
 
-TRIAGE_VALIDATE_PROMPT = """
+TRIAGE_VALIDATE_PROMPT = """\
+Fill in the `/* FILL */` sections in the C template below.
+The template is a shim for ucsan concolic execution that validates a triage
+verdict about `{name}`.
 
-## Triage Validation Task
-
-A triage agent analyzed a verification issue in `{name}` and produced the
-following verdict. Generate a harness that symbolically validates it.
+## Triage Verdict
 
 - Hypothesis: {hypothesis}
 - Issue: [{severity}] {issue_kind} — {issue_description}
@@ -351,13 +352,29 @@ following verdict. Generate a harness that symbolically validates it.
 
 {assumptions_section}
 {assertions_section}
-{real_functions_section}
 
-ucsan has integrated checks for integer overflow, null deref, buffer overflow,
-and use-after-free (like ubsan + asan). For safety proofs, add __taint_assume()
-calls modeling caller constraints — ucsan should find NO violations under those
-assumptions. For feasibility proofs, use minimal/no assumptions so ucsan can
-explore freely and trigger built-in checks.
+## C Template
+
+```c
+{template}
+```
+
+## Instructions
+
+Output a single ```c fenced block with the complete filled-in C code.
+Copy the template exactly, replacing each `/* FILL: ... */` with C code.
+
+Rules:
+- Do NOT add new #include, typedef, or extern declarations
+- Do NOT rename or change function signatures
+- Do NOT add functions not in the template
+- Every `/* FILL */` must be replaced with valid C code or left empty
+- Keep the code minimal — only add what the contracts require
+- Do NOT add comments — the code should be self-explanatory
+- In stubs: use assert_* for pre-conditions, assume_* for post-conditions
+- In test(): use assert_* to verify post-conditions after the call
+- Only check contracts on direct parameters (skip struct field contracts
+  like s->strm when struct definition is not available)
 """
 
 
@@ -400,6 +417,40 @@ class HarnessGenerator:
             "fix_attempts": 0,
         }
         self._triage_context: dict[str, Any] | None = None
+        self._check_toolchain()
+
+    def _check_toolchain(self) -> None:
+        """Validate that required toolchain binaries and libs exist."""
+        import shutil
+
+        missing: list[str] = []
+
+        # LLVM-14 tools (must be on PATH)
+        for tool in ("clang-14", "opt-14", "llc-14"):
+            if not shutil.which(tool):
+                missing.append(f"{tool} (not found on PATH)")
+
+        # ko-clang
+        if self.ko_clang_path:
+            if not Path(self.ko_clang_path).exists():
+                missing.append(f"ko-clang: {self.ko_clang_path}")
+
+        # SymSan / ucsan passes
+        if self.symsan_dir:
+            for lib in ("UCSanPass.so", "TaintPass.so"):
+                p = self.symsan_dir / "lib" / "symsan" / lib
+                if not p.exists():
+                    missing.append(f"{lib}: {p}")
+            abilist = self.symsan_dir / "lib" / "symsan" / "dfsan_abilist.txt"
+            if not abilist.exists():
+                missing.append(f"dfsan_abilist.txt: {abilist}")
+        elif self.ko_clang_path:
+            # symsan_dir should have been inferred from ko_clang_path
+            missing.append("symsan_dir could not be determined")
+
+        if missing:
+            msg = "Toolchain check failed:\n" + "\n".join(f"  - {m}" for m in missing)
+            raise FileNotFoundError(msg)
 
     @property
     def stats(self) -> dict[str, int]:
@@ -466,43 +517,72 @@ class HarnessGenerator:
         callee_section = self._format_callee_contracts(callee_contracts)
         postconds_section = self._format_postconditions(postconds)
 
-        prompt = SHIM_PROMPT.format(
-            name=func.name,
-            signature=func.signature,
-            params_json=json.dumps(func.params),
-            contracts_section=contracts_section,
-            callee_section=callee_section,
-            postconds_section=postconds_section,
+        # Extract struct definitions referenced by signatures/contracts
+        ref_types = self._collect_referenced_types(
+            func.signature or "", contracts, callee_contracts,
+        )
+        struct_defs = ""
+        if ref_types and func.file_path:
+            struct_defs = self._extract_struct_defs(func.file_path, ref_types)
+        struct_defs_section = struct_defs if struct_defs else (
+            "No struct definitions available. Use `void *` for all struct pointers."
         )
 
-        # Append triage validation context if set
+        # Determine which callees need shim stubs
+        if self._triage_context is not None:
+            real_fns = set(self._triage_context.get("real_functions", []))
+            shim_callees = [k for k in callee_contracts if k not in real_fns]
+        else:
+            shim_callees = list(callee_contracts.keys())
+
+        # Build prompt: triage validation uses fill-in template,
+        # normal gen-harness uses the free-form SHIM_PROMPT
         if self._triage_context is not None:
             ctx = self._triage_context
             assumptions = ctx.get("assumptions", [])
             assertions = ctx.get("assertions", [])
-            real_fns = ctx.get("real_functions", [])
-            prompt += TRIAGE_VALIDATE_PROMPT.format(
+
+            template = self._build_fill_template(
+                func.name, func.signature or "", func.params or [],
+                callee_contracts, postconds, ctx,
+                contracts=contracts, file_path=func.file_path,
+            )
+
+            # Format assumptions/assertions for the prompt
+            assumptions_text = ""
+            if assumptions:
+                assumptions_text = "Assumptions (contextual — for understanding, not code):\n"
+                assumptions_text += "\n".join(
+                    f"  {i}. {a}" for i, a in enumerate(assumptions, 1)
+                )
+
+            assertions_text = ""
+            if assertions:
+                assertions_text = "Expected checks (ucsan verifies automatically):\n"
+                assertions_text += "\n".join(
+                    f"  {i}. {a}" for i, a in enumerate(assertions, 1)
+                )
+
+            prompt = TRIAGE_VALIDATE_PROMPT.format(
                 name=func.name,
                 hypothesis=ctx.get("hypothesis", "unknown"),
                 severity=ctx.get("severity", ""),
                 issue_kind=ctx.get("issue_kind", ""),
                 issue_description=ctx.get("issue_description", ""),
                 reasoning=ctx.get("reasoning", ""),
-                assumptions_section=(
-                    "Assumptions (add as __taint_assume calls before the target call):\n"
-                    + "\n".join(f"  __taint_assume({a});" for a in assumptions)
-                    if assumptions else ""
-                ),
-                assertions_section=(
-                    "Explicit assertions (add after the call):\n"
-                    + "\n".join(f"  {a};" for a in assertions)
-                    if assertions else ""
-                ),
-                real_functions_section=(
-                    f"Real functions (do NOT generate stubs for these — they exist "
-                    f"in bitcode): {', '.join(real_fns)}"
-                    if real_fns else ""
-                ),
+                assumptions_section=assumptions_text,
+                assertions_section=assertions_text,
+                template=template,
+            )
+        else:
+            prompt = SHIM_PROMPT.format(
+                name=func.name,
+                signature=func.signature,
+                params_json=json.dumps(func.params),
+                contracts_section=contracts_section,
+                callee_section=callee_section,
+                postconds_section=postconds_section,
+                struct_defs_section=struct_defs_section,
             )
 
         try:
@@ -519,24 +599,32 @@ class HarnessGenerator:
             if self.log_file:
                 self._log_interaction(func_name, prompt, response)
 
-            # Parse LLM response
-            stubs, test_func, policy = self._parse_response(response, func_name)
-
-            # Post-process: add __dfsw_ prefix to callee stub function names
-            stubs = self._add_dfsw_prefix(stubs, callee_contracts)
-            # Post-process: fix void stubs that incorrectly have ret_label
-            stubs = self._fix_void_ret_labels(stubs, callee_contracts)
-
-            # Assemble shim
-            c_code = SHIM_TEMPLATE.format(
-                target_extern=target_extern,
-                stubs=stubs,
-                test_func=test_func,
-            )
+            # Parse response: fill-in template returns a single ```c block,
+            # free-form SHIM_PROMPT returns stubs/test/json blocks
+            if self._triage_context is not None:
+                c_code = self._extract_c_block(response)
+                if not c_code:
+                    if self.verbose:
+                        print("    Failed to extract C code from response")
+                    return None
+                policy = self._extract_json_block(response)
+            else:
+                stubs, test_func, policy = self._parse_response(
+                    response, func_name,
+                )
+                stubs = self._add_dfsw_prefix(stubs, callee_contracts)
+                stubs = self._fix_void_ret_labels(stubs, callee_contracts)
+                c_code = SHIM_TEMPLATE.format(
+                    target_extern=target_extern,
+                    stubs=stubs,
+                    test_func=test_func,
+                )
 
             # Compile-and-fix loop (shim via clang-14 -> opt-14 -> llc-14)
             if self.symsan_dir:
-                ucsan_config = self._build_ucsan_config(func_name)
+                ucsan_config = self._build_ucsan_config(
+                    func_name, shim_callees,
+                )
 
                 for attempt in range(self.max_fix_attempts):
                     ok, errors = self._compile_shim(c_code, ucsan_config)
@@ -563,14 +651,22 @@ class HarnessGenerator:
                             f"[COMPILE ERRORS]\n{errors}", fix_response,
                         )
 
-                    stubs = self._extract_block(fix_response, "stubs") or stubs
-                    test_func = self._extract_block(fix_response, "test") or test_func
-
-                    c_code = SHIM_TEMPLATE.format(
-                        target_extern=target_extern,
-                        stubs=stubs,
-                        test_func=test_func,
-                    )
+                    # For fill-in: extract single ```c block
+                    # For free-form: extract stubs/test blocks
+                    fixed = self._extract_c_block(fix_response)
+                    if fixed:
+                        c_code = fixed
+                    else:
+                        s = self._extract_block(fix_response, "stubs")
+                        t = self._extract_block(fix_response, "test")
+                        if s or t:
+                            stubs = s or stubs
+                            test_func = t or test_func
+                            c_code = SHIM_TEMPLATE.format(
+                                target_extern=target_extern,
+                                stubs=stubs,
+                                test_func=test_func,
+                            )
                 else:
                     if self.verbose:
                         print(f"    Failed to fix after {self.max_fix_attempts} attempts")
@@ -589,7 +685,9 @@ class HarnessGenerator:
                 policy_path.write_text(json.dumps(policy, indent=2))
 
                 config_path = out / f"config_{func_name}.yaml"
-                ucsan_config = self._build_ucsan_config(func_name)
+                ucsan_config = self._build_ucsan_config(
+                    func_name, shim_callees,
+                )
                 config_path.write_text(ucsan_config)
 
                 # Write abilist files (always — even leaf functions need them)
@@ -973,6 +1071,10 @@ class HarnessGenerator:
             if bare in scalar_typedefs:
                 canonical = scalar_typedefs[bare]
                 return f"const {canonical}" if is_const else canonical
+            # Unknown non-primitive, non-pointer type (e.g. enum typedef)
+            # — fall back to int to avoid unknown type errors in the shim
+            if bare not in self._PRIMITIVE_TYPES:
+                return "int"
             return t
 
         if params_str.strip():
@@ -1068,9 +1170,16 @@ class HarnessGenerator:
 
         return str(bc_path)
 
-    def _build_ucsan_config(self, func_name: str) -> str:
-        """Build ucsan config YAML (entry + scope only, no files key)."""
+    def _build_ucsan_config(
+        self, func_name: str,
+        shim_callees: list[str] | None = None,
+    ) -> str:
+        """Build ucsan config YAML (entry + scope + shims)."""
         lines = ["entry: test", "scope:", f"  - {func_name}"]
+        if shim_callees:
+            lines.append("shims:")
+            for cname in shim_callees:
+                lines.append(f"  - {cname}")
         return "\n".join(lines) + "\n"
 
     def _build_shim_abilist(self) -> str:
@@ -1468,6 +1577,321 @@ echo "Built: $OUT"
             lines.append("")
         return "\n".join(lines)
 
+    def _build_fill_template(
+        self,
+        func_name: str,
+        func_signature: str,
+        func_params: list[str],
+        callee_contracts: dict[str, dict],
+        postconds: dict,
+        triage_context: dict[str, Any],
+        contracts: list[dict[str, Any]] | None = None,
+        file_path: str | None = None,
+    ) -> str:
+        """Build a fill-in-the-blank C template for triage validation.
+
+        Generates the complete shim structure with `/* FILL: ... */` markers
+        where the LLM needs to add code. Everything else is fixed.
+        """
+        real_fns = set(triage_context.get("real_functions", []))
+        # Only generate stubs for callees NOT in real_functions
+        stub_callees = {
+            k: v for k, v in callee_contracts.items()
+            if k not in real_fns
+        }
+
+        lines: list[str] = []
+
+        # --- Header ---
+        lines.append(
+            "/* Auto-generated shim for contract-guided concolic execution */")
+        lines.append("#include <stdlib.h>")
+        lines.append("#include <stdint.h>")
+        lines.append("#include <stddef.h>")
+        lines.append("#include <string.h>")
+        lines.append("")
+
+        # --- API reference as comments ---
+        lines.append("/*")
+        lines.append(" * Summary function API (use in stubs and test):")
+        lines.append(" *")
+        lines.append(" * Assertions (verify a condition holds):")
+        lines.append(" *   assert_cond(result, id)"
+                      "              -- boolean check")
+        lines.append(" *   assert_allocated(ptr, size, id)"
+                      "      -- ptr is allocated >= size bytes")
+        lines.append(" *   assert_init(ptr, size, id)"
+                      "           -- ptr allocated + all bytes initialized")
+        lines.append(" *   assert_freed(ptr, id)"
+                      "                -- ptr has been freed")
+        lines.append(" *")
+        lines.append(" * Assumptions (establish a condition in callee stubs):")
+        lines.append(" *   assume_cond(result, id)"
+                      "              -- constrain solver, exit if false")
+        lines.append(" *   ptr = assume_allocated(ptr, size, id)"
+                      " -- ensure allocation (returns new ptr!)")
+        lines.append(" *   assume_init(ptr, size, id)"
+                      "           -- mark size bytes as initialized")
+        lines.append(" *   ptr = assume_freed(ptr, id)"
+                      "           -- mark as freed (returns new ptr!)")
+        lines.append(" *")
+        lines.append(
+            " * Use the assigned id from the contract comment above.")
+        lines.append(" *")
+        lines.append(" * Example stub for: void read_data(void *buf, "
+                      "size_t len)")
+        lines.append(
+            " *   assert_allocated(buf, len, 1); "
+            " // id=1 buf: buffer_size(len)")
+        lines.append(
+            " *   assume_init(buf, len, 2); "
+            "     // id=2 post: buf initialized")
+        lines.append(" */")
+        lines.append("")
+
+        # --- Extern declarations for summary functions ---
+        lines.append("/* Summary functions (instrumentation pass rewrites "
+                      "these) */")
+        lines.append("extern void assert_cond(uint8_t result, uint64_t id);")
+        lines.append("extern void assert_allocated(void *ptr, size_t size, "
+                      "uint64_t id);")
+        lines.append("extern void assert_init(void *ptr, size_t size, "
+                      "uint64_t id);")
+        lines.append("extern void assert_freed(void *ptr, uint64_t id);")
+        lines.append("extern void assume_cond(uint8_t result, uint64_t id);")
+        lines.append("extern void *assume_allocated(void *ptr, size_t size, "
+                      "uint64_t id);")
+        lines.append("extern void assume_init(void *ptr, size_t size, "
+                      "uint64_t id);")
+        lines.append("extern void *assume_freed(void *ptr, uint64_t id);")
+        lines.append("")
+
+        # --- Include headers that define referenced struct types ---
+        ref_types = self._collect_referenced_types(
+            func_signature, contracts or [], callee_contracts,
+        )
+        if ref_types and file_path:
+            headers = self._find_type_headers(file_path, ref_types)
+            for h in sorted(headers):
+                lines.append(f'#include "{h}"')
+            if headers:
+                lines.append("")
+
+        # --- Target function extern ---
+        target_extern = self._build_extern_decl(func_name, func_signature)
+        lines.append("/* Target function (in bitcode) */")
+        lines.append(target_extern)
+        lines.append("")
+
+        # --- ID map + callee stubs ---
+        # Assign a unique ID per contract for diagnostics feedback
+        id_counter = 1
+        id_map: list[str] = []  # "id: func:target:kind"
+
+        if stub_callees:
+            lines.append("/* ---- Callee stubs ---- */")
+            lines.append("")
+            for cname, cinfo in stub_callees.items():
+                sig = cinfo["signature"]
+                params = cinfo["params"]
+                ccontracts = cinfo["contracts"]
+
+                shim_sig = self._build_shim_signature(
+                    cname, sig, params,
+                )
+
+                # Format contracts as comments with assigned IDs
+                lines.append(f"/* Stub for {cname}: {sig}")
+                lines.append(" * Contracts (use the given ID as last arg):")
+                for c in ccontracts:
+                    kind = c["contract_kind"]
+                    target = c["target"]
+                    cid = id_counter
+                    id_counter += 1
+                    id_map.append(f"{cid}: {cname}:{target}:{kind}")
+                    if kind == "buffer_size":
+                        size_expr = c.get("size_expr", "?")
+                        lines.append(
+                            f" *   id={cid} {target}: "
+                            f"{kind}({size_expr})")
+                    else:
+                        lines.append(
+                            f" *   id={cid} {target}: {kind}")
+                lines.append(" */")
+                lines.append(shim_sig + " {")
+                lines.append("    /* FILL: check pre-conditions (assert_*) "
+                             "and establish post-conditions (assume_*) */")
+                lines.append("}")
+                lines.append("")
+        else:
+            lines.append("/* No callee stubs needed — all callees are in "
+                         "bitcode */")
+            lines.append("")
+
+        # --- test() entry ---
+        lines.append("/* ---- Entry point ---- */")
+
+        test_params, call_args = self._build_test_params(
+            func_name, func_signature, func_params,
+        )
+
+        lines.append(f"void test({test_params}) {{")
+
+        # malloc + memcpy for pointer params
+        alloc_size = 4096
+        paren = func_signature.index("(")
+        param_types = func_signature[paren + 1:func_signature.rindex(")")
+                                     ].split(",")
+        for ptype, pname in zip(param_types, func_params, strict=False):
+            ptype = ptype.strip()
+            if ptype.endswith("*") or ptype in self._get_pointer_typedefs():
+                lines.append(
+                    f"    void *{pname} = malloc({alloc_size});")
+                lines.append(
+                    f"    memcpy({pname}, input_{pname}, {alloc_size});")
+
+        lines.append("")
+        ret_type = func_signature[:paren].strip()
+        if ret_type != "void":
+            c_ret = self._resolve_type(ret_type)
+            lines.append(f"    {c_ret} result = {func_name}({call_args});")
+        else:
+            lines.append(f"    {func_name}({call_args});")
+
+        # Post-conditions with IDs
+        lines.append("")
+        postcond_comments = self._format_postcond_comments(postconds)
+        if postcond_comments:
+            lines.append(
+                "    /* FILL: verify post-conditions with assert_init / "
+                "assert_allocated / assert_cond")
+            for pc in postcond_comments:
+                cid = id_counter
+                id_counter += 1
+                id_map.append(f"{cid}: {func_name}:post:{pc}")
+                lines.append(f"     *   id={cid} {pc}")
+            lines.append("     */")
+        else:
+            lines.append(
+                "    /* FILL: post-condition assertions (if any) */")
+
+        lines.append("}")
+        lines.append("")
+
+        # Insert ID map comment at the top (after headers, before stubs)
+        if id_map:
+            map_lines = ["/* Assertion ID map (use these IDs as the last "
+                         "arg to assert_*/assume_*):"]
+            for entry in id_map:
+                map_lines.append(f" *   {entry}")
+            map_lines.append(" */")
+            map_lines.append("")
+            # Find insert point: after extern declarations, before stubs
+            insert_idx = next(
+                (idx for idx, ln in enumerate(lines)
+                 if "Callee stubs" in ln or "No callee stubs" in ln),
+                len(lines),
+            )
+            for j, ml in enumerate(map_lines):
+                lines.insert(insert_idx + j, ml)
+
+        return "\n".join(lines)
+
+    def _build_shim_signature(
+        self, name: str, signature: str, params: list[str],
+    ) -> str:
+        """Build a __shim_ stub function signature from callee info.
+
+        Plain C signature (no dfsan_label params) — the instrumentation
+        pass provides labels. Named __shim_<name> so ucsan can redirect
+        calls from the original function.
+        """
+        paren = signature.index("(")
+        ret_type_raw = signature[:paren].strip()
+        params_str = signature[paren + 1:signature.rindex(")")]
+
+        # Resolve types
+        param_types = [
+            self._resolve_type(t.strip()) for t in params_str.split(",")
+        ] if params_str.strip() else []
+
+        parts: list[str] = []
+        for ptype, pname in zip(param_types, params, strict=False):
+            parts.append(f"{ptype} {pname}")
+
+        params_out = ", ".join(parts)
+        ret_type = self._resolve_type(ret_type_raw)
+
+        return f"__attribute__((used)) {ret_type} __shim_{name}({params_out})"
+
+    def _build_test_params(
+        self, func_name: str, signature: str, params: list[str],
+    ) -> tuple[str, str]:
+        """Build test() parameter list and call arguments.
+
+        Returns (test_param_str, call_args_str).
+        Pointer params become void *input_X, scalars keep their type.
+        """
+        paren = signature.index("(")
+        params_str = signature[paren + 1:signature.rindex(")")]
+        param_types = [t.strip() for t in params_str.split(",")
+                       ] if params_str.strip() else []
+
+        ptr_typedefs = self._get_pointer_typedefs()
+        test_params: list[str] = []
+        call_args: list[str] = []
+
+        for ptype, pname in zip(param_types, params, strict=False):
+            if ptype.endswith("*") or ptype in ptr_typedefs:
+                test_params.append(f"void *input_{pname}")
+                call_args.append(pname)  # local var from malloc
+            else:
+                c_type = self._resolve_type(ptype)
+                test_params.append(f"{c_type} {pname}")
+                call_args.append(pname)
+
+        return ", ".join(test_params), ", ".join(call_args)
+
+    def _resolve_type(self, t: str) -> str:
+        """Resolve a single type to a valid C type for the shim."""
+        t = t.strip()
+        if not t or t == "void" or t == "...":
+            return t
+        is_const = t.startswith("const ")
+        bare = t.removeprefix("const ").strip()
+        if t.endswith("*"):
+            base = t[:-1].strip().removeprefix("const ").strip()
+            if base not in self._PRIMITIVE_TYPES and base != "void":
+                return "const void *" if is_const else "void *"
+            return t
+        if bare in self._get_pointer_typedefs():
+            return "void *"
+        scalar_typedefs = self._get_scalar_typedefs()
+        if bare in scalar_typedefs:
+            canonical = scalar_typedefs[bare]
+            return f"const {canonical}" if is_const else canonical
+        if bare not in self._PRIMITIVE_TYPES:
+            return "int"
+        return t
+
+    @staticmethod
+    def _format_postcond_comments(postconds: dict) -> list[str]:
+        """Format post-conditions as comment lines for the template."""
+        comments: list[str] = []
+        for alloc in postconds.get("allocations", []):
+            target = ("return value" if alloc.get("returned")
+                      else alloc.get("stored_to", "?"))
+            size = alloc.get("size_expr", "?")
+            comments.append(f"ALLOCATES {target} (size: {size})")
+        for init in postconds.get("inits", []):
+            target = init.get("target", "?")
+            byte_count = init.get("byte_count", "?")
+            comments.append(f"INITIALIZES {target} ({byte_count} bytes)")
+        for free in postconds.get("frees", []):
+            target = free.get("target", "?")
+            comments.append(f"FREES {target}")
+        return comments
+
     def _parse_response(
         self, response: str, func_name: str,
     ) -> tuple[str, str, dict]:
@@ -1502,6 +1926,152 @@ echo "Built: $OUT"
         match = re.search(pattern, response, re.DOTALL)
         return match.group(1) if match else None
 
+    @staticmethod
+    def _extract_c_block(response: str) -> str | None:
+        """Extract the first ```c fenced block from a response."""
+        match = re.search(r"```c\s*(.*?)\s*```", response, re.DOTALL)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _extract_json_block(response: str) -> dict[str, Any]:
+        """Extract the first ```json fenced block as a dict."""
+        match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
+        if match:
+            try:
+                result: dict[str, Any] = json.loads(match.group(1))
+                return result
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    def _collect_referenced_types(
+        self,
+        signature: str,
+        contracts: list[dict[str, Any]],
+        callee_contracts: dict[str, dict[str, Any]],
+    ) -> set[str]:
+        """Collect type names referenced by signatures and contracts.
+
+        Parses pointer types from function signatures and maps contract
+        targets with '->' to their parameter's declared type.
+        """
+        types: set[str] = set()
+        # Primitives and stdlib types we don't need to extract
+        skip = {
+            "void", "char", "int", "unsigned", "long", "short", "float",
+            "double", "size_t", "ssize_t", "uint8_t", "uint16_t", "uint32_t",
+            "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t", "uintptr_t",
+            "bool", "FILE",
+        }
+
+        def _types_from_sig(sig: str) -> None:
+            """Extract non-primitive pointer types from a signature."""
+            # sig is like "int(deflate_state *, int, const char *)"
+            paren = sig.find("(")
+            if paren < 0:
+                return
+            # Return type
+            ret = sig[:paren].strip().rstrip("*").strip()
+            if ret and ret not in skip:
+                types.add(ret)
+            # Param types
+            params_str = sig[paren + 1:sig.rfind(")")]
+            for part in params_str.split(","):
+                part = part.strip().rstrip("*").strip()
+                # Remove const/volatile/struct qualifiers
+                for qual in ("const ", "volatile ", "struct ", "enum "):
+                    part = part.replace(qual, "")
+                part = part.strip()
+                if part and part not in skip:
+                    types.add(part)
+
+        _types_from_sig(signature)
+        for info in callee_contracts.values():
+            _types_from_sig(info.get("signature", ""))
+
+        return types
+
+    def _extract_struct_defs(
+        self, file_path: str, type_names: set[str],
+    ) -> str:
+        """Extract struct definitions for given type names from preprocessed source.
+
+        Runs clang -E on the source file and searches for struct/typedef
+        definitions matching the requested type names.
+        """
+        if not type_names or not self.compile_commands:
+            return ""
+
+        from .preprocessor import SourcePreprocessor
+        pp = SourcePreprocessor(
+            compile_commands=self.compile_commands,
+            verbose=self.verbose,
+        )
+        result = pp.preprocess(file_path)
+        if result.error or not result.mappings:
+            if self.verbose:
+                print(f"    Preprocessor failed: {result.error}")
+            return ""
+
+        # Build full preprocessed text
+        pp_text = "\n".join(m.pp_line for m in result.mappings)
+
+        defs: list[str] = []
+        for type_name in sorted(type_names):
+            struct_def = _find_struct_def(pp_text, type_name)
+            if struct_def:
+                defs.append(struct_def)
+                if self.verbose:
+                    lines = struct_def.count("\n") + 1
+                    print(f"    Extracted struct def: {type_name} ({lines} lines)")
+
+        return "\n\n".join(defs)
+
+    def _find_type_headers(
+        self, file_path: str, type_names: set[str],
+    ) -> set[str]:
+        """Find header files that define the given struct/typedef types.
+
+        Runs clang -E and uses line markers to map struct definitions
+        back to their originating header file.
+        """
+        if not type_names or not self.compile_commands:
+            return set()
+
+        from .preprocessor import SourcePreprocessor
+        pp = SourcePreprocessor(
+            compile_commands=self.compile_commands,
+            verbose=self.verbose,
+        )
+        result = pp.preprocess(file_path)
+        if result.error or not result.mappings:
+            return set()
+
+        # For each type, find the line that defines it (} type_name ;)
+        # and look up which file that line came from via mappings
+        headers: set[str] = set()
+        source_path = str(Path(file_path).resolve())
+
+        for type_name in type_names:
+            # Search for "} type_name ;" pattern in preprocessed lines
+            for m in result.mappings:
+                line = m.pp_line.strip()
+                if (line.startswith("}") and type_name in line
+                        and line.endswith(";")):
+                    # Check it's a typedef close: "} type_name;"
+                    after_brace = line[1:].strip().rstrip(";").strip()
+                    # Could be "} type_name" or "} *type_name, type_name"
+                    if type_name in after_brace.replace(",", " ").split():
+                        orig = str(Path(m.orig_file).resolve())
+                        if orig != source_path:
+                            headers.add(m.orig_file)
+                        if self.verbose:
+                            print(f"    Type {type_name} defined in "
+                                  f"{m.orig_file}")
+                        break
+
+        return headers
+
     def _log_interaction(self, func_name: str, prompt: str, response: str) -> None:
         if not self.log_file:
             return
@@ -1519,3 +2089,81 @@ echo "Built: $OUT"
             f.write("RESPONSE:\n")
             f.write(response)
             f.write(f"\n{'='*80}\n\n")
+
+
+def _find_struct_def(pp_text: str, type_name: str) -> str | None:
+    """Find a struct/typedef definition for type_name in preprocessed text.
+
+    Handles:
+    - typedef struct tag { ... } type_name;
+    - struct type_name { ... };
+    - typedef struct { ... } type_name;
+    """
+    # Strategy: search for the type name, then find the enclosing struct
+    # definition by brace-matching.
+
+    # Pattern 1: "typedef struct ... { ... } type_name ;"
+    # Search for "} type_name ;" and walk backwards to find the opening
+    pat_end = re.compile(
+        rf"\}}\s*{re.escape(type_name)}\s*;",
+    )
+    for m in pat_end.finditer(pp_text):
+        # Walk backwards from '}' to find matching '{'
+        close_pos = m.start()
+        start = _find_struct_start(pp_text, close_pos)
+        if start is not None:
+            return pp_text[start:m.end()].strip()
+
+    # Pattern 2: "struct type_name {"
+    pat_start = re.compile(
+        rf"struct\s+{re.escape(type_name)}\s*\{{",
+    )
+    for m in pat_start.finditer(pp_text):
+        end = _find_brace_end(pp_text, m.start())
+        if end is not None:
+            # Include trailing semicolon if present
+            rest = pp_text[end:end + 5].lstrip()
+            if rest.startswith(";"):
+                end = pp_text.index(";", end) + 1
+            return pp_text[m.start():end].strip()
+
+    return None
+
+
+def _find_struct_start(text: str, close_brace: int) -> int | None:
+    """Walk backwards from a '}' to find the matching '{' and the struct/typedef keyword."""
+    depth = 1
+    pos = close_brace - 1
+    while pos >= 0 and depth > 0:
+        if text[pos] == "}":
+            depth += 1
+        elif text[pos] == "{":
+            depth -= 1
+        pos -= 1
+    if depth != 0:
+        return None
+    # pos+1 is the '{'. Now walk back to find 'typedef struct' or 'struct'
+    open_brace = pos + 1
+    prefix = text[max(0, open_brace - 200):open_brace].rstrip()
+    # Find the last 'typedef' or 'struct' keyword before the brace
+    for kw in ("typedef struct", "struct"):
+        idx = prefix.rfind(kw)
+        if idx >= 0:
+            return max(0, open_brace - 200) + idx
+    return open_brace
+
+
+def _find_brace_end(text: str, start: int) -> int | None:
+    """Find the position after the closing '}' matching the first '{' at or after start."""
+    brace_start = text.find("{", start)
+    if brace_start < 0:
+        return None
+    depth = 1
+    pos = brace_start + 1
+    while pos < len(text) and depth > 0:
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+        pos += 1
+    return pos if depth == 0 else None

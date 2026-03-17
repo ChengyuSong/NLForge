@@ -2197,6 +2197,11 @@ def _load_compile_commands(
                     _translate_arg(a, proj_dir, build_dir_path)
                     for a in e["arguments"]
                 ]
+            if "command" in e:
+                import shlex
+                parts = shlex.split(e["command"])
+                parts = [_translate_arg(a, proj_dir, build_dir_path) for a in parts]
+                e["command"] = " ".join(shlex.quote(p) for p in parts)
             resolved.append(e)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
