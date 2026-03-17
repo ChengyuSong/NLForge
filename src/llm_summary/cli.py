@@ -1,6 +1,7 @@
 """Command-line interface for LLM-based allocation summary analysis."""
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -4415,10 +4416,16 @@ def gen_harness(
                 console.print(
                     f"Validating {func_name}#{v.get('issue_index', '?')} "
                     f"({v.get('hypothesis', '?')}): "
-                    f"entries={entries}, scope={relevant}"
+                    f"entries={entries}"
                 )
 
+                other_entries = set(entries)
                 for entry in entries:
+                    # Scope per entry: exclude other entry functions
+                    entry_scope = [
+                        f for f in relevant
+                        if f == entry or f not in other_entries
+                    ]
                     triage_ctx = {
                         "hypothesis": v.get("hypothesis", ""),
                         "reasoning": v.get("reasoning", ""),
@@ -4427,7 +4434,7 @@ def gen_harness(
                         "issue_description": v.get("issue", {}).get("description", ""),
                         "assumptions": v.get("assumptions", []),
                         "assertions": v.get("assertions", []),
-                        "real_functions": relevant,
+                        "real_functions": entry_scope,
                     }
 
                     result = generator.validate_triage(
@@ -4438,6 +4445,50 @@ def gen_harness(
                     )
                     if result:
                         console.print(f"[green]Harness generated: {entry}[/green]")
+
+                        # Auto-build to get CFG dump, then generate
+                        # validation plan with counter-example traces
+                        out = Path(output_dir)
+                        script = out / f"build_{entry}.sh"
+                        if script.exists():
+                            console.print(f"  Building {entry}...")
+                            build_result = subprocess.run(
+                                ["bash", str(script)],
+                                capture_output=True, text=True,
+                            )
+                            if build_result.returncode == 0:
+                                console.print(
+                                    f"  [green]Built: {entry}.ucsan[/green]"
+                                )
+                                cfg_path = out / f"cfg_{entry}.txt"
+                                if cfg_path.exists():
+                                    plan = generator.generate_validation_plan(
+                                        v, str(out),
+                                        cfg_dump=str(cfg_path),
+                                        entry_name=entry,
+                                        scope_functions=entry_scope,
+                                    )
+                                    if plan:
+                                        console.print(
+                                            f"  [green]Validation plan: "
+                                            f"{len(plan.get('traces', []))} "
+                                            f"traces[/green]"
+                                        )
+                                    else:
+                                        console.print(
+                                            "[yellow]  Failed to generate "
+                                            "validation plan[/yellow]"
+                                        )
+                                else:
+                                    console.print(
+                                        "[yellow]  No CFG dump — "
+                                        "skipping plan[/yellow]"
+                                    )
+                            else:
+                                console.print(
+                                    f"[red]  Build failed: "
+                                    f"{build_result.stderr[:200]}[/red]"
+                                )
                     else:
                         console.print(f"[red]Failed: {entry}[/red]")
             return

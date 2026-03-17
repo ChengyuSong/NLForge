@@ -153,8 +153,10 @@ Rules:
 - Do NOT add comments — the code should be self-explanatory
 - In stubs: use assert_* for pre-conditions, assume_* for post-conditions
 - In test(): use assert_* to verify post-conditions after the call
-- Only check contracts on direct parameters (skip struct field contracts
-  like s->strm when struct definition is not available)
+- Only check contracts on direct parameters — skip deep field access
+  through forward-declared (opaque) struct pointers (e.g. do NOT access
+  s->l_desc.stat_desc->extra_bits if stat_desc's struct type is opaque)
+- Use sizeof(*ptr) for allocation sizes, not hardcoded constants
 """
 
 FILL_PROMPT = """\
@@ -198,8 +200,10 @@ Rules:
 - Do NOT add comments — the code should be self-explanatory
 - In stubs: use assert_* for pre-conditions, assume_* for post-conditions
 - In test(): use assert_* to verify post-conditions after the call
-- Only check contracts on direct parameters (skip struct field contracts
-  like s->strm when struct definition is not available)
+- Only check contracts on direct parameters — skip deep field access
+  through forward-declared (opaque) struct pointers (e.g. do NOT access
+  s->l_desc.stat_desc->extra_bits if stat_desc's struct type is opaque)
+- Use sizeof(*ptr) for allocation sizes, not hardcoded constants
 """
 
 SCHEDULE_PROMPT = """\
@@ -792,6 +796,8 @@ class HarnessGenerator:
         verdict: dict[str, Any],
         output_dir: str,
         cfg_dump: str | None = None,
+        entry_name: str | None = None,
+        scope_functions: list[str] | None = None,
     ) -> dict | None:
         """Generate a cross-function trace plan to validate a triage verdict.
 
@@ -802,7 +808,11 @@ class HarnessGenerator:
             verdict: Triage verdict dict (from verdict JSON).
             output_dir: Directory containing harness + CFG dump.
             cfg_dump: Path to CFG dump file. If None, looks for
-                cfg_{func_name}.txt in output_dir.
+                cfg_{entry_name}.txt in output_dir.
+            entry_name: Entry function name (for naming output files).
+                Defaults to verdict's function_name.
+            scope_functions: Override relevant_functions from verdict.
+                Use to limit scope per entry function.
 
         Returns:
             Plan dict or None on error.
@@ -814,7 +824,8 @@ class HarnessGenerator:
 
         out = Path(output_dir)
         func_name = verdict["function_name"]
-        relevant = verdict.get("relevant_functions", [func_name])
+        plan_name = entry_name or func_name
+        relevant = scope_functions or verdict.get("relevant_functions", [func_name])
         hypothesis = verdict.get("hypothesis", "unknown")
         issue = verdict.get("issue", {})
 
@@ -822,7 +833,7 @@ class HarnessGenerator:
         if cfg_dump:
             cfg_path = Path(cfg_dump)
         else:
-            cfg_path = out / f"cfg_{func_name}.txt"
+            cfg_path = out / f"cfg_{plan_name}.txt"
         if not cfg_path.exists():
             if self.verbose:
                 print(f"  No CFG dump found: {cfg_path}")
@@ -985,7 +996,7 @@ class HarnessGenerator:
                 trace["target_bids"] = sorted(flip_bids)
 
             # Write plan
-            plan_path = out / f"plan_{func_name}_validation.json"
+            plan_path = out / f"plan_{plan_name}_validation.json"
             plan_path.write_text(json.dumps(plan, indent=2))
 
             if self.verbose:
@@ -1037,17 +1048,12 @@ class HarnessGenerator:
                 return t
             is_const = t.startswith("const ")
             bare = t.removeprefix("const ").strip()
-            # Explicit pointer to non-primitive type
+            # Pointer types: keep as-is (headers provide definitions)
             if t.endswith("*"):
-                base = t[:-1].strip().removeprefix("const ").strip()
-                if base not in self._PRIMITIVE_TYPES and base != "void":
-                    if is_const:
-                        return "const void *"
-                    return "void *"
                 return t
             # Typedef that is actually a pointer (e.g. gzFile, z_streamp)
             if bare in ptr_typedefs:
-                return "void *"
+                return t
             # Scalar typedef (e.g. uLong -> unsigned long)
             if bare in scalar_typedefs:
                 canonical = scalar_typedefs[bare]
@@ -1640,8 +1646,7 @@ echo "Built: $OUT"
 
         lines.append(f"void test({test_params}) {{")
 
-        # malloc + memcpy for pointer params
-        alloc_size = 4096
+        # malloc + memcpy for pointer params (use real types + sizeof)
         paren = func_signature.index("(")
         param_types = func_signature[paren + 1:func_signature.rindex(")")
                                      ].split(",")
@@ -1649,9 +1654,9 @@ echo "Built: $OUT"
             ptype = ptype.strip()
             if ptype.endswith("*") or ptype in self._get_pointer_typedefs():
                 lines.append(
-                    f"    void *{pname} = malloc({alloc_size});")
+                    f"    {ptype} {pname} = malloc(sizeof(*{pname}));")
                 lines.append(
-                    f"    memcpy({pname}, input_{pname}, {alloc_size});")
+                    f"    memcpy({pname}, input_{pname}, sizeof(*{pname}));")
 
         lines.append("")
         ret_type = func_signature[:paren].strip()
@@ -1746,7 +1751,7 @@ echo "Built: $OUT"
 
         for ptype, pname in zip(param_types, params, strict=False):
             if ptype.endswith("*") or ptype in ptr_typedefs:
-                test_params.append(f"void *input_{pname}")
+                test_params.append(f"{ptype} input_{pname}")
                 call_args.append(pname)  # local var from malloc
             else:
                 c_type = self._resolve_type(ptype)
@@ -1762,13 +1767,11 @@ echo "Built: $OUT"
             return t
         is_const = t.startswith("const ")
         bare = t.removeprefix("const ").strip()
+        # Pointer types: keep as-is (headers provide definitions)
         if t.endswith("*"):
-            base = t[:-1].strip().removeprefix("const ").strip()
-            if base not in self._PRIMITIVE_TYPES and base != "void":
-                return "const void *" if is_const else "void *"
             return t
         if bare in self._get_pointer_typedefs():
-            return "void *"
+            return t
         scalar_typedefs = self._get_scalar_typedefs()
         if bare in scalar_typedefs:
             canonical = scalar_typedefs[bare]
