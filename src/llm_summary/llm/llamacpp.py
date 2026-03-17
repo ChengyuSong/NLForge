@@ -100,6 +100,7 @@ class LlamaCppBackend(LLMBackend):
             "temperature": 0.5,
             # "max_tokens": 8192,
             "stream": False,
+            "cache_prompt": True,
         }
 
         if response_format:
