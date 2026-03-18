@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llm_summary.db import SummaryDB
 from llm_summary.link_units.pipeline import load_link_units, topo_sort_link_units
+from llm_summary.models import SafetyIssue
 from llm_summary.validation_consumer import classify_outcome
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -385,6 +386,37 @@ def process_target(
                     binary, plan, verdict=v, timeout=args.run_timeout,
                 )
                 func_result["runs"].append(run_result)
+
+                # Auto-review safe_confirmed as false_positive
+                oc = run_result.get("outcome", {})
+                if oc.get("outcome") == "safe_confirmed":
+                    issue_d = v.get("issue", {})
+                    vi_obj = SafetyIssue(
+                        location=issue_d.get("location", ""),
+                        issue_kind=issue_d.get("issue_kind", ""),
+                        description=issue_d.get("description", ""),
+                        severity=issue_d.get("severity", "medium"),
+                        callee=issue_d.get("callee"),
+                        contract_kind=issue_d.get("contract_kind"),
+                    )
+                    db = SummaryDB(str(db_path))
+                    try:
+                        funcs = db.get_function_by_name(func_name)
+                        if funcs:
+                            assert funcs[0].id is not None
+                            db.upsert_issue_review(
+                                function_id=funcs[0].id,
+                                issue_index=idx,
+                                fingerprint=vi_obj.fingerprint(),
+                                status="false_positive",
+                                reason=oc.get("summary", ""),
+                            )
+                            if args.verbose:
+                                print(
+                                    f"        reviewed #{idx} as false_positive"
+                                )
+                    finally:
+                        db.close()
 
         result["functions"].append(func_result)
 

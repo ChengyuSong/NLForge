@@ -4564,27 +4564,41 @@ def gen_harness(
     "--harness-dir", "-d", required=True,
     help="Base harness directory containing per-verdict subdirs",
 )
+@click.option("--db", "db_path", default=None, help="DB path to auto-review safe_confirmed")
 @click.option("--output", "-o", default=None, help="Output JSON path (default: stdout)")
-def consume_validation(verdict: str, harness_dir: str, output: str | None) -> None:
+def consume_validation(
+    verdict: str, harness_dir: str, db_path: str | None, output: str | None,
+) -> None:
     """Classify validation outcomes for triage verdicts.
 
     Reads validation_result.json files produced by thoroupy and classifies
-    each verdict as confirmed or rejected.
+    each verdict as confirmed or rejected.  When --db is provided,
+    safe_confirmed outcomes are auto-reviewed as false_positive.
 
     Example:
         llm-summary consume-validation \\
             -v harnesses/png_static/verdict_png_build_16to8_table.json \\
-            -d harnesses/png_static
+            -d harnesses/png_static \\
+            --db func-scans/png_static/functions.db
     """
     from pathlib import Path
 
+    from .models import SafetyIssue
     from .validation_consumer import consume_validation_dir
 
-    results = consume_validation_dir(Path(verdict), Path(harness_dir))
+    verdict_path = Path(verdict)
+    results = consume_validation_dir(verdict_path, Path(harness_dir))
 
     if not results:
         console.print("[yellow]No validation results found[/yellow]")
         return
+
+    # Load verdicts for issue fingerprint computation
+    with open(verdict_path) as f:
+        verdicts_data = json.load(f)
+    if not isinstance(verdicts_data, list):
+        verdicts_data = [verdicts_data]
+    verdict_by_idx = {v.get("issue_index", i): v for i, v in enumerate(verdicts_data)}
 
     for r in results:
         status = "[green]CONFIRMED[/green]" if r["confirmed"] else "[red]REJECTED[/red]"
@@ -4592,6 +4606,45 @@ def consume_validation(verdict: str, harness_dir: str, output: str | None) -> No
             f"  {r['function']}[{r['issue_index']}] "
             f"{r['hypothesis']} → {status}: {r['summary']}"
         )
+
+    # Auto-review safe_confirmed
+    if db_path:
+        db = SummaryDB(db_path)
+        try:
+            reviewed = 0
+            for r in results:
+                if r["outcome"] != "safe_confirmed":
+                    continue
+                v = verdict_by_idx.get(r["issue_index"])
+                if not v:
+                    continue
+                issue_d = v.get("issue", {})
+                vi_obj = SafetyIssue(
+                    location=issue_d.get("location", ""),
+                    issue_kind=issue_d.get("issue_kind", ""),
+                    description=issue_d.get("description", ""),
+                    severity=issue_d.get("severity", "medium"),
+                    callee=issue_d.get("callee"),
+                    contract_kind=issue_d.get("contract_kind"),
+                )
+                funcs = db.get_function_by_name(r["function"])
+                if funcs:
+                    assert funcs[0].id is not None
+                    db.upsert_issue_review(
+                        function_id=funcs[0].id,
+                        issue_index=r["issue_index"],
+                        fingerprint=vi_obj.fingerprint(),
+                        status="false_positive",
+                        reason=r.get("summary", ""),
+                    )
+                    reviewed += 1
+            if reviewed:
+                console.print(
+                    f"\n[green]Auto-reviewed {reviewed} issue(s) "
+                    f"as false_positive[/green]"
+                )
+        finally:
+            db.close()
 
     if output:
         with open(output, "w") as f:
