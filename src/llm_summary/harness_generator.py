@@ -153,6 +153,11 @@ Rules:
 - Do NOT add comments — the code should be self-explanatory
 - In stubs: use assert_* for pre-conditions, assume_* for post-conditions
 - In test(): use assert_* to verify post-conditions after the call
+- Post-condition annotations use brackets for qualifiers:
+  - `[may_be_null]` means the pointer may be NULL — do NOT assert non-NULL
+  - `[when COND]` means the effect is conditional — wrap the assertion in
+    `if (COND) {{ ... }}` so it only checks on the relevant path
+  - If a post-condition has no brackets, it is unconditional
 - Only check contracts on direct parameters — skip deep field access
   through forward-declared (opaque) struct pointers (e.g. do NOT access
   s->l_desc.stat_desc->extra_bits if stat_desc's struct type is opaque)
@@ -200,6 +205,11 @@ Rules:
 - Do NOT add comments — the code should be self-explanatory
 - In stubs: use assert_* for pre-conditions, assume_* for post-conditions
 - In test(): use assert_* to verify post-conditions after the call
+- Post-condition annotations use brackets for qualifiers:
+  - `[may_be_null]` means the pointer may be NULL — do NOT assert non-NULL
+  - `[when COND]` means the effect is conditional — wrap the assertion in
+    `if (COND) {{ ... }}` so it only checks on the relevant path
+  - If a post-condition has no brackets, it is unconditional
 - Only check contracts on direct parameters — skip deep field access
   through forward-declared (opaque) struct pointers (e.g. do NOT access
   s->l_desc.stat_desc->extra_bits if stat_desc's struct type is opaque)
@@ -1257,7 +1267,7 @@ class HarnessGenerator:
                     f'echo "  Compiling {src_name}..."\n'
                     f'METADATA="$CONFIG" KO_CC=clang-14 '
                     f'KO_TRACE_BB=1 KO_DUMP_CFG="$CFG" \\\n'
-                    f'    "$KO_CLANG" -c -g \\\n'
+                    f'    "$KO_CLANG" -c -g -fno-inline-functions \\\n'
                     f'    {compile_flags_str}"{src}" -o "{obj_path}"'
                 )
 
@@ -1659,17 +1669,27 @@ echo "Built: $OUT"
 
         lines.append(f"void test({test_params}) {{")
 
-        # malloc + memcpy for pointer params (use real types + sizeof)
+        # assume_allocated for pointer params — tells the engine
+        # the buffer is allocated with the correct size
+        buf_size_map: dict[str, str] = {}
+        for c in (contracts or []):
+            if c.get("contract_kind") == "buffer_size" and c.get("size_expr"):
+                buf_size_map[c["target"]] = c["size_expr"]
+
         paren = func_signature.index("(")
         param_types = func_signature[paren + 1:func_signature.rindex(")")
                                      ].split(",")
         for ptype, pname in zip(param_types, func_params, strict=False):
             ptype = ptype.strip()
             if ptype.endswith("*") or ptype in self._get_pointer_typedefs():
+                size_expr = buf_size_map.get(pname, f"sizeof(*{pname})")
+                aid = id_counter
+                id_counter += 1
+                id_map.append(
+                    f"{aid}: test:{pname}:assume_allocated")
                 lines.append(
-                    f"    {ptype} {pname} = malloc(sizeof(*{pname}));")
-                lines.append(
-                    f"    memcpy({pname}, input_{pname}, sizeof(*{pname}));")
+                    f"    {ptype} {pname} = assume_allocated("
+                    f"input_{pname}, {size_expr}, {aid});")
 
         lines.append("")
         ret_type = func_signature[:paren].strip()
@@ -1801,14 +1821,29 @@ echo "Built: $OUT"
             target = ("return value" if alloc.get("returned")
                       else alloc.get("stored_to", "?"))
             size = alloc.get("size_expr", "?")
-            comments.append(f"ALLOCATES {target} (size: {size})")
+            may_null = alloc.get("may_be_null", True)
+            line = f"ALLOCATES {target} (size: {size})"
+            if may_null:
+                line += " [may_be_null]"
+            cond = alloc.get("condition", "")
+            if cond:
+                line += f" [when {cond}]"
+            comments.append(line)
         for init in postconds.get("inits", []):
             target = init.get("target", "?")
             byte_count = init.get("byte_count", "?")
-            comments.append(f"INITIALIZES {target} ({byte_count} bytes)")
+            line = f"INITIALIZES {target} ({byte_count} bytes)"
+            cond = init.get("condition", "")
+            if cond:
+                line += f" [when {cond}]"
+            comments.append(line)
         for free in postconds.get("frees", []):
             target = free.get("target", "?")
-            comments.append(f"FREES {target}")
+            line = f"FREES {target}"
+            cond = free.get("condition", "")
+            if cond:
+                line += f" [when {cond}]"
+            comments.append(line)
         return comments
 
     @staticmethod
