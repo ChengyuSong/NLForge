@@ -49,19 +49,15 @@ if TYPE_CHECKING:
 console = Console()
 
 
-def _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking):
+def _build_backend_kwargs(
+    backend: str,
+    llm_host: str,
+    llm_port: int | None,
+    disable_thinking: bool,
+) -> dict:
     """Build kwargs dict for create_backend() from CLI options."""
-    kwargs = {}
-    if backend == "llamacpp":
-        kwargs["host"] = llm_host
-        kwargs["port"] = llm_port if llm_port is not None else 8080
-    elif backend == "ollama":
-        if llm_port is None:
-            llm_port = 11434
-        kwargs["base_url"] = f"http://{llm_host}:{llm_port}"
-    if disable_thinking:
-        kwargs["enable_thinking"] = False
-    return kwargs
+    from .llm import build_backend_kwargs
+    return build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)
 
 
 @click.group()

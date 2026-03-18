@@ -16,7 +16,28 @@ __all__ = [
     "OllamaBackend",
     "LlamaCppBackend",
     "LLMPool",
+    "build_backend_kwargs",
 ]
+
+
+def build_backend_kwargs(
+    backend: str,
+    llm_host: str = "localhost",
+    llm_port: int | None = None,
+    disable_thinking: bool = False,
+) -> dict:
+    """Build kwargs dict for create_backend() from common CLI options."""
+    kwargs: dict = {}
+    if backend == "llamacpp":
+        kwargs["host"] = llm_host
+        kwargs["port"] = llm_port if llm_port is not None else 8080
+    elif backend == "ollama":
+        if llm_port is None:
+            llm_port = 11434
+        kwargs["base_url"] = f"http://{llm_host}:{llm_port}"
+    if disable_thinking:
+        kwargs["enable_thinking"] = False
+    return kwargs
 
 
 def create_backend(

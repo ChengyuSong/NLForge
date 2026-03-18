@@ -28,7 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llm_summary.db import SummaryDB
 from llm_summary.link_units.pipeline import load_link_units, topo_sort_link_units
+from llm_summary.llm import build_backend_kwargs, create_backend
 from llm_summary.models import SafetyIssue
+from llm_summary.reflection import reflect
 from llm_summary.validation_consumer import classify_outcome
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -248,6 +250,50 @@ def run_thoroupy(
     return result
 
 
+def run_reflection(
+    verdict: dict,
+    outcome: dict,
+    db_path: Path,
+    harness_dir: Path,
+    entry_name: str | None,
+    llm: object,
+    args: argparse.Namespace,
+) -> dict | None:
+    """Run reflection on a single validation outcome.
+
+    Returns the reflection result dict, or None on failure.
+    """
+    func_name = verdict.get("function_name", "unknown")
+    idx = verdict.get("issue_index", 0)
+    vdir = harness_dir / func_name / f"v{idx}"
+
+    cfg_path = None
+    if entry_name:
+        candidate = vdir / f"cfg_{entry_name}.txt"
+        if candidate.exists():
+            cfg_path = str(candidate)
+
+    db = SummaryDB(str(db_path))
+    try:
+        result = reflect(
+            verdict=verdict,
+            outcome=outcome,
+            db=db,
+            llm=llm,  # type: ignore[arg-type]
+            cfg_dump_path=cfg_path,
+            output_dir=str(vdir),
+            entry_name=entry_name,
+            verbose=args.verbose,
+        )
+        return result  # type: ignore[no-any-return]
+    except Exception as e:
+        if args.verbose:
+            print(f"        reflection failed: {e}")
+        return None
+    finally:
+        db.close()
+
+
 def process_target(
     project_name: str,
     target_name: str,
@@ -284,6 +330,7 @@ def process_target(
     compile_commands = _find_compile_commands(project_name)
     project_path = _find_project_path(project_name)
     harness_dir = HARNESSES_DIR / target_name
+    reflect_llm = None  # lazily created when first reflection is needed
 
     for func_name, issue_count in issues:
         func_result: dict = {
@@ -389,7 +436,8 @@ def process_target(
 
                 # Auto-review safe_confirmed as false_positive
                 oc = run_result.get("outcome", {})
-                if oc.get("outcome") == "safe_confirmed":
+                outcome_type = oc.get("outcome", "")
+                if outcome_type == "safe_confirmed":
                     issue_d = v.get("issue", {})
                     vi_obj = SafetyIssue(
                         location=issue_d.get("location", ""),
@@ -417,6 +465,40 @@ def process_target(
                                 )
                     finally:
                         db.close()
+
+                # Reflect on non-trivial outcomes
+                elif outcome_type and not args.skip_reflect:
+                    if reflect_llm is None:
+                        kwargs = build_backend_kwargs(
+                            args.backend, args.llm_host, args.llm_port,
+                        )
+                        reflect_llm = create_backend(
+                            args.backend, model=args.model, **kwargs,
+                        )
+                    entry = Path(binary).stem if binary else None
+                    if args.verbose:
+                        print(
+                            f"        reflecting on {outcome_type}..."
+                        )
+                    refl = run_reflection(
+                        verdict=v,
+                        outcome=oc,
+                        db_path=db_path,
+                        harness_dir=harness_dir,
+                        entry_name=entry,
+                        llm=reflect_llm,
+                        args=args,
+                    )
+                    if refl:
+                        run_result["reflection"] = refl
+                        if args.verbose:
+                            hyp = refl.get("hypothesis", "?")
+                            conf = refl.get("confidence", "?")
+                            act = refl.get("action", "?")
+                            print(
+                                f"        → {hyp} ({conf}) "
+                                f"action={act}"
+                            )
 
         result["functions"].append(func_result)
 
@@ -539,6 +621,10 @@ def main() -> None:
         help="Generate harnesses but skip thoroupy runs",
     )
     parser.add_argument(
+        "--skip-reflect", action="store_true",
+        help="Skip reflection after thoroupy runs",
+    )
+    parser.add_argument(
         "--filter", type=str, default=None,
         help="Only process projects matching this substring",
     )
@@ -592,6 +678,8 @@ def main() -> None:
         stages.append("validate")
     if not args.skip_run:
         stages.append("run")
+    if not args.skip_reflect:
+        stages.append("reflect")
 
     print(f"\nProcessing {len(projects)} projects")
     print(
