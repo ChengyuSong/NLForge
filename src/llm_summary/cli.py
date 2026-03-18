@@ -4403,9 +4403,10 @@ def gen_harness(
             # Support both single verdict and list of verdicts
             verdicts = verdict_data if isinstance(verdict_data, list) else [verdict_data]
 
-            for v in verdicts:
+            for vi, v in enumerate(verdicts):
                 relevant = v.get("relevant_functions", [])
                 func_name = v.get("function_name", "")
+                issue_idx = v.get("issue_index", vi)
                 if not relevant:
                     relevant = [func_name] if func_name else []
                 if not relevant:
@@ -4413,10 +4414,15 @@ def gen_harness(
                     continue
 
                 entries = _find_entry_functions(db, relevant)
+                # Per-verdict output dir to avoid overwriting
+                verdict_dir = str(
+                    Path(output_dir) / func_name / f"v{issue_idx}"
+                )
+                Path(verdict_dir).mkdir(parents=True, exist_ok=True)
                 console.print(
-                    f"Validating {func_name}#{v.get('issue_index', '?')} "
+                    f"Validating {func_name}#{issue_idx} "
                     f"({v.get('hypothesis', '?')}): "
-                    f"entries={entries}"
+                    f"entries={entries} -> {verdict_dir}"
                 )
 
                 other_entries = set(entries)
@@ -4440,7 +4446,7 @@ def gen_harness(
                     result = generator.validate_triage(
                         entry,
                         triage_context=triage_ctx,
-                        output_dir=output_dir,
+                        output_dir=verdict_dir,
                         bc_file=bc_file,
                     )
                     if result:
@@ -4448,7 +4454,7 @@ def gen_harness(
 
                         # Auto-build to get CFG dump, then generate
                         # validation plan with counter-example traces
-                        out = Path(output_dir)
+                        out = Path(verdict_dir)
                         script = out / f"build_{entry}.sh"
                         if script.exists():
                             console.print(f"  Building {entry}...")
