@@ -3402,7 +3402,7 @@ def import_dep_summaries(db_path, dep_db_paths, force, verbose):
     try:
         for dep_path in dep_db_paths:
             dep_db = SummaryDB(dep_path)
-            dep_tag = f"dep:{Path(dep_path).stem}"
+            dep_tag = f"dep:{Path(dep_path).parent.name}"
             copied_funcs = 0
             copied_summaries = 0
 
@@ -3424,41 +3424,43 @@ def import_dep_summaries(db_path, dep_db_paths, force, verbose):
                     if not src_summaries:
                         continue
 
-                    # Find or create matching function in target DB
+                    # Find or create matching functions in target DB.
+                    # Multiple candidates can share a name (C++ overloads /
+                    # template instantiations) — import to ALL of them.
                     candidates = target_db.get_function_by_name(src_func.name)
-                    tgt_func = candidates[0] if candidates else None
-                    if tgt_func is None:
+                    if not candidates:
                         stub_id = target_db.insert_function_stub(
                             name=src_func.name,
                             file_path=src_func.file_path,
                             line_start=src_func.line_start,
                             line_end=src_func.line_end,
                         )
-                        tgt_func = target_db.get_function(stub_id)
-
-                    if tgt_func is None:
-                        continue
+                        stub = target_db.get_function(stub_id)
+                        candidates = [stub] if stub else []
 
                     func_imported = False
-                    for table, (summary_json, model_used) in src_summaries.items():
-                        existing = target_db.conn.execute(
-                            f"SELECT id FROM {table} WHERE function_id = ?",
-                            (tgt_func.id,),
-                        ).fetchone()
-                        if existing and not force:
+                    for tgt_func in candidates:
+                        if tgt_func is None:
                             continue
+                        for table, (summary_json, model_used) in src_summaries.items():
+                            existing = target_db.conn.execute(
+                                f"SELECT id FROM {table} WHERE function_id = ?",
+                                (tgt_func.id,),
+                            ).fetchone()
+                            if existing and not force:
+                                continue
 
-                        target_db.conn.execute(
-                            f"INSERT INTO {table} (function_id, summary_json, model_used)"
-                            " VALUES (?, ?, ?)"
-                            " ON CONFLICT(function_id) DO UPDATE SET"
-                            "   summary_json = excluded.summary_json,"
-                            "   updated_at   = CURRENT_TIMESTAMP,"
-                            "   model_used   = excluded.model_used",
-                            (tgt_func.id, summary_json, model_used),
-                        )
-                        copied_summaries += 1
-                        func_imported = True
+                            target_db.conn.execute(
+                                f"INSERT INTO {table} (function_id, summary_json, model_used)"
+                                " VALUES (?, ?, ?)"
+                                " ON CONFLICT(function_id) DO UPDATE SET"
+                                "   summary_json = excluded.summary_json,"
+                                "   updated_at   = CURRENT_TIMESTAMP,"
+                                "   model_used   = excluded.model_used",
+                                (tgt_func.id, summary_json, model_used),
+                            )
+                            copied_summaries += 1
+                            func_imported = True
 
                     if func_imported:
                         copied_funcs += 1

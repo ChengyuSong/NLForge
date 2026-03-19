@@ -4,14 +4,46 @@ import json
 import re
 from typing import cast
 
+_VALID_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+
+
+def _fix_invalid_escapes(s: str) -> str:
+    r"""Double-escape invalid ``\X`` sequences inside a JSON string literal.
+
+    Valid JSON escapes (``\"``, ``\\``, ``\/``, ``\b``, ``\f``, ``\n``,
+    ``\r``, ``\t``, ``\uXXXX``) are left alone.  Anything else
+    (e.g. ``\p``, ``\s``, ``\w``) becomes ``\\p``, ``\\s``, ``\\w``.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == '\\' and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in _VALID_JSON_ESCAPES:
+                out.append(s[i:i + 2])
+                i += 2
+            else:
+                # Invalid escape → double the backslash
+                out.append('\\\\')
+                i += 1
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
 
 def repair_json(text: str) -> str:
     """Fix common JSON syntax errors from quantized LLMs.
 
     Handles:
+      - Invalid backslash escapes in string values (``\\p`` → ``\\\\p``)
       - Trailing commas before ``}`` or ``]``
       - Mismatched closing braces/brackets (e.g. ``}`` where ``]`` expected)
+      - Unescaped ``operator""X`` C++ literal operator names
     """
+    # C++ user-defined literal operators: operator""h → operator\"\"h
+    text = re.sub(r'operator""', r'operator\\"\\"', text)
+
     # Trailing commas
     text = re.sub(r",\s*([}\]])", r"\1", text)
 
@@ -24,7 +56,7 @@ def repair_json(text: str) -> str:
     while i < len(text):
         ch = text[i]
         if ch == '"':
-            # Skip string literal (handle backslash escapes)
+            # Extract string literal (handle backslash escapes)
             j = i + 1
             while j < len(text):
                 if text[j] == '\\':
@@ -34,7 +66,13 @@ def repair_json(text: str) -> str:
                     break
                 else:
                     j += 1
-            out.append(text[i:j])
+            # Fix invalid \escapes inside the string content
+            raw_str = text[i:j]
+            if len(raw_str) >= 2:
+                inner = raw_str[1:-1] if raw_str.endswith('"') else raw_str[1:]
+                fixed = _fix_invalid_escapes(inner)
+                raw_str = '"' + fixed + ('"' if raw_str.endswith('"') else '')
+            out.append(raw_str)
             i = j
             continue
         if ch in ('{', '['):
