@@ -4572,11 +4572,12 @@ def gen_harness(
 @click.option("--disable-thinking", is_flag=True)
 @click.option("--verbose", is_flag=True)
 @click.option("--output", "-o", default=None, help="Output JSON path")
+@click.option("--project-path", "-p", default=None, help="Project source path for call site search")
 def reflect_cmd(
     verdict: str, harness_dir: str, db_path: str,
     backend: str, model: str | None, llm_host: str,
     llm_port: int | None, disable_thinking: bool,
-    verbose: bool, output: str | None,
+    verbose: bool, output: str | None, project_path: str | None,
 ) -> None:
     """Reflect on validation outcomes that need investigation.
 
@@ -4653,6 +4654,7 @@ def reflect_cmd(
                 f"{oc['summary']}"
             )
 
+            proj_path = Path(project_path) if project_path else None
             assessment = reflect(
                 verdict=v,
                 outcome=oc,
@@ -4661,6 +4663,7 @@ def reflect_cmd(
                 cfg_dump_path=cfg_path,
                 output_dir=str(vdir),
                 entry_name=entry_name,
+                project_path=proj_path,
                 verbose=verbose,
             )
             results.append({

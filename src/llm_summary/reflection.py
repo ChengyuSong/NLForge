@@ -19,6 +19,7 @@ from typing import Any
 
 from .bbid_extractor import format_annotated_function, parse_cfg_dump
 from .db import SummaryDB
+from .git_tools import GitTools
 from .llm.base import LLMBackend
 
 REFLECTION_PROMPT = """\
@@ -31,6 +32,7 @@ You are given the full context of a validation run:
 3. **Harness shim**: the C shim with callee stubs and test() entry point
 4. **Annotated source**: real code with BB IDs showing branch structure
 5. **Validation outcome**: what actually happened (traces, crashes, assertions)
+6. **Caller context**: how actual callers in the codebase invoke the function
 
 ## How the system works
 
@@ -63,6 +65,10 @@ weaker evidence, the path may still be reachable.
 
 {annotated_sources}
 
+## Caller Context
+
+{caller_context}
+
 ## Validation Outcome
 
 {outcome_section}
@@ -79,6 +85,9 @@ Analyze ALL the evidence and produce a revised verdict as JSON:
   "action": "accept | re-validate | re-triage",
   "action_reason": "Why this action is needed",
   "original_correct": true | false,
+  "practically_triggerable": true | false,
+  "triggerability_analysis": "Can any real caller actually pass the violating \
+input? Cite specific call sites and what arguments they use.",
   "crash_analysis": {{
     "is_real_bug": true | false | "unknown",
     "is_harness_artifact": true | false | "unknown",
@@ -108,6 +117,12 @@ uninitialized struct fields).
 reached, which may confirm or contradict the hypothesis.
 - If all assertions pass but no crash, the predicted bug may not exist.
 - A crash from a stubbed function's missing side-effect is NOT a real bug.
+- **Triggerability**: A contract violation that is technically feasible but \
+never triggered by any real caller is a false positive in practice. Check \
+the caller context — if all callers pass safe values (e.g., string literals, \
+pre-validated pointers), the bug is not practically triggerable even if the \
+contract allows it. Set `practically_triggerable: false` and consider \
+revising the hypothesis to safe.
 
 Output ONLY the JSON block, no other text.
 """
@@ -120,6 +135,59 @@ def _read_file_if_exists(path: Path) -> str | None:
     return None
 
 
+def _build_caller_context(
+    func_name: str,
+    project_path: Path | None = None,
+    context_lines: int = 2,
+) -> str:
+    """Build caller context by searching for actual call sites via git grep.
+
+    Shows raw source lines where the function is called, so the LLM can see
+    what arguments real callers pass (e.g., string literals vs variables).
+    """
+    if not project_path or not (project_path / ".git").exists():
+        return "_No project path available for call site search._"
+
+    git = GitTools(project_path)
+
+    # Search for call sites: literal "func_name(" pattern
+    grep_result = git.git_grep(
+        f"{func_name}(",
+        glob="*.c",
+        max_results=20,
+        context=context_lines,
+    )
+
+    if grep_result.get("error"):
+        return f"_Git grep failed: {grep_result['error']}_"
+
+    matches = grep_result.get("matches", [])
+    if not matches:
+        return (
+            f"_No call sites found for `{func_name}` in the codebase. "
+            f"It may only be called from external code._"
+        )
+
+    # Filter out the function definition itself (line with opening brace)
+    call_sites = [
+        m for m in matches
+        if f"{func_name}(" in m and "{" not in m.split(func_name, 1)[-1]
+    ]
+    if not call_sites:
+        call_sites = matches  # fallback: show all matches
+
+    blocks: list[str] = [
+        f"Actual call sites for `{func_name}` in the codebase "
+        f"({len(call_sites)} found):\n",
+        "```",
+    ]
+    for m in call_sites:
+        blocks.append(m)
+    blocks.append("```")
+
+    return "\n".join(blocks)
+
+
 def build_reflection_context(
     verdict: dict[str, Any],
     outcome: dict[str, Any],
@@ -127,11 +195,12 @@ def build_reflection_context(
     cfg_dump_path: str | None = None,
     output_dir: str | None = None,
     entry_name: str | None = None,
+    project_path: Path | None = None,
 ) -> dict[str, str]:
     """Build all context sections for the reflection prompt.
 
     Returns dict with keys: context, plan_section, shim_section,
-    annotated_sources, outcome_section.
+    annotated_sources, caller_context, outcome_section.
     """
     func_name = verdict["function_name"]
     plan_name = entry_name or func_name
@@ -212,6 +281,11 @@ def build_reflection_context(
         if blocks:
             annotated_sources = "\n\n".join(blocks)
 
+    # -- Caller context --
+    caller_context = _build_caller_context(
+        func_name, project_path=project_path,
+    )
+
     # -- Outcome section --
     crashes = outcome.get("crashes", [])
     crash_text = "None."
@@ -259,6 +333,7 @@ def build_reflection_context(
         "plan_section": plan_section,
         "shim_section": shim_section,
         "annotated_sources": annotated_sources,
+        "caller_context": caller_context,
         "outcome_section": outcome_section,
     }
 
@@ -271,6 +346,7 @@ def reflect(
     cfg_dump_path: str | None = None,
     output_dir: str | None = None,
     entry_name: str | None = None,
+    project_path: Path | None = None,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Run reflection on a validation outcome.
@@ -283,6 +359,7 @@ def reflect(
         cfg_dump_path: Path to CFG dump file.
         output_dir: Directory containing harness artifacts.
         entry_name: Entry function name for CFG lookup.
+        project_path: Path to project source for call site search.
         verbose: Print debug info.
 
     Returns:
@@ -293,6 +370,7 @@ def reflect(
         cfg_dump_path=cfg_dump_path,
         output_dir=output_dir,
         entry_name=entry_name,
+        project_path=project_path,
     )
 
     prompt = REFLECTION_PROMPT.format(**sections)
@@ -319,6 +397,14 @@ def reflect(
         if crash:
             print(f"  crash: real={crash.get('is_real_bug')}, "
                   f"artifact={crash.get('is_harness_artifact')}")
+        triggerable = result.get("practically_triggerable")
+        if triggerable is not None:
+            print(f"  practically_triggerable: {triggerable}")
+        if result.get("triggerability_analysis"):
+            print(
+                f"  triggerability: "
+                f"{result['triggerability_analysis'][:300]}",
+            )
         if result.get("reasoning"):
             print(f"  reasoning: {result['reasoning'][:300]}")
 

@@ -258,6 +258,7 @@ def run_reflection(
     entry_name: str | None,
     llm: object,
     args: argparse.Namespace,
+    project_path: Path | None = None,
 ) -> dict | None:
     """Run reflection on a single validation outcome.
 
@@ -283,6 +284,7 @@ def run_reflection(
             cfg_dump_path=cfg_path,
             output_dir=str(vdir),
             entry_name=entry_name,
+            project_path=project_path,
             verbose=args.verbose,
         )
         return result  # type: ignore[no-any-return]
@@ -488,6 +490,7 @@ def process_target(
                         entry_name=entry,
                         llm=reflect_llm,
                         args=args,
+                        project_path=project_path,
                     )
                     if refl:
                         run_result["reflection"] = refl
