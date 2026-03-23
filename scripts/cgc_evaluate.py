@@ -95,8 +95,16 @@ def evaluate_challenge(
     # Track which verifier issues are matched (for FP calculation)
     matched_verifier_issues: set[tuple[str, int]] = set()  # (func_name, issue_idx)
 
+    # Use ASAN-derived vulns if available, else fall back to patch-site vulns.
+    # The refined GT from merge_asan_ground_truth.py puts ASAN findings in
+    # "vulnerabilities" and patch-based ones in "patch_sites".
+    gt_vulns = gt_entry["vulnerabilities"]
+    if not gt_vulns and "patch_sites" in gt_entry:
+        gt_vulns = gt_entry["patch_sites"]
+    result["gt_vulnerabilities"] = len(gt_vulns)
+
     # For each GT vulnerability with a mappable issue_kind
-    for vuln in gt_entry["vulnerabilities"]:
+    for vuln in gt_vulns:
         issue_kind = vuln.get("issue_kind")
         if not issue_kind:
             continue
