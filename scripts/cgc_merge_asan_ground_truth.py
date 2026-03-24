@@ -202,9 +202,15 @@ def merge(
         if asan_findings:
             stats["asan_covered"] += 1
             for af in asan_findings:
+                # SEGV is a symptom, not a root cause — use CWE-derived
+                # kind when available so the verifier can match it
+                issue_kind = af["issue_kind"]
+                if issue_kind == "segv" and cwe_issue_kinds:
+                    issue_kind = cwe_issue_kinds[0]
+
                 # Cross-validate against CWE
                 compatible = any(
-                    issue_kind_compatible(af["issue_kind"], ck)
+                    issue_kind_compatible(issue_kind, ck)
                     for ck in cwe_issue_kinds
                 ) if cwe_issue_kinds else True
 
@@ -226,7 +232,7 @@ def merge(
 
                 vulnerabilities.append({
                     "source": "asan",
-                    "issue_kind": af["issue_kind"],
+                    "issue_kind": issue_kind,
                     "raw_kind": af["raw_kind"],
                     "sanitizer": af["sanitizer"],
                     "function": af["function"],

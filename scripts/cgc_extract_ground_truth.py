@@ -177,7 +177,15 @@ def parse_cwes(readme_path: Path) -> list[int]:
     if not readme_path.exists():
         return []
     text = readme_path.read_text(errors="replace")
-    return [int(m) for m in re.findall(r"CWE-(\d+)", text)]
+    cwes = [int(m) for m in re.findall(r"CWE-(\d+)", text)]
+    if not cwes:
+        # Some READMEs use bare "NNN: Description" under CWE classification
+        section = re.search(
+            r"CWE classification\s*\n(.*?)(?:\n##|\Z)", text, re.S,
+        )
+        if section:
+            cwes = [int(m) for m in re.findall(r"^(\d+):", section.group(1), re.M)]
+    return cwes
 
 
 def parse_vuln_description(readme_path: Path) -> str:
