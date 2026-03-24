@@ -174,7 +174,7 @@ class GitTools:
         path = _safe_path(path)
 
         cmd: list[str] = [
-            "grep", "-n", f"--max-count={max_results}",
+            "grep", "-P", "-n", f"--max-count={max_results}",
         ]
         if context > 0:
             cmd.append(f"-C{context}")
