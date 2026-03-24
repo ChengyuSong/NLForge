@@ -56,6 +56,9 @@ Exception: if this function directly accesses and frees a field \
 (e.g., `free(ctx->buf); cleanup(ctx);`), report the direct `free(ctx->buf)` \
 AND the `cleanup(ctx)` call separately.
 
+**IMPORTANT**: Enumerate EVERY distinct free/release site individually. \
+Do NOT collapse multiple frees into a single entry.
+
 Other considerations:
 - Direct calls to free/deallocator functions
 - Wrapper functions that free (use callee summaries)
@@ -83,6 +86,7 @@ Respond in JSON format:
 ```json
 {ob}
   "function": "{func_name}",
+  "description": "One-sentence description of what this function frees/releases",
   "frees": [
     {ob}
       "target": "expression being freed",
@@ -102,8 +106,7 @@ Respond in JSON format:
       "condition": "guard expression (omit if unconditional)",
       "nulled_after": true|false
     {cb}
-  ],
-  "description": "One-sentence description of what this function frees/releases"
+  ]
 {cb}
 ```
 
@@ -111,9 +114,9 @@ If the function does not free any memory or release resources, return:
 ```json
 {ob}
   "function": "{func_name}",
+  "description": "Does not free memory",
   "frees": [],
-  "resource_releases": [],
-  "description": "Does not free memory"
+  "resource_releases": []
 {cb}
 ```"""
 
@@ -196,6 +199,8 @@ BLOCK_FREE_PROMPT = (
     "{{{{\n"
     '  "suggested_name": "descriptive_name_for_this_case",\n'
     '  "suggested_signature": "void descriptive_name(args)",\n'
+    '  "summary": "One-sentence description of what this case block does '
+    'regarding deallocation",\n'
     '  "frees": [\n'
     "    {{{{\n"
     '      "target": "expression being freed",\n'
@@ -205,9 +210,7 @@ BLOCK_FREE_PROMPT = (
     '      "condition": "guard expression (omit if unconditional)",\n'
     '      "nulled_after": true|false\n'
     "    }}}}\n"
-    "  ],\n"
-    '  "summary": "One-sentence description of what this case block does '
-    'regarding deallocation"\n'
+    "  ]\n"
     "}}}}\n"
     "```\n\n"
     "If no frees, return empty frees list with a summary of what the block does.\n"
@@ -231,11 +234,11 @@ FREE_RESPONSE_FORMAT = make_json_response_format({
     "type": "object",
     "properties": {
         "function": {"type": "string"},
+        "description": {"type": "string"},
         "frees": {"type": "array", "items": _FREE_ITEM},
         "resource_releases": {"type": "array", "items": _FREE_ITEM},
-        "description": {"type": "string"},
     },
-    "required": ["function", "frees", "resource_releases", "description"],
+    "required": ["function", "description", "frees", "resource_releases"],
 })
 
 FREE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
@@ -243,10 +246,10 @@ FREE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
     "properties": {
         "suggested_name": {"type": "string"},
         "suggested_signature": {"type": "string"},
-        "frees": {"type": "array", "items": _FREE_ITEM},
         "summary": {"type": "string"},
+        "frees": {"type": "array", "items": _FREE_ITEM},
     },
-    "required": ["suggested_name", "suggested_signature", "frees", "summary"],
+    "required": ["suggested_name", "suggested_signature", "summary", "frees"],
 })
 
 

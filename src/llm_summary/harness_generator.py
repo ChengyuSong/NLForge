@@ -1498,7 +1498,59 @@ echo "Built: $OUT"
                 data = json.loads(row[0])
                 result[key] = data.get(key, [])
 
+        # Replace local size_expr with persistent equivalents from
+        # buffer_size_pairs when available.
+        if result["allocations"]:
+            self._resolve_local_size_exprs(func_id, result["allocations"])
+
         return result
+
+    def _resolve_local_size_exprs(
+        self, func_id: int, allocations: list[dict[str, Any]],
+    ) -> None:
+        """Replace local-variable size_expr with persistent struct fields.
+
+        Uses buffer_size_pairs from the allocation summary to find persistent
+        size expressions (struct fields, params, globals) for allocations whose
+        size_expr references a local variable.
+        """
+        row = self.db.conn.execute(
+            "SELECT summary_json FROM allocation_summaries "
+            "WHERE function_id = ?",
+            (func_id,),
+        ).fetchone()
+        if not row:
+            return
+        data = json.loads(row[0])
+        pairs = data.get("buffer_size_pairs", [])
+        if not pairs:
+            return
+
+        # Build mapping: buffer field -> persistent size expression
+        # Normalize keys by stripping array indexing (e.g. "[i]", "[]")
+        buf_to_size: dict[str, str] = {}
+        for bp in pairs:
+            buf_key = re.sub(r"\[.*?\]", "", bp.get("buffer", ""))
+            size_field = bp.get("size", "")
+            if buf_key and size_field:
+                buf_to_size[buf_key] = size_field
+
+        for alloc in allocations:
+            size_expr = alloc.get("size_expr")
+            if not size_expr:
+                continue
+            # Skip if already persistent (contains -> or is a known macro)
+            if "->" in size_expr or "." in size_expr or size_expr.isupper():
+                continue
+            # Strip local: prefix if present
+            if size_expr.startswith("local:"):
+                size_expr = size_expr[len("local:"):].strip()
+                alloc["size_expr"] = size_expr
+            # Look up stored_to in buffer_size_pairs
+            stored = alloc.get("stored_to", "")
+            stored_norm = re.sub(r"\[.*?\]", "", stored)
+            if stored_norm in buf_to_size:
+                alloc["size_expr"] = buf_to_size[stored_norm]
 
     def _format_postconditions(self, postconds: dict) -> str:
         """Format post-conditions for the prompt."""

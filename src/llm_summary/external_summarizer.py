@@ -28,6 +28,7 @@ Return a single JSON object with exactly these four keys:
    When non-null:
    {{
      "function": "<name>",
+     "description": "<one sentence>",
      "allocations": [
        {{
          "type": "heap",
@@ -41,8 +42,7 @@ Return a single JSON object with exactly these four keys:
      ],
      "parameters": {{
        "<param>": {{"role": "<role description>", "used_in_allocation": <bool>}}
-     }},
-     "description": "<one sentence>"
+     }}
    }}
 
 2. "free": FreeSummary or null
@@ -50,6 +50,7 @@ Return a single JSON object with exactly these four keys:
    When non-null:
    {{
      "function": "<name>",
+     "description": "<one sentence>",
      "frees": [
        {{
          "target": "<param name or '*param'>",
@@ -58,8 +59,7 @@ Return a single JSON object with exactly these four keys:
          "conditional": <true if freeing is conditional>,
          "nulled_after": <true if pointer is set to NULL after freeing>
        }}
-     ],
-     "description": "<one sentence>"
+     ]
    }}
 
 3. "init": InitSummary or null
@@ -69,6 +69,7 @@ Return a single JSON object with exactly these four keys:
    When non-null:
    {{
      "function": "<name>",
+     "description": "<one sentence>",
      "inits": [
        {{
          "target": "<param name or '*param' or 'return'>",
@@ -76,13 +77,13 @@ Return a single JSON object with exactly these four keys:
          "initializer": "<name of the primitive that writes the bytes>",
          "byte_count": "<expression for bytes written, e.g. n or strlen(src)+1>"
        }}
-     ],
-     "description": "<one sentence>"
+     ]
    }}
 
 4. "memsafe": MemsafeSummary  (always required; use empty contracts list when there are none)
    {{
      "function": "<name>",
+     "description": "<one sentence summarising overall preconditions>",
      "contracts": [
        {{
          "target": "<param name>",
@@ -91,8 +92,7 @@ Return a single JSON object with exactly these four keys:
          "size_expr": "<expression>",        (only for buffer_size)
          "relationship": "byte_count|element_count"  (only for buffer_size)
        }}
-     ],
-     "description": "<one sentence summarising overall preconditions>"
+     ]
    }}
 
 Rules:
@@ -119,41 +119,41 @@ _EXTERNAL_ALLOC_SCHEMA = {
     "type": "object",
     "properties": {
         "function": {"type": "string"},
+        "description": {"type": "string"},
         "allocations": {"type": "array", "items": {"type": "object"}},
         "parameters": {"type": "object"},
-        "description": {"type": "string"},
     },
-    "required": ["function", "allocations", "parameters", "description"],
+    "required": ["function", "description", "allocations", "parameters"],
 }
 
 _EXTERNAL_FREE_SCHEMA = {
     "type": "object",
     "properties": {
         "function": {"type": "string"},
-        "frees": {"type": "array", "items": {"type": "object"}},
         "description": {"type": "string"},
+        "frees": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["function", "frees", "description"],
+    "required": ["function", "description", "frees"],
 }
 
 _EXTERNAL_INIT_SCHEMA = {
     "type": "object",
     "properties": {
         "function": {"type": "string"},
-        "inits": {"type": "array", "items": {"type": "object"}},
         "description": {"type": "string"},
+        "inits": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["function", "inits", "description"],
+    "required": ["function", "description", "inits"],
 }
 
 _EXTERNAL_MEMSAFE_SCHEMA = {
     "type": "object",
     "properties": {
         "function": {"type": "string"},
-        "contracts": {"type": "array", "items": {"type": "object"}},
         "description": {"type": "string"},
+        "contracts": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["function", "contracts", "description"],
+    "required": ["function", "description", "contracts"],
 }
 
 EXTERNAL_RESPONSE_FORMAT = make_json_response_format({

@@ -108,6 +108,7 @@ Respond with JSON:
 ```json
 {{
   "function": "{name}",
+  "description": "One-sentence summary",
   "simplified_contracts": [
     {{"target": "param", "contract_kind": "not_null|nullable|not_freed|initialized|buffer_size",
       "description": "brief", "size_expr": "buffer_size only", "relationship": "buffer_size only"}}
@@ -118,8 +119,7 @@ Respond with JSON:
       "description": "the problem", "severity": "high|medium|low",
       "callee": "if contract violation",
       "contract_kind": "if contract violation"}}
-  ],
-  "description": "One-sentence summary"
+  ]
 }}
 ```
 """
@@ -155,6 +155,7 @@ Respond in JSON:
 {{{{
   "suggested_name": "descriptive_name_for_this_case",
   "suggested_signature": "void descriptive_name(args)",
+  "summary": "One-sentence verification summary for this block",
   "issues": [
     {{{{
       "location": "line N or description",
@@ -162,8 +163,7 @@ Respond in JSON:
       "description": "what the problem is",
       "severity": "high|medium|low"
     }}}}
-  ],
-  "summary": "One-sentence verification summary for this block"
+  ]
 }}}}
 ```
 
@@ -209,11 +209,11 @@ VERIFY_RESPONSE_FORMAT = make_json_response_format({
     "type": "object",
     "properties": {
         "function": {"type": "string"},
+        "description": {"type": "string"},
         "simplified_contracts": {"type": "array", "items": _CONTRACT_ITEM},
         "issues": {"type": "array", "items": _ISSUE_ITEM},
-        "description": {"type": "string"},
     },
-    "required": ["function", "simplified_contracts", "issues", "description"],
+    "required": ["function", "description", "simplified_contracts", "issues"],
 })
 
 VERIFY_BLOCK_RESPONSE_FORMAT = make_json_response_format({
@@ -221,10 +221,10 @@ VERIFY_BLOCK_RESPONSE_FORMAT = make_json_response_format({
     "properties": {
         "suggested_name": {"type": "string"},
         "suggested_signature": {"type": "string"},
-        "issues": {"type": "array", "items": _ISSUE_ITEM},
         "summary": {"type": "string"},
+        "issues": {"type": "array", "items": _ISSUE_ITEM},
     },
-    "required": ["suggested_name", "suggested_signature", "issues", "summary"],
+    "required": ["suggested_name", "suggested_signature", "summary", "issues"],
 })
 
 

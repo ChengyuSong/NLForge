@@ -103,6 +103,7 @@ Respond in JSON format:
 ```json
 {{
   "function": "{name}",
+  "description": "One-sentence summary of this function's safety requirements",
   "contracts": [
     {{
       "target": "parameter or expression",
@@ -112,8 +113,7 @@ Respond in JSON format:
       "relationship": "byte_count (buffer_size only, omit otherwise)",
       "condition": "C expression (omit if unconditional)"
     }}
-  ],
-  "description": "One-sentence summary of this function's safety requirements"
+  ]
 }}
 ```
 
@@ -121,8 +121,8 @@ If the function has no safety pre-conditions (e.g., all pointers are checked bef
 ```json
 {{
   "function": "{name}",
-  "contracts": [],
-  "description": "No safety pre-conditions required"
+  "description": "No safety pre-conditions required",
+  "contracts": []
 }}
 ```
 """
@@ -152,6 +152,7 @@ Respond in JSON:
 {{{{
   "suggested_name": "descriptive_name_for_this_case",
   "suggested_signature": "void descriptive_name(args)",
+  "summary": "One-sentence description of this block's safety requirements",
   "contracts": [
     {{{{
       "target": "parameter or expression",
@@ -161,8 +162,7 @@ Respond in JSON:
       "relationship": "byte_count (buffer_size only)",
       "condition": "C expression (omit if unconditional)"
     }}}}
-  ],
-  "summary": "One-sentence description of this block's safety requirements"
+  ]
 }}}}
 ```
 
@@ -198,10 +198,10 @@ MEMSAFE_RESPONSE_FORMAT = make_json_response_format({
     "type": "object",
     "properties": {
         "function": {"type": "string"},
-        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
         "description": {"type": "string"},
+        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
     },
-    "required": ["function", "contracts", "description"],
+    "required": ["function", "description", "contracts"],
 })
 
 MEMSAFE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
@@ -209,11 +209,11 @@ MEMSAFE_BLOCK_RESPONSE_FORMAT = make_json_response_format({
     "properties": {
         "suggested_name": {"type": "string"},
         "suggested_signature": {"type": "string"},
-        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
         "summary": {"type": "string"},
+        "contracts": {"type": "array", "items": _MEMSAFE_CONTRACT_ITEM},
     },
     "required": ["suggested_name", "suggested_signature",
-                  "contracts", "summary"],
+                  "summary", "contracts"],
 })
 
 

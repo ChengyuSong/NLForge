@@ -49,6 +49,9 @@ Do NOT use "full"; always prefer the actual size expression or sizeof(return_typ
 6. **condition** (optional): the condition under which the initialization occurs \
 (e.g., "return value == 0", "n > 0 && s != NULL"); only present when conditional is true
 
+**IMPORTANT**: Enumerate EVERY distinct initialization site individually. \
+Do NOT collapse multiple inits into a single entry.
+
 Consider:
 - Direct assignments to output parameters and struct fields
 - Calls to memset, memcpy, calloc, etc. (use callee summaries)
@@ -68,6 +71,7 @@ Respond in JSON format:
 ```json
 {ob}
   "function": "{func_name}",
+  "description": "One-sentence description of what this function initializes",
   "inits": [
     {ob}
       "target": "expression being initialized",
@@ -77,8 +81,7 @@ Respond in JSON format:
       "conditional": true,
       "condition": "condition expression (omit if unconditional)"
     {cb}
-  ],
-  "description": "One-sentence description of what this function initializes"
+  ]
 {cb}
 ```
 
@@ -86,8 +89,8 @@ If the function does not unconditionally initialize any caller-visible state, re
 ```json
 {ob}
   "function": "{func_name}",
-  "inits": [],
-  "description": "Does not unconditionally initialize caller-visible state"
+  "description": "Does not unconditionally initialize caller-visible state",
+  "inits": []
 {cb}
 ```"""
 
@@ -174,6 +177,8 @@ BLOCK_INIT_PROMPT = (
     "{{{{\n"
     '  "suggested_name": "descriptive_name_for_this_case",\n'
     '  "suggested_signature": "void descriptive_name(args)",\n'
+    '  "summary": "One-sentence description of what this case block does '
+    'regarding initialization",\n'
     '  "inits": [\n'
     "    {{{{\n"
     '      "target": "expression being initialized",\n'
@@ -181,9 +186,7 @@ BLOCK_INIT_PROMPT = (
     '      "initializer": "how it is initialized",\n'
     '      "byte_count": "concrete_expr|sizeof(T)|null"\n'
     "    }}}}\n"
-    "  ],\n"
-    '  "summary": "One-sentence description of what this case block does '
-    'regarding initialization"\n'
+    "  ]\n"
     "}}}}\n"
     "```\n\n"
     "If no caller-visible initializations, return empty inits list with a summary.\n"
@@ -207,10 +210,10 @@ INIT_RESPONSE_FORMAT = make_json_response_format({
     "type": "object",
     "properties": {
         "function": {"type": "string"},
-        "inits": {"type": "array", "items": _INIT_ITEM},
         "description": {"type": "string"},
+        "inits": {"type": "array", "items": _INIT_ITEM},
     },
-    "required": ["function", "inits", "description"],
+    "required": ["function", "description", "inits"],
 })
 
 INIT_BLOCK_RESPONSE_FORMAT = make_json_response_format({
@@ -218,10 +221,10 @@ INIT_BLOCK_RESPONSE_FORMAT = make_json_response_format({
     "properties": {
         "suggested_name": {"type": "string"},
         "suggested_signature": {"type": "string"},
-        "inits": {"type": "array", "items": _INIT_ITEM},
         "summary": {"type": "string"},
+        "inits": {"type": "array", "items": _INIT_ITEM},
     },
-    "required": ["suggested_name", "suggested_signature", "inits", "summary"],
+    "required": ["suggested_name", "suggested_signature", "summary", "inits"],
 })
 
 

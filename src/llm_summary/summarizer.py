@@ -30,11 +30,17 @@ call heap allocators.
 stack-allocated buffer (local variable, VLA, alloca) escapes the function \
 (returned or stored to a caller-visible location) — this is a bug worth flagging.
    - Source: The allocating function/operator
-   - Size expression: How size is computed
+   - Size expression: How size is computed. Trace local vars and args \
+passed to callees back to more persistent source (own parameter, struct \
+field, or global). If no persistent source exists, prefix with `local:`.
    - Size parameters: Which function parameters affect size
    - Returned: Is the allocation returned?
    - Stored to: Is it stored to a field/global?
    - May be null: Can allocation fail?
+
+   **IMPORTANT**: Enumerate EVERY distinct allocation site individually. \
+Do NOT collapse multiple allocations into a single entry. Each call to \
+malloc/calloc/realloc (direct or via wrapper) is a separate entry.
 
    **Do NOT report**: ordinary local variables, fixed-size stack arrays, \
 compound literals, static const tables, struct declarations on the stack, \
@@ -87,6 +93,13 @@ Respond in JSON format:
 ```json
 {ob}
   "function": "{func_name}",
+  "description": "One-sentence summary of what this function allocates",
+  "parameters": {ob}
+    "param_name": {ob}
+      "role": "role description",
+      "used_in_allocation": true|false
+    {cb}
+  {cb},
   "allocations": [
     {ob}
       "type": "heap",
@@ -98,12 +111,6 @@ Respond in JSON format:
       "may_be_null": true|false
     {cb}
   ],
-  "parameters": {ob}
-    "param_name": {ob}
-      "role": "role description",
-      "used_in_allocation": true|false
-    {cb}
-  {cb},
   "buffer_size_pairs": [
     {ob}
       "buffer": "buffer variable/field",
@@ -111,8 +118,7 @@ Respond in JSON format:
       "kind": "param_pair|struct_field|flexible_array",
       "relationship": "byte count|element count|max capacity"
     {cb}
-  ],
-  "description": "One-sentence description"
+  ]
 {cb}
 ```
 
@@ -120,10 +126,10 @@ If the function does not allocate memory (directly or via callees), return:
 ```json
 {ob}
   "function": "{func_name}",
-  "allocations": [],
+  "description": "Does not allocate memory",
   "parameters": {empty},
-  "buffer_size_pairs": [],
-  "description": "Does not allocate memory"
+  "allocations": [],
+  "buffer_size_pairs": []
 {cb}
 ```"""
 
@@ -212,19 +218,20 @@ BLOCK_ALLOCATION_PROMPT = (
     "{{{{\n"
     '  "suggested_name": "descriptive_name_for_this_case",\n'
     '  "suggested_signature": "void descriptive_name(args)",\n'
+    '  "summary": "One-sentence description of what this case block does '
+    'regarding allocation",\n'
     '  "allocations": [\n'
     "    {{{{\n"
     '      "type": "heap",\n'
     '      "source": "allocator function name",\n'
-    '      "size_expr": "size expression or null",\n'
+    '      "size_expr": "size expr (prefer persistent: '
+    'param/field/global; prefix local vars with local:)",\n'
     '      "size_params": [],\n'
     '      "returned": false,\n'
     '      "stored_to": "field or null",\n'
     '      "may_be_null": true\n'
     "    }}}}\n"
-    "  ],\n"
-    '  "summary": "One-sentence description of what this case block does '
-    'regarding allocation"\n'
+    "  ]\n"
     "}}}}\n"
     "```\n\n"
     "If no allocations, return empty allocations list with a summary of "
