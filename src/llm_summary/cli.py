@@ -4399,6 +4399,7 @@ def gen_harness(
             ko_clang_path=ko_clang_path,
             symsan_dir=symsan_dir,
             compile_commands=compile_commands,
+            project_path=project_path,
         )
 
         # Validate a triage verdict

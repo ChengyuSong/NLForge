@@ -15,6 +15,7 @@ from typing import Any
 
 from .compile_commands import CompileCommandsDB
 from .db import SummaryDB
+from .git_tools import GIT_TOOL_DEFINITIONS, GitTools
 from .llm.base import LLMBackend
 
 # ---- Fill-in template prompts ----
@@ -267,6 +268,210 @@ Output a single ```json fenced block:
 """
 
 
+# ---------------------------------------------------------------------------
+# Agent-based fix loop: tool definitions, executor, system prompt
+# ---------------------------------------------------------------------------
+
+_GIT_TOOL_NAMES = {"git_show", "git_ls_tree", "git_grep"}
+
+FIX_SYSTEM_PROMPT = """\
+You are fixing a C shim that failed to compile with ko-clang.
+
+The shim was generated from a fill-in template for ucsan concolic execution.
+Keep the template structure intact — do not reorganise the code.
+
+## Git tools
+
+You have read-only access to the project source via git tools. Use them to \
+*understand* types, signatures, and macros — do NOT copy project code into \
+the shim. The shim is a thin test stub, not a copy of the real implementation.
+
+## Typical errors and fixes
+
+- **Unknown type**: `git_grep` for the typedef/struct definition. Then either \
+use `void *` (for opaque pointers) or add a minimal forward declaration \
+(`struct foo;` or `typedef struct foo foo;`) at the top of the shim.
+- **Wrong parameter name**: `git_show` the file containing the real function \
+to see the actual signature and parameter names.
+- **Undeclared identifier**: grep for it — it may be an enum value, macro, or \
+global. Use a literal value or forward-declare as needed.
+- **Incompatible types**: cast to `void *` for opaque pointer types.
+
+## Rules
+
+- Do NOT add `#include` directives.
+- Do NOT copy function implementations from the project.
+- Minimise changes — fix only what the compiler error requires.
+- After patching, always call `compile_shim` to verify.
+- When compilation succeeds, call `submit_harness` to finish.
+"""
+
+HARNESS_FIX_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "compile_shim",
+        "description": (
+            "Compile the current shim code with ko-clang. "
+            "Returns {success: bool, errors: string}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "replace_function_body",
+        "description": (
+            "Replace the body of a named function in the shim. "
+            "Provide the function name (e.g. '__shim_png_malloc') and "
+            "the new body lines (without the surrounding braces)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "function_name": {
+                    "type": "string",
+                    "description": "Name of the function to patch.",
+                },
+                "new_body": {
+                    "type": "string",
+                    "description": (
+                        "Replacement body lines (no surrounding { })."
+                    ),
+                },
+            },
+            "required": ["function_name", "new_body"],
+        },
+    },
+    {
+        "name": "replace_full_code",
+        "description": (
+            "Replace the entire shim C code. Use only when patching "
+            "individual functions is insufficient (e.g. adding a "
+            "forward declaration at the top)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Complete replacement C code.",
+                },
+            },
+            "required": ["code"],
+        },
+    },
+    {
+        "name": "submit_harness",
+        "description": (
+            "Accept the current shim code and finish the fix loop. "
+            "Call this after compile_shim returns success."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+] + GIT_TOOL_DEFINITIONS
+
+MAX_FIX_TURNS = 50
+MAX_COMPILE_ATTEMPTS = 5
+
+
+class HarnessFixExecutor:
+    """Executes fix-loop tool calls against the shim code."""
+
+    def __init__(
+        self,
+        c_code: str,
+        ucsan_config: str,
+        file_path: str | None,
+        generator: "HarnessGenerator",
+        git_tools: GitTools | None,
+    ) -> None:
+        self.c_code = c_code
+        self.ucsan_config = ucsan_config
+        self.file_path = file_path
+        self.gen = generator
+        self.git = git_tools
+        self.submitted = False
+        self.compile_attempts = 0
+
+    def execute(
+        self, tool_name: str, tool_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        if tool_name in _GIT_TOOL_NAMES:
+            if self.git is None:
+                return {"error": f"Tool '{tool_name}' unavailable: no project path"}
+            return self.git.dispatch(tool_name, tool_input)
+        handler = getattr(self, f"_tool_{tool_name}", None)
+        if handler is None:
+            return {"error": f"Unknown tool: {tool_name}"}
+        result: dict[str, Any] = handler(tool_input)
+        return result
+
+    def _tool_compile_shim(self, _inp: dict[str, Any]) -> dict[str, Any]:
+        self.compile_attempts += 1
+        if self.compile_attempts > MAX_COMPILE_ATTEMPTS:
+            return {
+                "success": False,
+                "errors": f"Compile attempt limit ({MAX_COMPILE_ATTEMPTS}) "
+                "reached. Call submit_harness to accept current code or "
+                "give up.",
+            }
+        ok, errors = self.gen._compile_shim(
+            self.c_code, self.ucsan_config, file_path=self.file_path,
+        )
+        if ok:
+            return {"success": True, "errors": ""}
+        return {"success": False, "errors": errors}
+
+    def _tool_replace_function_body(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        func_name = inp["function_name"]
+        new_body = inp["new_body"]
+
+        # Find the function in self.c_code by scanning for its name
+        lines = self.c_code.split("\n")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Match "... func_name(..." at a function definition
+            if func_name not in stripped:
+                continue
+            if not ("(" in stripped and
+                    not stripped.startswith("extern ")
+                    and not stripped.startswith("/*")
+                    and not stripped.startswith("*")):
+                continue
+            # Verify it's a definition (has or is followed by {)
+            if "{" in line:
+                brace_line = i
+            elif i + 1 < len(lines) and lines[i + 1].strip() == "{":
+                brace_line = i + 1
+            else:
+                continue
+            # Find matching }
+            depth = 0
+            for j in range(brace_line, len(lines)):
+                depth += lines[j].count("{") - lines[j].count("}")
+                if depth == 0:
+                    # Replace body: 1-indexed for _apply_fix
+                    self.c_code = self.gen._apply_fix(
+                        self.c_code, brace_line + 1, j + 1, new_body,
+                    )
+                    return {"ok": True, "function": func_name}
+            return {"error": f"Unbalanced braces in '{func_name}'"}
+        return {"error": f"Function '{func_name}' not found in shim code"}
+
+    def _tool_replace_full_code(self, inp: dict[str, Any]) -> dict[str, Any]:
+        self.c_code = inp["code"]
+        return {"ok": True}
+
+    def _tool_submit_harness(self, _inp: dict[str, Any]) -> dict[str, Any]:
+        self.submitted = True
+        return {"accepted": True}
+
+
 class HarnessGenerator:
     """Generates test harnesses for contract-guided symbolic execution.
 
@@ -283,6 +488,7 @@ class HarnessGenerator:
         max_fix_attempts: int = 3,
         symsan_dir: str | None = None,
         compile_commands: CompileCommandsDB | None = None,
+        project_path: str | None = None,
     ):
         self.db = db
         self.llm = llm
@@ -291,6 +497,7 @@ class HarnessGenerator:
         self.ko_clang_path = ko_clang_path
         self.max_fix_attempts = max_fix_attempts
         self.compile_commands = compile_commands
+        self.project_path: Path | None = Path(project_path) if project_path else None
         # symsan install dir (parent of bin/ko-clang)
         self.symsan_dir: Path | None
         if symsan_dir:
@@ -543,73 +750,101 @@ class HarnessGenerator:
                     scope_functions=scope_fns,
                 )
 
-                for attempt in range(self.max_fix_attempts):
-                    ok, errors = self._compile_shim(
-                        c_code, ucsan_config, file_path=func.file_path,
-                    )
-                    if ok:
-                        if self.verbose:
-                            print("    Shim compiled successfully"
-                                  + (f" (after {attempt} fix(es))" if attempt else ""))
-                        break
-
-                    self._stats["fix_attempts"] += 1
+                # First compile attempt
+                compile_ok = False
+                ok, errors = self._compile_shim(
+                    c_code, ucsan_config, file_path=func.file_path,
+                )
+                if ok:
+                    compile_ok = True
                     if self.verbose:
-                        print(f"    Compile failed (attempt {attempt + 1}/"
-                              f"{self.max_fix_attempts}), asking LLM to fix...")
+                        print("    Shim compiled successfully")
+                elif self._can_use_fix_agent():
+                    # Agent-based fix loop (with git tools)
+                    if self.verbose:
+                        print("    Compile failed, starting fix agent...")
+                    fixed = self._fix_with_agent(
+                        c_code, ucsan_config, func.file_path, errors,
+                    )
+                    if fixed:
+                        c_code = fixed
+                        compile_ok = True
+                        if self.verbose:
+                            print("    Shim compiled successfully (fix agent)")
+                    elif self.verbose:
+                        print("    Fix agent failed")
+                else:
+                    # Fallback: linear fix loop
+                    for attempt in range(self.max_fix_attempts):
+                        if attempt > 0:
+                            ok, errors = self._compile_shim(
+                                c_code, ucsan_config,
+                                file_path=func.file_path,
+                            )
+                            if ok:
+                                compile_ok = True
+                                if self.verbose:
+                                    print("    Shim compiled successfully"
+                                          f" (after {attempt} fix(es))")
+                                break
 
-                    # Find which function failed and ask for a patch
-                    fail = self._find_failing_function(c_code, errors)
-                    if fail:
-                        sig, body, bstart, bend = fail
-                        fix_prompt = FIX_PROMPT.format(
-                            func_signature=sig,
-                            func_body=body,
-                            errors=errors,
-                        )
-                    else:
-                        # Can't locate failing function — send full
-                        # code in a fallback prompt
-                        fix_prompt = (
-                            "The following C shim failed to compile. "
-                            "Fix the errors.\n\n```c\n"
-                            + c_code + "\n```\n\n"
-                            "Compiler errors:\n```\n"
-                            + errors + "\n```\n\n"
-                            "Output a single ```c fenced block with "
-                            "the complete fixed C code.\n"
-                        )
+                        self._stats["fix_attempts"] += 1
+                        if self.verbose:
+                            print(f"    Compile failed (attempt {attempt + 1}/"
+                                  f"{self.max_fix_attempts}), asking LLM to fix...")
 
-                    # Prepend original prompt for KV cache reuse
-                    fix_full = prompt + "\n\n---\n\n" + fix_prompt
-                    fix_response = self.llm.complete(fix_full)
-                    self._stats["llm_calls"] += 1
-
-                    if self.log_file:
-                        self._log_interaction(
-                            f"{func_name}_fix{attempt + 1}",
-                            f"[COMPILE ERRORS]\n{errors}", fix_response,
-                        )
-
-                    # Apply fix: patch or full replacement
-                    if fail:
-                        fix_body = self._extract_fix_block(fix_response)
-                        if fix_body:
-                            c_code = self._apply_fix(
-                                c_code, bstart, bend, fix_body,
+                        fail = self._find_failing_function(c_code, errors)
+                        if fail:
+                            sig, body, bstart, bend = fail
+                            fix_prompt = FIX_PROMPT.format(
+                                func_signature=sig,
+                                func_body=body,
+                                errors=errors,
                             )
                         else:
-                            # LLM may have returned ```c block instead
+                            fix_prompt = (
+                                "The following C shim failed to compile. "
+                                "Fix the errors.\n\n```c\n"
+                                + c_code + "\n```\n\n"
+                                "Compiler errors:\n```\n"
+                                + errors + "\n```\n\n"
+                                "Output a single ```c fenced block with "
+                                "the complete fixed C code.\n"
+                            )
+
+                        fix_full = prompt + "\n\n---\n\n" + fix_prompt
+                        fix_response = self.llm.complete(fix_full)
+                        self._stats["llm_calls"] += 1
+
+                        if self.log_file:
+                            self._log_interaction(
+                                f"{func_name}_fix{attempt + 1}",
+                                f"[COMPILE ERRORS]\n{errors}",
+                                fix_response,
+                            )
+
+                        if fail:
+                            fix_body = self._extract_fix_block(fix_response)
+                            if fix_body:
+                                c_code = self._apply_fix(
+                                    c_code, bstart, bend, fix_body,
+                                )
+                            else:
+                                fixed = self._extract_c_block(fix_response)
+                                if fixed:
+                                    c_code = fixed
+                        else:
                             fixed = self._extract_c_block(fix_response)
                             if fixed:
                                 c_code = fixed
                     else:
-                        fixed = self._extract_c_block(fix_response)
-                        if fixed:
-                            c_code = fixed
-                else:
-                    if self.verbose:
-                        print(f"    Failed to fix after {self.max_fix_attempts} attempts")
+                        if self.verbose:
+                            print(f"    Failed to fix after "
+                                  f"{self.max_fix_attempts} attempts")
+
+                if not compile_ok:
+                    self._stats["errors"] += 1
+                    return None
 
             # Generate scheduling policy (separate LLM call)
             schedule_response = self.llm.complete(SCHEDULE_PROMPT.format(
@@ -1456,6 +1691,134 @@ echo "Built: $OUT"
                 return False, (r.stderr + r.stdout).strip()
 
             return True, ""
+
+    def _can_use_fix_agent(self) -> bool:
+        """Check if the agent-based fix loop can be used.
+
+        Requires tool-use support from the LLM backend (complete_with_tools
+        must be overridden from the base class).
+        """
+        from .llm.base import LLMBackend
+        return type(self.llm).complete_with_tools is not LLMBackend.complete_with_tools
+
+    def _fix_with_agent(
+        self,
+        c_code: str,
+        ucsan_config: str,
+        file_path: str | None,
+        initial_errors: str,
+    ) -> str | None:
+        """Use a ReAct agent loop to fix compilation errors.
+
+        The agent can inspect project source via git tools, patch functions,
+        recompile, and iterate until the shim compiles or turns are exhausted.
+
+        Returns the fixed C code, or None if it could not be fixed.
+        """
+        git = GitTools(self.project_path) if self.project_path else None
+        executor = HarnessFixExecutor(
+            c_code, ucsan_config, file_path, self, git,
+        )
+
+        user_prompt = (
+            "The following shim failed to compile. Fix the errors.\n\n"
+            "## Current shim code\n\n```c\n" + c_code + "\n```\n\n"
+            "## Compiler errors\n\n```\n" + initial_errors + "\n```\n\n"
+            "Use the tools to investigate and fix the errors. "
+            "When compilation succeeds, call submit_harness."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Filter out git tools if no project path
+        tools = list(HARNESS_FIX_TOOL_DEFINITIONS)
+        if git is None:
+            tools = [t for t in tools if t["name"] not in _GIT_TOOL_NAMES]
+
+        for turn in range(MAX_FIX_TURNS):
+            response = self.llm.complete_with_tools(
+                messages=messages,
+                tools=tools,
+                system=FIX_SYSTEM_PROMPT,
+            )
+            self._stats["llm_calls"] += 1
+
+            stop = getattr(response, "stop_reason", None)
+            if stop in ("end_turn", "stop"):
+                if self.verbose:
+                    print(f"    [fix-agent] LLM stopped at turn {turn + 1}")
+                break
+
+            if stop != "tool_use":
+                if self.verbose:
+                    print(f"    [fix-agent] Unexpected stop: {stop}")
+                break
+
+            assistant_content: list[dict[str, Any]] = []
+            tool_results: list[dict[str, Any]] = []
+
+            for block in response.content:
+                if hasattr(block, "text") and block.type == "text":
+                    entry: dict[str, Any] = {"type": "text", "text": block.text}
+                    if getattr(block, "thought", False):
+                        entry["thought"] = True
+                    sig = getattr(block, "thought_signature", None)
+                    if sig:
+                        entry["thought_signature"] = sig
+                    assistant_content.append(entry)
+                    if self.verbose and not getattr(block, "thought", False):
+                        print(f"    [fix-agent] {block.text[:200]}")
+
+                elif block.type == "tool_use":
+                    tool_entry: dict[str, Any] = {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    }
+                    sig = getattr(block, "thought_signature", None)
+                    if sig:
+                        tool_entry["thought_signature"] = sig
+                    assistant_content.append(tool_entry)
+
+                    result = executor.execute(block.name, block.input)
+                    self._stats["fix_attempts"] += 1
+
+                    if self.verbose:
+                        err = result.get("error")
+                        if err:
+                            print(f"    [fix-agent] {block.name} -> "
+                                  f"ERROR: {err[:150]}")
+                        elif block.name == "compile_shim":
+                            ok = result.get("success")
+                            print(f"    [fix-agent] compile_shim -> "
+                                  f"{'OK' if ok else 'FAIL'}")
+                        elif block.name == "submit_harness":
+                            print("    [fix-agent] submit_harness -> accepted")
+                        else:
+                            arg = json.dumps(block.input)
+                            if len(arg) > 80:
+                                arg = arg[:80] + "..."
+                            print(f"    [fix-agent] {block.name}({arg})")
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result),
+                    })
+
+            messages.append({"role": "assistant", "content": assistant_content})
+            messages.append({"role": "user", "content": tool_results})
+
+            if executor.submitted:
+                return executor.c_code
+
+        # Agent didn't submit — return None
+        if self.verbose:
+            print(f"    [fix-agent] Failed after {turn + 1} turns "
+                  f"({executor.compile_attempts} compiles)")
+        return None
 
     def _gather_callee_contracts(self, func_id: int) -> dict[str, dict]:
         """Get memsafe contracts for all direct callees of func_id."""
