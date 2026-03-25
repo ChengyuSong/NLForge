@@ -815,6 +815,32 @@ class SummaryDB:
         ).fetchall()
         dirty.update(row["caller_id"] for row in rows)
 
+        # 3. For verification pass: also dirty when a callee's earlier-pass
+        #    summary (allocation, free, init, memsafe) is newer than this
+        #    function's verification summary.  The verify pass reads all
+        #    earlier-pass data from callees, so changes there must trigger
+        #    re-verification of callers.
+        if pass_table == "verification_summaries":
+            upstream_tables = [
+                "allocation_summaries", "free_summaries",
+                "init_summaries", "memsafe_summaries",
+            ]
+            for upstream in upstream_tables:
+                rows = self.conn.execute(
+                    f"""
+                    SELECT DISTINCT ce.caller_id
+                    FROM call_edges ce
+                    JOIN functions f ON f.id = ce.caller_id
+                    JOIN {upstream} callee_s
+                      ON callee_s.function_id = ce.callee_id
+                    JOIN verification_summaries caller_s
+                      ON caller_s.function_id = ce.caller_id
+                    WHERE callee_s.updated_at > caller_s.updated_at
+                      AND f.source IS NOT NULL AND f.source != ''
+                    """,
+                ).fetchall()
+                dirty.update(row["caller_id"] for row in rows)
+
         return dirty
 
     # ========== Free Summary Operations ==========

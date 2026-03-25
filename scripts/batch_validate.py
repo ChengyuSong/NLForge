@@ -34,7 +34,7 @@ from llm_summary.link_units.pipeline import load_link_units, topo_sort_link_unit
 from llm_summary.llm import build_backend_kwargs, create_backend
 from llm_summary.llm.base import LLMBackend
 from llm_summary.models import SafetyIssue
-from llm_summary.reflection import reflect
+from llm_summary.reflection import ReflectionAgent
 from llm_summary.validation_consumer import classify_outcome
 
 
@@ -289,7 +289,10 @@ def run_reflection(
     args: argparse.Namespace,
     project_path: Path | None = None,
 ) -> dict[str, Any] | None:
-    """Run reflection on a single validation outcome.
+    """Run reflection agent on a single validation outcome.
+
+    The agent can investigate callee summaries, mark issues as
+    FP/confirmed, and correct wrong summaries that cause false positives.
 
     Returns the reflection result dict, or None on failure.
     """
@@ -305,16 +308,17 @@ def run_reflection(
 
     db = SummaryDB(str(db_path))
     try:
-        result = reflect(
+        agent = ReflectionAgent(
+            db=db, llm=llm,
+            verbose=args.verbose,
+            project_path=project_path,
+        )
+        result = agent.reflect(
             verdict=verdict,
             outcome=outcome,
-            db=db,
-            llm=llm,
             cfg_dump_path=cfg_path,
             output_dir=str(vdir),
             entry_name=entry_name,
-            project_path=project_path,
-            verbose=args.verbose,
         )
         return dict(result)
     except Exception as e:
@@ -563,37 +567,11 @@ def process_target(
                     )
                     func_result["runs"].append(run_result)
 
-                # Auto-review safe_confirmed / feasible_confirmed
-                outcome_status = {
-                    "safe_confirmed": "false_positive",
-                    "feasible_confirmed": "confirmed",
-                }
                 oc = run_result.get("outcome", {})
                 outcome_type = oc.get("outcome", "")
-                review_status = outcome_status.get(outcome_type)
-                if review_status:
-                    db = SummaryDB(str(db_path))
-                    try:
-                        funcs = db.get_function_by_name(func_name)
-                        if funcs:
-                            assert funcs[0].id is not None
-                            db.upsert_issue_review(
-                                function_id=funcs[0].id,
-                                issue_index=idx,
-                                fingerprint=fp,
-                                status=review_status,
-                                reason=oc.get("summary", ""),
-                            )
-                            if args.verbose:
-                                print(
-                                    f"        reviewed #{idx} "
-                                    f"as {review_status}"
-                                )
-                    finally:
-                        db.close()
 
-                # Reflect on non-trivial outcomes
-                if outcome_type and outcome_type != "safe_confirmed" and not args.skip_reflect:
+                # Reflect on outcomes (agent handles review + summary correction)
+                if not args.skip_reflect and outcome_type:
                     if reflect_llm is None:
                         kwargs = build_backend_kwargs(
                             args.backend, args.llm_host, args.llm_port,

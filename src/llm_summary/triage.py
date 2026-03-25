@@ -22,7 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .agent_tools import (
+    GIT_TOOL_NAMES,
+    READ_TOOL_DEFINITIONS,
+    TRIAGE_ONLY_TOOL_DEFINITIONS,
+    ToolExecutor,
+)
 from .db import SummaryDB
+from .git_tools import GIT_TOOL_DEFINITIONS as _GIT_TOOL_DEFS
 from .git_tools import GitTools
 from .llm.base import LLMBackend
 from .models import (
@@ -93,15 +100,9 @@ _DB_TOOLS = {
     "get_verification_summary",
 }
 
-_GIT_TOOLS = {
-    "git_show",
-    "git_ls_tree",
-    "git_grep",
-}
-
 PHASE_TOOLS: dict[str, set[str]] = {
-    "ANALYZE": _DB_TOOLS | _GIT_TOOLS | {"transition_phase"},
-    "HYPOTHESIZE": _DB_TOOLS | _GIT_TOOLS | {"transition_phase"},
+    "ANALYZE": _DB_TOOLS | GIT_TOOL_NAMES | {"transition_phase"},
+    "HYPOTHESIZE": _DB_TOOLS | GIT_TOOL_NAMES | {"transition_phase"},
     "VERDICT": {
         "submit_verdict",
     },
@@ -109,250 +110,14 @@ PHASE_TOOLS: dict[str, set[str]] = {
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions (Anthropic tool-use schema)
+# Tool definitions — assembled from shared + triage-specific
 # ---------------------------------------------------------------------------
 
 TRIAGE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "name": "read_function_source",
-        "description": (
-            "Read the full source code of a function, similar to a Read/cat "
-            "tool but looked up by function name from the project database. "
-            "Returns macro-annotated source (original lines shown as "
-            "'// (macro)' comments above their expanded form), file path, "
-            "line range, and signature."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "function_name": {
-                    "type": "string",
-                    "description": "Name of the function to read.",
-                },
-            },
-            "required": ["function_name"],
-        },
-    },
-    {
-        "name": "get_callers",
-        "description": (
-            "Search for all functions that call the given function, similar "
-            "to Grep but searching the call graph instead of text. Returns "
-            "caller names with signatures, file paths, and full source code "
-            "so you can see how arguments are passed to the callee."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "function_name": {
-                    "type": "string",
-                    "description": "Name of the callee function to find callers of.",
-                },
-            },
-            "required": ["function_name"],
-        },
-    },
-    {
-        "name": "get_callees",
-        "description": (
-            "Get all functions called by the given function, including "
-            "resolved indirect call targets (function pointers, vtable "
-            "calls). Returns fully-qualified callee function names."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "function_name": {
-                    "type": "string",
-                    "description": "Name of the function whose callees to list.",
-                },
-            },
-            "required": ["function_name"],
-        },
-    },
-    {
-        "name": "get_summaries",
-        "description": (
-            "Get all analysis summaries for any function: memory safety "
-            "pre-conditions, simplified contracts from verification, "
-            "post-conditions (allocations, frees, initializations), and "
-            "verification issues. Works for the target function, its "
-            "callers, or its callees."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "function_name": {
-                    "type": "string",
-                    "description": "Name of the function.",
-                },
-            },
-            "required": ["function_name"],
-        },
-    },
-    {
-        "name": "get_verification_summary",
-        "description": (
-            "Get the full verification summary for a function, including "
-            "all issues found and simplified contracts. Use this to see "
-            "what the verifier reported for any function (callers, callees, "
-            "or the target itself)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "function_name": {
-                    "type": "string",
-                    "description": "Name of the function.",
-                },
-            },
-            "required": ["function_name"],
-        },
-    },
-    {
-        "name": "transition_phase",
-        "description": (
-            "Transition to the next workflow phase. "
-            "ANALYZE->HYPOTHESIZE, HYPOTHESIZE->VERDICT. "
-            "VALIDATE phase is auto-entered after submit_verdict."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "next_phase": {
-                    "type": "string",
-                    "enum": ["HYPOTHESIZE", "VERDICT"],
-                    "description": "The phase to transition to.",
-                },
-            },
-            "required": ["next_phase"],
-        },
-    },
-    {
-        "name": "submit_verdict",
-        "description": (
-            "Submit the final triage verdict. Only callable in VERDICT phase. "
-            "You must provide either a safety proof (with updated_contracts) "
-            "or a feasibility proof (with feasible_path)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "hypothesis": {
-                    "type": "string",
-                    "enum": ["safe", "feasible"],
-                    "description": (
-                        "safe: the issue cannot manifest given caller constraints. "
-                        "feasible: the violation condition is reachable."
-                    ),
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": (
-                        "Detailed natural language proof. For safety proofs, "
-                        "explain which caller constraints prevent the issue. "
-                        "For feasibility proofs, describe the execution path."
-                    ),
-                },
-                "updated_contracts": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "target": {"type": "string"},
-                            "contract_kind": {
-                                "type": "string",
-                                "enum": [
-                                    "not_null", "nullable", "not_freed",
-                                    "initialized", "buffer_size",
-                                ],
-                            },
-                            "description": {"type": "string"},
-                            "size_expr": {"type": "string"},
-                        },
-                        "required": ["target", "contract_kind", "description"],
-                    },
-                    "description": (
-                        "For 'safe' hypothesis: updated/additional contracts "
-                        "that prove the issue away. These will be written back "
-                        "to the DB so the verifier won't flag this again."
-                    ),
-                },
-                "feasible_path": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "For 'feasible' hypothesis: the call chain that can "
-                        "trigger the issue. E.g. ['main', 'process_input', "
-                        "'parse_header', 'target_func (overflow at line 42)']."
-                    ),
-                },
-                "assumptions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Constraints on inputs for this proof. For safety: "
-                        "'width <= MAX_WIDTH because caller validates'. "
-                        "For feasibility: 'width is user-controlled via "
-                        "parse_header()'."
-                    ),
-                },
-                "assertions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "The violation condition to check. E.g. "
-                        "'width * height overflows uint32_t', "
-                        "'buf[offset] is out-of-bounds when offset >= len'."
-                    ),
-                },
-                "relevant_functions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Functions relevant to this proof. Include the target "
-                        "function, callers that constrain its inputs, and "
-                        "callees whose behavior matters. These will be kept "
-                        "as real code in symbolic validation; everything else "
-                        "gets stubbed."
-                    ),
-                },
-                "validation_plan": {
-                    "type": "array",
-                    "description": (
-                        "How to test the relevant_functions. Each element is "
-                        "a test case with an 'entries' list (function names). "
-                        "If entries has one function, test it alone. If "
-                        "entries has multiple functions, call them sequentially "
-                        "in test() (e.g. first call sets up state, second "
-                        "call is the function under test). Example for a "
-                        "safety proof that depends on an invariant: "
-                        "[{\"entries\": [\"setup_fn\", \"target_fn\"]}]. "
-                        "Example for independent entries: "
-                        "[{\"entries\": [\"entry_a\"]}, "
-                        "{\"entries\": [\"entry_b\"]}]."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "entries": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["entries"],
-                    },
-                },
-            },
-            "required": ["hypothesis", "reasoning", "relevant_functions"],
-        },
-    },
+    *READ_TOOL_DEFINITIONS,
+    *TRIAGE_ONLY_TOOL_DEFINITIONS,
+    *_GIT_TOOL_DEFS,
 ]
-
-# Append shared git-based file tools
-from .git_tools import GIT_TOOL_DEFINITIONS as _GIT_TOOL_DEFS  # noqa: E402
-
-TRIAGE_TOOL_DEFINITIONS.extend(_GIT_TOOL_DEFS)
 
 
 # ---------------------------------------------------------------------------
@@ -449,33 +214,21 @@ deprecated APIs. Treat deprecated functions as reachable entry points.
 # ---------------------------------------------------------------------------
 
 
-def _resolve_function(db: SummaryDB, name: str) -> Function | None:
-    """Find a function by name, returning the first match or None."""
-    funcs = db.get_function_by_name(name)
-    return funcs[0] if funcs else None
-
-
 class TriageToolExecutor:
-    """Executes triage tools against the function database."""
+    """Phase-gated wrapper around the shared ToolExecutor for triage."""
 
     def __init__(
         self, db: SummaryDB, verbose: bool = False,
         git_tools: GitTools | None = None,
     ) -> None:
-        self.db = db
-        self.verbose = verbose
-        self.git_tools = git_tools
+        self._executor = ToolExecutor(
+            db, verbose=verbose, git_tools=git_tools,
+        )
         self._current_phase = "ANALYZE"
-        self._func_cache: dict[str, Function | None] = {}
 
     @property
     def phase(self) -> str:
         return self._current_phase
-
-    def _get_func(self, name: str) -> Function | None:
-        if name not in self._func_cache:
-            self._func_cache[name] = _resolve_function(self.db, name)
-        return self._func_cache[name]
 
     def execute(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         """Execute a tool call, enforcing phase gating."""
@@ -488,232 +241,26 @@ class TriageToolExecutor:
                     f"Use transition_phase to advance."
                 ),
             }
-        # Git tools are dispatched via GitTools instance
-        if tool_name in _GIT_TOOLS:
-            if self.git_tools is None:
-                return {"error": f"Tool '{tool_name}' unavailable: no project path"}
-            return self.git_tools.dispatch(tool_name, tool_input)
 
-        handler = getattr(self, f"_tool_{tool_name}", None)
-        if handler is None:
-            return {"error": f"Unknown tool: {tool_name}"}
-        result: dict[str, Any] = handler(tool_input)
-        return result
+        # Intercept transition_phase to manage local phase state
+        if tool_name == "transition_phase":
+            return self._transition_phase(tool_input)
 
-    # -- read_function_source --
+        return self._executor.execute(tool_name, tool_input)
 
-    def _tool_read_function_source(self, inp: dict[str, Any]) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        return {
-            "function": func.name,
-            "signature": func.signature or "",
-            "file_path": func.file_path,
-            "line_start": func.line_start,
-            "line_end": func.line_end,
-            "source": func.llm_source[:20000],
-        }
-
-    # -- get_callers --
-
-    def _tool_get_callers(self, inp: dict[str, Any]) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        if func.id is None:
-            return {"error": f"Function '{name}' has no ID."}
-
-        caller_ids = self.db.get_callers(func.id)
-        callers = []
-        for cid in caller_ids:
-            caller = self.db.get_function(cid)
-            if caller is None:
-                continue
-            info: dict[str, Any] = {
-                "name": caller.name,
-                "signature": caller.signature or "",
-                "file_path": caller.file_path,
-                "source": caller.llm_source[:8000],
-            }
-            callers.append(info)
-
-        return {
-            "function": name,
-            "caller_count": len(callers),
-            "callers": callers,
-        }
-
-    # -- get_callees --
-
-    def _tool_get_callees(self, inp: dict[str, Any]) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        if func.id is None:
-            return {"error": f"Function '{name}' has no ID."}
-
-        callee_ids = self.db.get_callees(func.id)
-        edges = self.db.get_call_edges_by_caller(func.id)
-        # Build a set of indirect callee IDs for annotation
-        indirect_ids = {e.callee_id for e in edges if e.is_indirect}
-
-        callees = []
-        for cid in callee_ids:
-            callee = self.db.get_function(cid)
-            if callee is None:
-                continue
-            # Fully-qualified: file_path::name(signature)
-            fq = f"{callee.file_path}::{callee.name}"
-            if callee.signature:
-                fq += f" {callee.signature}"
-            if cid in indirect_ids:
-                fq += " [indirect]"
-            callees.append(fq)
-
-        return {
-            "function": name,
-            "callee_count": len(callees),
-            "callees": callees,
-        }
-
-    # -- get_summaries --
-
-    def _tool_get_summaries(self, inp: dict[str, Any]) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        if func.id is None:
-            return {"error": f"Function '{name}' has no ID."}
-
-        result: dict[str, Any] = {
-            "function": func.name,
-            "signature": func.signature,
-        }
-
-        memsafe = self.db.get_memsafe_summary_by_function_id(func.id)
-        if memsafe and memsafe.contracts:
-            result["pre_conditions"] = [
-                {
-                    "target": c.target,
-                    "kind": c.contract_kind,
-                    "description": c.description,
-                    **({"size_expr": c.size_expr} if c.size_expr else {}),
-                }
-                for c in memsafe.contracts
-            ]
-        else:
-            result["pre_conditions"] = []
-
-        vsummary = self.db.get_verification_summary_by_function_id(func.id)
-        if vsummary:
-            if vsummary.simplified_contracts is not None:
-                result["simplified_contracts"] = [
-                    {
-                        "target": c.target,
-                        "kind": c.contract_kind,
-                        "description": c.description,
-                        **({"size_expr": c.size_expr} if c.size_expr else {}),
-                    }
-                    for c in vsummary.simplified_contracts
-                ]
-            result["issues_count"] = len(vsummary.issues)
-
-        alloc = self.db.get_summary_by_function_id(func.id)
-        if alloc and alloc.allocations:
-            result["allocations"] = [
-                {
-                    "source": a.source,
-                    **({"size_expr": a.size_expr} if a.size_expr else {}),
-                    "may_be_null": a.may_be_null,
-                    "returned": a.returned,
-                }
-                for a in alloc.allocations
-            ]
-
-        free_summary = self.db.get_free_summary_by_function_id(func.id)
-        if free_summary and free_summary.frees:
-            result["frees"] = [
-                {
-                    "deallocator": f.deallocator,
-                    "target": f.target,
-                    "conditional": f.conditional,
-                    **({"condition": f.condition} if f.condition else {}),
-                    "nulled_after": f.nulled_after,
-                }
-                for f in free_summary.frees
-            ]
-
-        init_summary = self.db.get_init_summary_by_function_id(func.id)
-        if init_summary and init_summary.inits:
-            result["initializations"] = [
-                {
-                    "initializer": i.initializer,
-                    "target": i.target,
-                    **({"byte_count": i.byte_count} if i.byte_count else {}),
-                }
-                for i in init_summary.inits
-            ]
-
-        return result
-
-    # -- get_verification_summary --
-
-    def _tool_get_verification_summary(self, inp: dict[str, Any]) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        if func.id is None:
-            return {"error": f"Function '{name}' has no ID."}
-
-        vsummary = self.db.get_verification_summary_by_function_id(func.id)
-        if vsummary is None:
-            return {"function": name, "status": "not_verified"}
-
-        return {
-            "function": name,
-            "description": vsummary.description,
-            "simplified_contracts": (
-                [
-                    {
-                        "target": c.target,
-                        "kind": c.contract_kind,
-                        "description": c.description,
-                        **({"size_expr": c.size_expr} if c.size_expr else {}),
-                    }
-                    for c in vsummary.simplified_contracts
-                ]
-                if vsummary.simplified_contracts is not None
-                else None
-            ),
-            "issues": [i.to_dict() for i in vsummary.issues],
-        }
-
-    # -- transition_phase --
-
-    def _tool_transition_phase(self, inp: dict[str, Any]) -> dict[str, Any]:
+    def _transition_phase(self, inp: dict[str, Any]) -> dict[str, Any]:
         next_phase = inp["next_phase"]
-        allowed = ALLOWED_TRANSITIONS.get(self._current_phase, [])
-        if next_phase not in allowed:
+        allowed_next = ALLOWED_TRANSITIONS.get(self._current_phase, [])
+        if next_phase not in allowed_next:
             return {
                 "error": (
                     f"Cannot transition from {self._current_phase} to "
-                    f"{next_phase}. Allowed: {allowed}"
+                    f"{next_phase}. Allowed: {allowed_next}"
                 ),
             }
         prev = self._current_phase
         self._current_phase = next_phase
         return {"previous_phase": prev, "current_phase": next_phase}
-
-    # -- submit_verdict --
-
-    def _tool_submit_verdict(self, inp: dict[str, Any]) -> dict[str, Any]:
-        return {"accepted": True, **inp}
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +316,7 @@ class TriageAgent:
             allowed = PHASE_TOOLS.get(executor.phase, set())
             # Hide git tools when no project_path was given
             if git is None:
-                allowed = allowed - _GIT_TOOLS
+                allowed = allowed - GIT_TOOL_NAMES
             tools = [t for t in TRIAGE_TOOL_DEFINITIONS if t["name"] in allowed]
 
             response = self.llm.complete_with_tools(
