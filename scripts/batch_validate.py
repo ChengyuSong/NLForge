@@ -604,6 +604,16 @@ def process_target(
                                 f"        → {hyp} ({conf}) "
                                 f"action={act}"
                             )
+                        updated = refl.get("summaries_updated", [])
+                        if updated:
+                            result.setdefault(
+                                "summaries_updated", [],
+                            ).extend(updated)
+                            if args.verbose:
+                                print(
+                                    f"        summaries updated: "
+                                    f"{updated}"
+                                )
 
         func_result["validate"]["success"] = any_validate_ok
         result["functions"].append(func_result)
@@ -807,6 +817,7 @@ def main() -> None:
 
     all_results = []
     stopped_early = False
+    all_summaries_updated: list[str] = []
     for i, project_name in enumerate(projects, 1):
         print(f"[{i}/{len(projects)}] {project_name}...", end=" ", flush=True)
         try:
@@ -817,6 +828,24 @@ def main() -> None:
             break
         all_results.append(result)
         print(_format_result(result))
+
+        # Collect updated summaries from all targets
+        for t in result.get("targets", []):
+            all_summaries_updated.extend(
+                t.get("summaries_updated", []),
+            )
+
+        if all_summaries_updated:
+            print(
+                f"\nSummaries updated ({len(all_summaries_updated)}): "
+                f"{', '.join(all_summaries_updated)}"
+            )
+            print(
+                "Run 'llm-summary summarize --type verify --incremental' "
+                "to re-verify affected callers, then re-run validation."
+            )
+            stopped_early = True
+            break
 
     # Aggregate
     total_funcs = sum(
