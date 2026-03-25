@@ -4344,11 +4344,16 @@ def triage(
          "the triage conclusion using ucsan. Entry function and scope are "
          "derived from the verdict's relevant_functions list.",
 )
+@click.option(
+    "--issue-index", "issue_index", default=None, type=int,
+    help="When used with --validate, only process the verdict with this "
+         "issue_index. Skips all other verdicts in the file.",
+)
 def gen_harness(
     db_path, backend, model, llm_host, llm_port,
     disable_thinking, verbose, log_llm, output_dir, function_names,
     ko_clang_path, symsan_dir, compile_commands_path, project_path,
-    build_dir, bc_file, plan, plan_only, validate,
+    build_dir, bc_file, plan, plan_only, validate, issue_index,
 ):
     """Generate test harnesses for contract-guided symbolic execution.
 
@@ -4414,6 +4419,11 @@ def gen_harness(
                 relevant = v.get("relevant_functions", [])
                 func_name = v.get("function_name", "")
                 issue_idx = v.get("issue_index", vi)
+
+                # Filter by --issue-index if provided
+                if issue_index is not None and issue_idx != issue_index:
+                    continue
+
                 if not relevant:
                     relevant = [func_name] if func_name else []
                 if not relevant:

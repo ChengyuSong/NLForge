@@ -16,6 +16,8 @@ Usage:
     python scripts/batch_validate.py --filter zlib --skip-triage  # reuse existing verdicts
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import subprocess
@@ -23,12 +25,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llm_summary.db import SummaryDB
 from llm_summary.link_units.pipeline import load_link_units, topo_sort_link_units
 from llm_summary.llm import build_backend_kwargs, create_backend
+from llm_summary.llm.base import LLMBackend
 from llm_summary.models import SafetyIssue
 from llm_summary.reflection import reflect
 from llm_summary.validation_consumer import classify_outcome
@@ -200,6 +204,7 @@ def run_gen_harness(
     project_path: Path | None,
     verbose: bool,
     timeout: int,
+    issue_index: int | None = None,
 ) -> tuple[bool, str, float]:
     """Run llm-summary gen-harness --validate."""
     cmd = [
@@ -208,6 +213,8 @@ def run_gen_harness(
         "--backend", backend,
         "--validate", str(verdict_path),
     ]
+    if issue_index is not None:
+        cmd += ["--issue-index", str(issue_index)]
     if model:
         cmd += ["--model", model]
     if llm_host != "localhost":
@@ -278,10 +285,10 @@ def run_reflection(
     db_path: Path,
     harness_dir: Path,
     entry_name: str | None,
-    llm: object,
+    llm: LLMBackend,
     args: argparse.Namespace,
     project_path: Path | None = None,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Run reflection on a single validation outcome.
 
     Returns the reflection result dict, or None on failure.
@@ -302,14 +309,14 @@ def run_reflection(
             verdict=verdict,
             outcome=outcome,
             db=db,
-            llm=llm,  # type: ignore[arg-type]
+            llm=llm,
             cfg_dump_path=cfg_path,
             output_dir=str(vdir),
             entry_name=entry_name,
             project_path=project_path,
             verbose=args.verbose,
         )
-        return result
+        return dict(result)
     except Exception as e:
         if args.verbose:
             print(f"        reflection failed: {e}")
@@ -414,65 +421,105 @@ def process_target(
             result["functions"].append(func_result)
             continue
 
-        # Validate
+        # Validate + Run: per-issue loop
         if not verdict_path.exists():
             func_result["validate"]["error"] = "no verdict file"
             result["functions"].append(func_result)
             continue
 
-        # Check for existing .ucsan binaries
-        has_binaries = False
-        if not args.force:
-            func_dir = harness_dir / func_name
-            if func_dir.exists():
-                has_binaries = any(func_dir.rglob("*.ucsan"))
-
-        if has_binaries:
-            func_result["validate"]["success"] = True
-            func_result["validate"]["skipped"] = True
-            if args.verbose:
-                print(f"      {func_name}: reusing harnesses")
-        else:
-            if args.verbose:
-                print(f"      {func_name}: generating harnesses...")
-            ok, err, dur = run_gen_harness(
-                db_path=db_path,
-                verdict_path=verdict_path,
-                backend=args.backend,
-                model=args.model,
-                llm_host=args.llm_host,
-                llm_port=args.llm_port,
-                ko_clang_path=args.ko_clang_path,
-                compile_commands=compile_commands,
-                project_path=project_path,
-                verbose=args.verbose,
-                timeout=args.gen_timeout,
-            )
-            func_result["validate"]["success"] = ok
-            func_result["validate"]["error"] = err if not ok else None
-            func_result["validate"]["timing_seconds"] = round(dur, 2)
-
-        if not func_result["validate"]["success"]:
-            result["functions"].append(func_result)
-            if args.stop_on_error:
-                err = func_result["validate"].get("error", "unknown")
-                raise PipelineError(
-                    f"validation failed for {func_name}: {err}",
-                )
-            continue
-
-        if args.skip_run:
-            result["functions"].append(func_result)
-            continue
-
-        # Run thoroupy
         with open(verdict_path) as f:
             vdata = json.load(f)
         vlist = vdata if isinstance(vdata, list) else [vdata]
 
+        # Build fingerprint->review lookup for this function
+        reviewed_fps: dict[str, str] = {}
+        if not args.force:
+            db = SummaryDB(str(db_path))
+            try:
+                funcs = db.get_function_by_name(func_name)
+                if funcs:
+                    assert funcs[0].id is not None
+                    for r in db.get_issue_reviews(funcs[0].id):
+                        if r["status"] != "pending":
+                            reviewed_fps[r["issue_fingerprint"]] = r["status"]
+            finally:
+                db.close()
+
+        any_validate_ok = False
         for vi, v in enumerate(vlist):
             idx = v.get("issue_index", vi)
             vdir = harness_dir / func_name / f"v{idx}"
+
+            # Skip already-reviewed issues
+            issue_d = v.get("issue", {})
+            vi_obj = SafetyIssue(
+                location=issue_d.get("location", ""),
+                issue_kind=issue_d.get("issue_kind", ""),
+                description=issue_d.get("description", ""),
+                severity=issue_d.get("severity", "medium"),
+                callee=issue_d.get("callee"),
+                contract_kind=issue_d.get("contract_kind"),
+            )
+            fp = vi_obj.fingerprint()
+            if fp in reviewed_fps:
+                if args.verbose:
+                    print(
+                        f"      {func_name}#{idx}: "
+                        f"already {reviewed_fps[fp]}, skipping"
+                    )
+                continue
+
+            # --- Per-issue harness generation ---
+            has_binary = (
+                not args.force
+                and vdir.exists()
+                and any(vdir.glob("*.ucsan"))
+            )
+            if has_binary:
+                if args.verbose:
+                    print(f"      {func_name}#{idx}: reusing harnesses")
+            elif args.skip_validate:
+                continue
+            else:
+                if args.verbose:
+                    print(
+                        f"      {func_name}#{idx}: generating harness..."
+                    )
+                ok, err, dur = run_gen_harness(
+                    db_path=db_path,
+                    verdict_path=verdict_path,
+                    backend=args.backend,
+                    model=args.model,
+                    llm_host=args.llm_host,
+                    llm_port=args.llm_port,
+                    ko_clang_path=args.ko_clang_path,
+                    compile_commands=compile_commands,
+                    project_path=project_path,
+                    verbose=args.verbose,
+                    timeout=args.gen_timeout,
+                    issue_index=idx,
+                )
+                if not ok:
+                    if args.verbose:
+                        print(
+                            f"      {func_name}#{idx}: "
+                            f"gen-harness failed: {err}"
+                        )
+                    if args.stop_on_error:
+                        raise PipelineError(
+                            f"gen-harness failed for "
+                            f"{func_name}#{idx}: {err}",
+                        )
+                    continue
+                has_binary = vdir.exists() and any(vdir.glob("*.ucsan"))
+
+            if has_binary:
+                any_validate_ok = True
+
+            # --- Per-issue run ---
+            if args.skip_run or not has_binary:
+                continue
+
             if not vdir.exists():
                 continue
             for binary in sorted(vdir.glob("*.ucsan")):
@@ -525,15 +572,6 @@ def process_target(
                 outcome_type = oc.get("outcome", "")
                 review_status = outcome_status.get(outcome_type)
                 if review_status:
-                    issue_d = v.get("issue", {})
-                    vi_obj = SafetyIssue(
-                        location=issue_d.get("location", ""),
-                        issue_kind=issue_d.get("issue_kind", ""),
-                        description=issue_d.get("description", ""),
-                        severity=issue_d.get("severity", "medium"),
-                        callee=issue_d.get("callee"),
-                        contract_kind=issue_d.get("contract_kind"),
-                    )
                     db = SummaryDB(str(db_path))
                     try:
                         funcs = db.get_function_by_name(func_name)
@@ -542,13 +580,14 @@ def process_target(
                             db.upsert_issue_review(
                                 function_id=funcs[0].id,
                                 issue_index=idx,
-                                fingerprint=vi_obj.fingerprint(),
+                                fingerprint=fp,
                                 status=review_status,
                                 reason=oc.get("summary", ""),
                             )
                             if args.verbose:
                                 print(
-                                    f"        reviewed #{idx} as {review_status}"
+                                    f"        reviewed #{idx} "
+                                    f"as {review_status}"
                                 )
                     finally:
                         db.close()
@@ -588,6 +627,7 @@ def process_target(
                                 f"action={act}"
                             )
 
+        func_result["validate"]["success"] = any_validate_ok
         result["functions"].append(func_result)
 
     result["timing_seconds"] = round(time.monotonic() - start, 2)
