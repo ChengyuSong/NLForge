@@ -37,6 +37,82 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FUNC_SCANS_DIR = REPO_ROOT / "func-scans" / "cgc"
 C_EXTENSIONS = {".c", ".cpp", ".cc", ".cxx", ".c++"}
 
+_PATCHED_START_RE = re.compile(r"#\s*(ifdef|ifndef)\s+PATCHED(?:_\d+)?\s*$")
+_PATCHED_END_RE = re.compile(r"#\s*endif\b")
+_PATCHED_NESTED_RE = re.compile(r"#\s*(ifdef|ifndef|if)\b")
+
+
+def strip_patched_ifdefs(source: str) -> str:
+    """Remove entire #ifdef/#ifndef PATCHED blocks (both branches) from source.
+
+    The preprocessed pp_source already has the correct resolved code path.
+    Stripping the raw #ifdef blocks prevents the macro-diff annotation from
+    leaking the other branch as ``// (macro)`` comments to the LLM.
+    """
+    lines = source.splitlines()
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        m = _PATCHED_START_RE.match(s)
+        if not m:
+            result.append(lines[i])
+            i += 1
+            continue
+
+        # Skip the entire #ifdef/#ifndef PATCHED ... #endif block
+        depth = 1
+        end_idx = None
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            sj = lines[j].strip()
+            if _PATCHED_NESTED_RE.match(sj):
+                depth += 1
+            elif _PATCHED_END_RE.match(sj):
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+            j += 1
+
+        if end_idx is None:
+            # Malformed — keep as-is
+            result.append(lines[i])
+            i += 1
+            continue
+
+        i = end_idx + 1
+
+    return "\n".join(result)
+
+
+def strip_patched_ifdefs_in_db(db_path: Path, verbose: bool = False) -> int:
+    """Strip #ifdef PATCHED blocks from all function sources in a DB.
+
+    Returns the number of functions updated.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    updated = 0
+    rows = conn.execute("SELECT id, name, source FROM functions").fetchall()
+    for row in rows:
+        old = row["source"]
+        if not old or "PATCHED" not in old:
+            continue
+        new = strip_patched_ifdefs(old)
+        if new != old:
+            conn.execute(
+                "UPDATE functions SET source = ? WHERE id = ?",
+                (new, row["id"]),
+            )
+            updated += 1
+            if verbose:
+                print(f"    {row['name']}: stripped #ifdef PATCHED from source")
+    conn.commit()
+    conn.close()
+    return updated
+
 
 def _infer_project_root(source_files: list[str]) -> Path | None:
     """Infer project root as common parent of all source files."""
@@ -190,6 +266,15 @@ def scan_challenge(
 
             db.insert_functions_batch(all_functions)
             db.insert_typedefs_batch(all_typedefs)
+            db.close()
+
+            # Strip #ifdef PATCHED blocks from raw source so the LLM
+            # only sees the code path resolved by the preprocessor.
+            n_stripped = strip_patched_ifdefs_in_db(db_path, verbose=verbose)
+            if verbose and n_stripped:
+                print(f"      stripped PATCHED ifdefs from {n_stripped} functions")
+
+            db = SummaryDB(str(db_path))
 
             # Address-taken scan + callsite finding
             scanner = AddressTakenScanner(db, compile_commands=cc)
@@ -323,6 +408,14 @@ def patch_rescan(
 
         # Re-insert (ON CONFLICT updates source, pp_source, source_hash)
         db.insert_functions_batch(all_functions)
+        db.close()
+
+        # Strip #ifdef PATCHED blocks from raw source
+        n_stripped = strip_patched_ifdefs_in_db(patched_db, verbose=verbose)
+        if verbose and n_stripped:
+            print(f"    stripped PATCHED ifdefs from {n_stripped} functions")
+
+        db = SummaryDB(str(patched_db))
 
         # Step 4: Compare hashes, delete summaries for changed functions
         summary_tables = [
