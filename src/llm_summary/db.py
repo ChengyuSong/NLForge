@@ -28,6 +28,7 @@ from .models import (
     InitSummary,
     MemsafeContract,
     MemsafeSummary,
+    OutputRange,
     ParameterInfo,
     SafetyIssue,
     VerificationSummary,
@@ -976,9 +977,18 @@ class SummaryDB:
                 initializer=i.get("initializer", "assignment"),
                 byte_count=bc,
             ))
+        output_ranges = [
+            OutputRange(
+                target=o.get("target", "return"),
+                range=o.get("range", ""),
+                description=o.get("description", ""),
+            )
+            for o in data.get("output_ranges", [])
+        ]
         return InitSummary(
             function_name=data.get("function", ""),
             inits=inits,
+            output_ranges=output_ranges,
             description=data.get("description", ""),
         )
 

@@ -1,64 +1,9 @@
 """Data models for the LLM summary system."""
 
 import difflib
-import re as _re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-
-_PATCHED_START_RE = _re.compile(r"#\s*(ifdef|ifndef)\s+PATCHED(?:_\d+)?\s*$")
-_PATCHED_END_RE = _re.compile(r"#\s*endif\b")
-_PATCHED_NESTED_RE = _re.compile(r"#\s*(ifdef|ifndef|if)\b")
-
-
-def _strip_patched_blocks(lines: list[str]) -> list[str]:
-    """Remove #ifdef/#ifndef PATCHED blocks, keeping the unpatched code path.
-
-    Only operates on per-function source (small), not whole files.
-    """
-    result = []
-    i = 0
-    while i < len(lines):
-        s = lines[i].strip()
-        m = _PATCHED_START_RE.match(s)
-        if not m:
-            result.append(lines[i])
-            i += 1
-            continue
-
-        directive = m.group(1)  # "ifdef" or "ifndef"
-        start = i
-        else_idx = None
-        end_idx = None
-        depth = 1
-        j = i + 1
-        while j < len(lines) and depth > 0:
-            sj = lines[j].strip()
-            if _PATCHED_NESTED_RE.match(sj):
-                depth += 1
-            elif _re.match(r"#\s*else\b", sj) and depth == 1:
-                else_idx = j
-            elif _PATCHED_END_RE.match(sj):
-                depth -= 1
-                if depth == 0:
-                    end_idx = j
-            j += 1
-
-        if end_idx is None:
-            result.append(lines[i])
-            i += 1
-            continue
-
-        # ifdef PATCHED: body=patched, else=vulnerable → keep else
-        # ifndef PATCHED: body=vulnerable, else=patched → keep body
-        if directive == "ifdef":
-            if else_idx is not None:
-                result.extend(lines[else_idx + 1 : end_idx])
-        else:
-            result.extend(lines[start + 1 : else_idx or end_idx])
-        i = end_idx + 1
-
-    return result
 
 
 def _annotate_macro_diff(source: str, pp_source: str) -> str:
@@ -69,9 +14,7 @@ def _annotate_macro_diff(source: str, pp_source: str) -> str:
     immediately above the expanded line so the LLM can see both the semantic
     macro name and the expanded value.
     """
-    # Strip PATCHED blocks from source before diffing so the LLM never
-    # sees hints about which code path is patched vs vulnerable.
-    src_lines = _strip_patched_blocks(source.splitlines())
+    src_lines = source.splitlines()
     pp_lines = pp_source.splitlines()
     result: list[str] = []
 
@@ -376,19 +319,39 @@ class InitOp:
 
 
 @dataclass
+class OutputRange:
+    """Value range for a function output (return value or out-parameter)."""
+
+    target: str  # "return", "*out_len", "*result"
+    range: str  # "[0, MAX_PIXELS*10]", ">= 0", "[-32768, 32767]"
+    description: str  # brief context
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "range": self.range,
+            "description": self.description,
+        }
+
+
+@dataclass
 class InitSummary:
     """Complete initialization summary for a function."""
 
     function_name: str
     inits: list[InitOp] = field(default_factory=list)
+    output_ranges: list[OutputRange] = field(default_factory=list)
     description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "function": self.function_name,
             "inits": [i.to_dict() for i in self.inits],
             "description": self.description,
         }
+        if self.output_ranges:
+            result["output_ranges"] = [o.to_dict() for o in self.output_ranges]
+        return result
 
 
 @dataclass

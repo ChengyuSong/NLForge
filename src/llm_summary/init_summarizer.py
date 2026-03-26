@@ -11,6 +11,7 @@ from .models import (
     FunctionBlock,
     InitOp,
     InitSummary,
+    OutputRange,
     build_skeleton,
 )
 
@@ -57,7 +58,30 @@ Consider:
 - Calls to memset, memcpy, calloc, etc. (use callee summaries)
 - Prefer unconditional inits; use conditional+condition for output params \
 initialized only on success paths
-- If a field is only initialized on some paths, mark it conditional rather than omitting it\
+- If a field is only initialized on some paths, mark it conditional rather than omitting it
+
+## Output Value Ranges
+
+Additionally, report **value ranges** for outputs that callers may cast, truncate, \
+or use as sizes/indices. Focus on outputs where the actual range is narrower than \
+the declared type — this helps callers know whether a cast is safe.
+
+Only report ranges when:
+- The range is **derivable from the code** (constants, loop bounds, array sizes)
+- The range is **narrower** than the full type range (don't report "int32_t returns \
+[-2^31, 2^31-1]" — that's just the type)
+- The output is a **return value** or **out-parameter** (caller-visible)
+
+Use standard interval notation: `[` `]` for inclusive (closed), `(` `)` for exclusive \
+(open). Pay attention to the actual range — e.g., `for (i = 0; i < N; i++)` produces \
+`[0, N)`, not `[0, N]`.
+
+Examples of useful ranges:
+- A loop counter bounded by `i < MAX_ITEMS`: `[0, MAX_ITEMS)`
+- A function that returns a percentage: `[0, 100]`
+- A function that returns a status code from a small enum: `{{0, -1}}`
+
+Skip ranges that are just the full type range or truly unbounded.\
 """
 
 
@@ -81,6 +105,13 @@ Respond in JSON format:
       "conditional": true,
       "condition": "condition expression (omit if unconditional)"
     {cb}
+  ],
+  "output_ranges": [
+    {ob}
+      "target": "return or *out_param",
+      "range": "[lower, upper] or >= 0",
+      "description": "brief context"
+    {cb}
   ]
 {cb}
 ```
@@ -92,7 +123,8 @@ If the function does not unconditionally initialize any caller-visible state, re
   "description": "Does not unconditionally initialize caller-visible state",
   "inits": []
 {cb}
-```"""
+```
+Omit output_ranges if no outputs have a range narrower than their declared type."""
 
 
 # --- Single-message prompt (no caching) ---
@@ -206,12 +238,23 @@ _INIT_ITEM = {
     "required": ["target", "target_kind", "initializer"],
 }
 
+_OUTPUT_RANGE_ITEM = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string"},
+        "range": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "required": ["target", "range", "description"],
+}
+
 INIT_RESPONSE_FORMAT = make_json_response_format({
     "type": "object",
     "properties": {
         "function": {"type": "string"},
         "description": {"type": "string"},
         "inits": {"type": "array", "items": _INIT_ITEM},
+        "output_ranges": {"type": "array", "items": _OUTPUT_RANGE_ITEM},
     },
     "required": ["function", "description", "inits"],
 })
@@ -578,8 +621,20 @@ class InitSummarizer:
                 )
             )
 
+        # Parse output ranges
+        output_ranges = []
+        for o in data.get("output_ranges", []):
+            output_ranges.append(
+                OutputRange(
+                    target=o.get("target", "return"),
+                    range=o.get("range", ""),
+                    description=o.get("description", ""),
+                )
+            )
+
         return InitSummary(
             function_name=data.get("function", func_name),
             inits=inits,
+            output_ranges=output_ranges,
             description=data.get("description", ""),
         )

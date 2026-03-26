@@ -13,6 +13,7 @@ from .models import (
     FunctionBlock,
     InitOp,
     MemsafeContract,
+    OutputRange,
     SafetyIssue,
     VerificationSummary,
     build_skeleton,
@@ -528,16 +529,15 @@ class VerificationSummarizer:
         """
         import re
 
-        # Find referenced type names: struct X, union X, typedef names in casts/params
-        names: set[str] = set()
-        for m in re.finditer(r'\b(?:struct|union|enum)\s+(\w+)', source):
-            names.add(m.group(1))
-
-        rows = self.db.get_typedefs_by_names(list(names)) if names else []
+        # Find all identifiers in source, look up any that match a typedef.
+        # This catches struct/union/enum tags AND plain typedefs (cgc_size_t,
+        # pmeta, uint16_t, etc.).
+        all_identifiers = set(re.findall(r'\b([A-Za-z_]\w*)\b', source))
+        rows = self.db.get_typedefs_by_names(list(all_identifiers)) if all_identifiers else []
+        names = {r["name"] for r in rows}
 
         # Also include file-scope static variables from the same source file that
         # are actually referenced by name in the function source.
-        all_identifiers = set(re.findall(r'\b([A-Za-z_]\w*)\b', source))
         static_rows = [
             r for r in (self.db.get_static_vars_by_file(file_path) if file_path else [])
             if r["name"] in all_identifiers
@@ -644,7 +644,10 @@ class VerificationSummarizer:
         callee_attrs = self._get_callee_attributes(list(all_callee_names))
 
         # Collect per-callee post-condition data from DB
-        _post_data = dict[str, list[Allocation] | list[FreeOp] | list[InitOp]]
+        _post_list = (
+            list[Allocation] | list[FreeOp] | list[InitOp] | list[OutputRange]
+        )
+        _post_data = dict[str, _post_list]
         callee_post: dict[str, _post_data] = {}
         if func.id is not None:
             callee_ids = self.db.get_callees(func.id)
@@ -662,6 +665,8 @@ class VerificationSummarizer:
                 init_summary = self.db.get_init_summary_by_function_id(callee_id)
                 if init_summary and init_summary.inits:
                     post["inits"] = init_summary.inits
+                if init_summary and init_summary.output_ranges:
+                    post["output_ranges"] = init_summary.output_ranges
                 if post:
                     callee_post[callee_func.name] = post
 
@@ -794,6 +799,17 @@ class VerificationSummarizer:
                             f"{indent} *   init:"
                             f" {iop.initializer}({target}){byte_info}"
                         )
+                    out_ranges: list[OutputRange] = post.get(  # type: ignore[assignment]
+                        "output_ranges", [],
+                    )
+                    for orange in out_ranges:
+                        target = _substitute(
+                            orange.target, formal_params, actual_args,
+                        )
+                        post_lines.append(
+                            f"{indent} *   range:"
+                            f" {target} = {orange.range}"
+                        )
                     post_lines.append(f"{indent} */")
 
             result.append(line)
@@ -905,7 +921,7 @@ class VerificationSummarizer:
                         f"  Releases: {'; '.join(releases)}"
                     )
 
-            # Pass 3: Initializations
+            # Pass 3: Initializations + output ranges
             init_summary = self.db.get_init_summary_by_function_id(callee_id)
             if init_summary and init_summary.inits:
                 init_descs = []
@@ -915,6 +931,12 @@ class VerificationSummarizer:
                         desc += f" [{i.byte_count} bytes]"
                     init_descs.append(desc)
                 post_parts.append(f"  Initializations: {'; '.join(init_descs)}")
+            if init_summary and init_summary.output_ranges:
+                for o in init_summary.output_ranges:
+                    post_parts.append(
+                        f"  Output range: {o.target} = {o.range}"
+                        f" -- {o.description}"
+                    )
 
             if post_parts:
                 section_lines.append("**Post-conditions:**")

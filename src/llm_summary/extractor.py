@@ -28,6 +28,92 @@ _SYSTEM_HEADER_PREFIXES = (
 )
 
 
+_SIZEOF_RE = re.compile(r"sizeof\s*\(\s*([A-Za-z_]\w*)\s*\)")
+
+
+def _collect_type_sizes(cursor: Cursor) -> dict[str, int]:
+    """Walk a TU cursor and collect {type_name: size_in_bytes} for all named types."""
+    sizes: dict[str, int] = {}
+    for child in cursor.get_children():
+        if child.kind in (CursorKind.TYPEDEF_DECL, CursorKind.TYPE_ALIAS_DECL):
+            t = child.underlying_typedef_type
+            sz = t.get_size()
+            if sz > 0:
+                sizes[child.spelling] = sz
+        elif child.kind == CursorKind.STRUCT_DECL and child.spelling:
+            t = child.type
+            sz = t.get_size()
+            if sz > 0:
+                sizes[child.spelling] = sz
+                sizes[f"struct {child.spelling}"] = sz
+    return sizes
+
+
+def _annotate_sizeof(source: str, type_sizes: dict[str, int]) -> str:
+    """Annotate sizeof(TypeName) with resolved value as inline comment.
+
+    ``sizeof(t3DCPixel)`` → ``sizeof(t3DCPixel) /* = 10 */``
+    """
+    def _replace(m: re.Match[str]) -> str:
+        type_name = m.group(1)
+        sz = type_sizes.get(type_name)
+        if sz is None:
+            return m.group(0)
+        return f"{m.group(0)} /* = {sz} */"
+
+    return _SIZEOF_RE.sub(_replace, source)
+
+
+def _get_struct_field_layout(cursor: Cursor) -> dict[str, tuple[int, int]]:
+    """Get {field_name: (offset_bytes, size_bytes)} for a struct/union cursor.
+
+    Returns empty dict if the cursor has no field declarations or if
+    the type is incomplete.
+    """
+    # For typedef cursors, resolve to the underlying struct declaration
+    decl = cursor
+    if cursor.kind == CursorKind.TYPEDEF_DECL:
+        decl = cursor.underlying_typedef_type.get_declaration()
+    if not decl or decl.kind not in (
+        CursorKind.STRUCT_DECL, CursorKind.CLASS_DECL, CursorKind.UNION_DECL,
+    ):
+        return {}
+
+    layout: dict[str, tuple[int, int]] = {}
+    for field in decl.get_children():
+        if field.kind != CursorKind.FIELD_DECL or not field.spelling:
+            continue
+        offset_bits = field.get_field_offsetof()
+        if offset_bits < 0:
+            continue
+        sz = field.type.get_size()
+        if sz < 0:
+            continue
+        layout[field.spelling] = (offset_bits // 8, sz)
+    return layout
+
+
+def _annotate_struct_layout(
+    definition: str | None, layout: dict[str, tuple[int, int]],
+) -> str | None:
+    """Annotate struct field lines with offset and size comments.
+
+    ``int16_t x;`` → ``int16_t x; /* offset: 0, size: 2 */``
+    """
+    if not definition or not layout:
+        return definition
+    lines = definition.splitlines()
+    result: list[str] = []
+    for line in lines:
+        for field_name, (offset, size) in layout.items():
+            if re.search(rf"\b{re.escape(field_name)}\s*[;\[,]", line) \
+               and "/* offset:" not in line:
+                line = f"{line.rstrip()} /* offset: {offset}, size: {size} */"
+                break
+        result.append(line)
+    return "\n".join(result)
+
+
 def _is_system_header(file_path: str) -> bool:
     """Return True if file_path looks like a system header (not project-local)."""
     return any(file_path.startswith(p) for p in _SYSTEM_HEADER_PREFIXES)
@@ -256,6 +342,13 @@ class FunctionExtractor:
                 )
                 if pp_src:
                     func.pp_source = pp_src
+
+        # Annotate sizeof(TypeName) with resolved values as inline comments
+        type_sizes = _collect_type_sizes(tu.cursor)
+        if type_sizes:
+            for func in functions:
+                if func.pp_source:
+                    func.pp_source = _annotate_sizeof(func.pp_source, type_sizes)
 
         # Update block source text from llm_source (preprocessed when available).
         # Block line ranges are absolute file lines, so re-extract from llm_source.
@@ -861,6 +954,11 @@ class FunctionExtractor:
                         child_file, child.extent.start.line, child.extent.end.line
                     ) if pp_file else None,
                 )
+                layout = _get_struct_field_layout(child)
+                if layout:
+                    pp_definition = _annotate_struct_layout(
+                        pp_definition or definition, layout,
+                    )
                 results.append({
                     "name": child.spelling,
                     "kind": "typedef",
@@ -925,6 +1023,11 @@ class FunctionExtractor:
                             child_file, child.extent.start.line, child.extent.end.line
                         ) if pp_file else None,
                     )
+                    layout = _get_struct_field_layout(child)
+                    if layout:
+                        pp_definition = _annotate_struct_layout(
+                            pp_definition or definition, layout,
+                        )
                     results.append({
                         "name": child.spelling,
                         "kind": kind_map[child.kind],
