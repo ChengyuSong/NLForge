@@ -7,13 +7,29 @@ import threading
 from .db import SummaryDB
 from .llm.base import LLMBackend, make_json_response_format
 from .models import (
+    Allocation,
+    FreeOp,
     Function,
     FunctionBlock,
+    InitOp,
     MemsafeContract,
     SafetyIssue,
     VerificationSummary,
     build_skeleton,
 )
+
+
+def _substitute(expr: str, formals: list[str], actuals: list[str]) -> str:
+    """Replace formal parameter names with actual argument texts in an expression."""
+    if not formals or not actuals:
+        return expr
+    pairs = sorted(zip(formals, actuals, strict=False), key=lambda p: -len(p[0]))
+    for formal, actual in pairs:
+        if formal and actual and formal != actual:
+            def _repl(_: re.Match[str], r: str = actual) -> str:
+                return r
+            expr = re.sub(r"\b" + re.escape(formal) + r"\b", _repl, expr)
+    return expr
 
 
 class IncompleteCalleeError(RuntimeError):
@@ -267,12 +283,15 @@ class VerificationSummarizer:
         self,
         func: Function,
         callee_summaries: dict[str, VerificationSummary] | None = None,
+        callee_params: dict[str, list[str]] | None = None,
         alias_context: str | None = None,
         previous_summary_json: str | None = None,
     ) -> VerificationSummary:
         """Verify a function and simplify its contracts."""
         if callee_summaries is None:
             callee_summaries = {}
+        if callee_params is None:
+            callee_params = {}
 
         # Check for large function with blocks
         blocks = self.db.get_function_blocks(func.id) if func.id else []
@@ -284,8 +303,12 @@ class VerificationSummarizer:
         callee_section = self._build_callee_section(func, callee_summaries)
         own_contracts = self._build_own_contracts_section(func)
 
+        annotated_source = self._annotate_source(
+            func, callee_summaries, callee_params,
+        )
+
         prompt, system, cache_system = self._build_prompt_and_system(
-            func.llm_source, func, own_contracts, callee_section, alias_context,
+            annotated_source, func, own_contracts, callee_section, alias_context,
         )
 
         if previous_summary_json is not None:
@@ -594,6 +617,190 @@ class VerificationSummarizer:
         )
         return prompt, None, False
 
+    def _get_callee_attributes(self, callee_names: list[str]) -> dict[str, str]:
+        """Look up attributes for callee functions."""
+        attrs: dict[str, str] = {}
+        for name in callee_names:
+            funcs = self.db.get_function_by_name(name)
+            if funcs and funcs[0].attributes:
+                attrs[name] = funcs[0].attributes
+        return attrs
+
+    def _annotate_source(
+        self,
+        func: Function,
+        callee_summaries: dict[str, VerificationSummary],
+        callee_params: dict[str, list[str]],
+    ) -> str:
+        """Annotate function source with inline callee pre/post-conditions.
+
+        Injects ``/* PRE[callee(args)]: ... */`` and ``/* POST[callee(args)]: ... */``
+        comments immediately before each callsite.
+        """
+        if not func.callsites:
+            return func.llm_source
+
+        all_callee_names = {cs["callee"] for cs in func.callsites}
+        callee_attrs = self._get_callee_attributes(list(all_callee_names))
+
+        # Collect per-callee post-condition data from DB
+        _post_data = dict[str, list[Allocation] | list[FreeOp] | list[InitOp]]
+        callee_post: dict[str, _post_data] = {}
+        if func.id is not None:
+            callee_ids = self.db.get_callees(func.id)
+            for callee_id in callee_ids:
+                callee_func = self.db.get_function(callee_id)
+                if callee_func is None:
+                    continue
+                post: _post_data = {}
+                alloc_summary = self.db.get_summary_by_function_id(callee_id)
+                if alloc_summary and alloc_summary.allocations:
+                    post["allocations"] = alloc_summary.allocations
+                free_summary = self.db.get_free_summary_by_function_id(callee_id)
+                if free_summary and (free_summary.frees or free_summary.resource_releases):
+                    post["frees"] = free_summary.frees
+                init_summary = self.db.get_init_summary_by_function_id(callee_id)
+                if init_summary and init_summary.inits:
+                    post["inits"] = init_summary.inits
+                if post:
+                    callee_post[callee_func.name] = post
+
+        # Group callsites by line_in_body
+        by_line: dict[int, list[dict]] = {}
+        for cs in func.callsites:
+            cname = str(cs["callee"])
+            has_pre = (cname in callee_summaries
+                       and callee_summaries[cname].simplified_contracts is not None)
+            has_post = cname in callee_post
+            has_attrs = cname in callee_attrs
+            if has_pre or has_post or has_attrs:
+                by_line.setdefault(cs["line_in_body"], []).append(cs)
+
+        if not by_line:
+            return func.llm_source
+
+        lines = func.source.splitlines()
+        result: list[str] = []
+        for i, line in enumerate(lines):
+            # Collect post-condition lines to emit after the callsite
+            post_lines: list[str] = []
+
+            for cs in by_line.get(i, []):
+                callee_name = str(cs["callee"])
+                actual_args: list[str] = cs.get("args", [])
+                formal_params: list[str] = callee_params.get(callee_name, [])
+                via_macro: bool = bool(cs.get("via_macro", False))
+                macro_name = cs.get("macro_name")
+
+                if via_macro:
+                    header = f"{callee_name}  [via macro {macro_name or '?'}]"
+                    actual_args = []
+                else:
+                    args_str = ", ".join(actual_args)
+                    header = f"{callee_name}({args_str})"
+
+                indent = " " * (len(line) - len(line.lstrip()))
+
+                # Attribute annotation (before call)
+                if callee_name in callee_attrs:
+                    result.append(
+                        f"{indent}/* {callee_name}: "
+                        f"{callee_attrs[callee_name]} */"
+                    )
+
+                # Pre-conditions (before call)
+                verified = callee_summaries.get(callee_name)
+                if verified and verified.simplified_contracts:
+                    result.append(f"{indent}/* PRE[{header}]:")
+                    for c in verified.simplified_contracts:
+                        target = _substitute(c.target, formal_params, actual_args)
+                        if c.contract_kind == "buffer_size" and c.size_expr:
+                            size = _substitute(
+                                c.size_expr, formal_params, actual_args,
+                            )
+                            result.append(
+                                f"{indent} *   {target}:"
+                                f" {c.contract_kind}({size})"
+                            )
+                        else:
+                            result.append(
+                                f"{indent} *   {target}: {c.contract_kind}"
+                            )
+                    result.append(f"{indent} */")
+
+                # Post-conditions (after call)
+                post = callee_post.get(callee_name, {})
+                if post:
+                    post_lines.append(f"{indent}/* POST[{header}]:")
+                    allocs: list[Allocation] = post.get(  # type: ignore[assignment]
+                        "allocations", [],
+                    )
+                    for a in allocs:
+                        extras = []
+                        if a.may_be_null:
+                            extras.append("may_be_null")
+                        else:
+                            extras.append("never_null")
+                        if a.returned:
+                            extras.append("returned")
+                        if a.stored_to:
+                            stored = _substitute(
+                                a.stored_to, formal_params, actual_args,
+                            )
+                            extras.append(f"stored_to={stored}")
+                        size_desc = ""
+                        if a.size_expr:
+                            size_desc = (
+                                f"({_substitute(a.size_expr, formal_params, actual_args)})"
+                            )
+                        post_lines.append(
+                            f"{indent} *   alloc: {a.source}{size_desc}"
+                            f" [{', '.join(extras)}]"
+                        )
+                    frees: list[FreeOp] = post.get(  # type: ignore[assignment]
+                        "frees", [],
+                    )
+                    for fop in frees:
+                        target = _substitute(
+                            fop.target, formal_params, actual_args,
+                        )
+                        extras_f = []
+                        if fop.conditional:
+                            extras_f.append(
+                                f"when {fop.condition}"
+                                if fop.condition else "conditional"
+                            )
+                        if fop.nulled_after:
+                            extras_f.append("nulled_after")
+                        extra_str = (
+                            f" [{', '.join(extras_f)}]" if extras_f else ""
+                        )
+                        post_lines.append(
+                            f"{indent} *   free:"
+                            f" {fop.deallocator}({target}){extra_str}"
+                        )
+                    inits: list[InitOp] = post.get(  # type: ignore[assignment]
+                        "inits", [],
+                    )
+                    for iop in inits:
+                        target = _substitute(
+                            iop.target, formal_params, actual_args,
+                        )
+                        byte_info = (
+                            f" [{iop.byte_count} bytes]"
+                            if iop.byte_count else ""
+                        )
+                        post_lines.append(
+                            f"{indent} *   init:"
+                            f" {iop.initializer}({target}){byte_info}"
+                        )
+                    post_lines.append(f"{indent} */")
+
+            result.append(line)
+            result.extend(post_lines)
+
+        return "\n".join(result)
+
     def _build_callee_section(
         self,
         func: Function,
@@ -657,10 +864,13 @@ class VerificationSummarizer:
                     extras = []
                     if a.may_be_null:
                         extras.append("may_be_null")
+                    else:
+                        extras.append("never_null")
                     if a.returned:
                         extras.append("returned")
-                    if extras:
-                        desc += f" [{', '.join(extras)}]"
+                    if a.stored_to:
+                        extras.append(f"stored_to={a.stored_to}")
+                    desc += f" [{', '.join(extras)}]"
                     alloc_descs.append(desc)
                 post_parts.append(f"  Allocations: {'; '.join(alloc_descs)}")
                 if alloc_summary.buffer_size_pairs:

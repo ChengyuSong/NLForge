@@ -218,12 +218,14 @@ class VerificationPass:
         callee_funcs: dict[str, Function] | None = None,
         **kwargs: Any,
     ) -> VerificationSummary:
+        callee_params = {name: f.params for name, f in (callee_funcs or {}).items()}
         alias_context = None
         if self.alias_builder is not None:
             callee_names = list((callee_funcs or {}).keys())
             alias_context = self.alias_builder.build_context(func, callee_names)
         result: VerificationSummary = self.summarizer.summarize_function(
-            func, callee_summaries, alias_context=alias_context,
+            func, callee_summaries, callee_params=callee_params,
+            alias_context=alias_context,
             previous_summary_json=kwargs.get("previous_summary_json"),
         )
         return result

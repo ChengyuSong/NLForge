@@ -16,14 +16,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# ucsan checker exit codes
-CRASH_CODES = {
+# ucsan exit codes
+EXIT_REASONS = {
+    # internal (not real crashes)
+    123: "loop_oob",
+    124: "obj_oob",
+    125: "stack_oob",
+    # checker
     150: "ubi",
     151: "uaf",
     152: "oob",
     153: "null_deref",
+    161: "oob_upcast",
     171: "panic",
 }
+
+INTERNAL_EXIT_CODES = {123, 124, 125}
+
+# Backwards compat alias
+CRASH_CODES = {k: v for k, v in EXIT_REASONS.items() if k not in INTERNAL_EXIT_CODES}
 
 
 @dataclass
@@ -71,15 +82,22 @@ def classify_outcome(
         validation: validation_result.json from run_policy.py
     """
     hypothesis = verdict.get("hypothesis", "unknown")
-    crashes = validation.get("crashes", [])
+    raw_crashes = validation.get("crashes", [])
+
     plan_cov = validation.get("plan_coverage") or {}
     assertions = validation.get("assertions") or {}
 
-    # Parse crash info
-    crash_info = [
-        {"exit_code": c, "kind": CRASH_CODES.get(c, f"unknown({c})")}
-        for c in crashes
-    ]
+    # Parse crash info — handle both old (list of ints) and new (list of dicts)
+    crash_info = []
+    for c in raw_crashes:
+        if isinstance(c, dict):
+            crash_info.append({"exit_code": c["code"], "kind": c["reason"]})
+        else:
+            code = c
+            if code in INTERNAL_EXIT_CODES:
+                continue  # not a real crash
+            kind = EXIT_REASONS.get(code, f"unknown({code})")
+            crash_info.append({"exit_code": code, "kind": kind})
 
     # Parse assertion results
     a_failures: list[dict[str, Any]] = []
@@ -210,11 +228,24 @@ def consume_validation_dir(
     if not isinstance(verdicts, list):
         verdicts = [verdicts]
 
+    from .models import SafetyIssue
+
     results: list[dict[str, Any]] = []
     for vi, v in enumerate(verdicts):
         func_name = v.get("function_name", "unknown")
         idx = v.get("issue_index", vi)
-        vdir = harness_dir / func_name / f"v{idx}"
+
+        issue_d = v.get("issue", {})
+        si = SafetyIssue(
+            location=issue_d.get("location", ""),
+            issue_kind=issue_d.get("issue_kind", ""),
+            description=issue_d.get("description", ""),
+            severity=issue_d.get("severity", "medium"),
+            callee=issue_d.get("callee"),
+            contract_kind=issue_d.get("contract_kind"),
+        )
+        fp = si.fingerprint()
+        vdir = harness_dir / func_name / f"v{idx}_{fp}"
 
         # Find all validation results in this verdict dir
         for vr_path in sorted(vdir.glob("validation_result.json")):
