@@ -10,6 +10,7 @@ from .models import (
     InitSummary,
     MemsafeContract,
     MemsafeSummary,
+    OutputRange,
     ParameterInfo,
 )
 
@@ -477,6 +478,32 @@ STDLIB_INIT_SUMMARIES: dict[str, InitSummary] = {
         description="Always initializes dest by copying n bytes from src (overlapping safe).",
     ),
     # CGC library
+    "cgc_transmit": InitSummary(
+        function_name="cgc_transmit",
+        inits=[
+            InitOp(
+                target="*tx_bytes",
+                target_kind="parameter",
+                initializer="cgc_transmit",
+                byte_count="sizeof(cgc_size_t)",
+                conditional=True,
+                condition="tx_bytes != NULL and transmit succeeds",
+            )
+        ],
+        output_ranges=[
+            OutputRange(
+                target="*tx_bytes",
+                range="[0, count]",
+                description="Written bytes cannot exceed requested count",
+            ),
+            OutputRange(
+                target="return value",
+                range="{0} or CGC errno",
+                description="Returns 0 on success, CGC errno on failure",
+            ),
+        ],
+        description="Transmits up to count bytes; *tx_bytes set to actual bytes sent.",
+    ),
     "cgc_receive": InitSummary(
         function_name="cgc_receive",
         inits=[
@@ -485,7 +512,27 @@ STDLIB_INIT_SUMMARIES: dict[str, InitSummary] = {
                 target_kind="parameter",
                 initializer="cgc_receive",
                 byte_count="up to count (actual in *rx_bytes)",
-            )
+            ),
+            InitOp(
+                target="*rx_bytes",
+                target_kind="parameter",
+                initializer="cgc_receive",
+                byte_count="sizeof(cgc_size_t)",
+                conditional=True,
+                condition="rx_bytes != NULL and receive succeeds",
+            ),
+        ],
+        output_ranges=[
+            OutputRange(
+                target="*rx_bytes",
+                range="[0, count]",
+                description="Received bytes cannot exceed requested count",
+            ),
+            OutputRange(
+                target="return value",
+                range="{0} or CGC errno",
+                description="Returns 0 on success, CGC errno on failure",
+            ),
         ],
         description="Receives up to count bytes into buf from fd.",
     ),
@@ -496,10 +543,62 @@ STDLIB_INIT_SUMMARIES: dict[str, InitSummary] = {
                 target="*buf",
                 target_kind="parameter",
                 initializer="cgc_random",
-                byte_count="up to count (actual in *rnd_bytes)",
-            )
+                byte_count="count",
+            ),
+            InitOp(
+                target="*rnd_bytes",
+                target_kind="parameter",
+                initializer="cgc_random",
+                byte_count="sizeof(cgc_size_t)",
+                conditional=True,
+                condition="rnd_bytes != NULL",
+            ),
         ],
-        description="Fills buf with up to count random bytes.",
+        output_ranges=[
+            OutputRange(
+                target="*rnd_bytes",
+                range="[count, count]",
+                description="Always exactly count bytes",
+            ),
+            OutputRange(
+                target="return value",
+                range="{0}",
+                description="Always returns 0",
+            ),
+        ],
+        description="Fills buf with exactly count random bytes.",
+    ),
+    "cgc_allocate": InitSummary(
+        function_name="cgc_allocate",
+        inits=[
+            InitOp(
+                target="*addr",
+                target_kind="parameter",
+                initializer="cgc_allocate",
+                byte_count="sizeof(void*)",
+                conditional=True,
+                condition="addr != NULL and allocation succeeds",
+            ),
+            InitOp(
+                target="**addr",
+                target_kind="parameter",
+                initializer="memset zero",
+                byte_count="length",
+                conditional=True,
+                condition="allocation succeeds",
+            ),
+        ],
+        output_ranges=[
+            OutputRange(
+                target="return value",
+                range="{0} or CGC errno",
+                description="Returns 0 on success, CGC errno on failure",
+            ),
+        ],
+        description=(
+            "Allocates length bytes via mmap, zero-initializes the region,"
+            " stores pointer to *addr."
+        ),
     ),
     "strncpy": InitSummary(
         function_name="strncpy",
