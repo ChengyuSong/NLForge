@@ -128,10 +128,9 @@ def main():
 @click.option(
     "--cache-mode",
     type=click.Choice(["none", "instructions", "source"]),
-    default="none",
-    help="Prompt caching mode: none (default), "
-         "instructions (cache task instructions), "
-         "source (cache function source)",
+    default=None,
+    help="Prompt caching mode: none, instructions, source. "
+         "Auto-selects 'source' for claude backend.",
 )
 @click.option(
     "--function", "function_names", multiple=True,
@@ -299,6 +298,10 @@ def summarize(
         backend_kwargs = _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)
         llm = create_backend(backend, model=model, **backend_kwargs)
         console.print(f"Using {backend} backend ({llm.model})")
+
+        # Auto-select cache mode for backends that support prompt caching
+        if cache_mode is None:
+            cache_mode = "source" if backend == "claude" else "none"
         if cache_mode != "none":
             console.print(f"  Prompt cache mode: {cache_mode}")
 

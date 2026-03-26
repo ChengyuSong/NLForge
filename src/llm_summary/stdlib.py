@@ -574,21 +574,27 @@ STDLIB_INIT_SUMMARIES: dict[str, InitSummary] = {
             InitOp(
                 target="*addr",
                 target_kind="parameter",
-                initializer="cgc_allocate",
+                initializer="mmap",
                 byte_count="sizeof(void*)",
                 conditional=True,
-                condition="addr != NULL and allocation succeeds",
+                condition="allocation succeeds (return == 0)",
             ),
             InitOp(
-                target="**addr",
+                target="*addr buffer",
                 target_kind="parameter",
                 initializer="memset zero",
                 byte_count="length",
                 conditional=True,
-                condition="allocation succeeds",
+                condition="allocation succeeds (return == 0)",
             ),
         ],
         output_ranges=[
+            OutputRange(
+                target="*addr",
+                range="non-null (valid mmap pointer)",
+                description="On success, *addr is a non-null pointer to a"
+                " zero-initialized region of length bytes",
+            ),
             OutputRange(
                 target="return value",
                 range="{0} or CGC errno",
@@ -596,8 +602,9 @@ STDLIB_INIT_SUMMARIES: dict[str, InitSummary] = {
             ),
         ],
         description=(
-            "Allocates length bytes via mmap, zero-initializes the region,"
-            " stores pointer to *addr."
+            "ret = mmap(length); *addr = ret; memset(ret, 0, length)."
+            " On success: *addr is non-null, the region at *addr is"
+            " zero-initialized for length bytes."
         ),
     ),
     "strncpy": InitSummary(

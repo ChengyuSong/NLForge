@@ -1715,10 +1715,11 @@ class SummaryDB:
         return [dict(row) for row in rows]
 
     def get_static_vars_by_file(self, file_path: str) -> list[dict]:
-        """Get all file-scope static variable declarations for a given source file."""
+        """Get all file-scope variable declarations (static and global)."""
         rows = self.conn.execute(
             "SELECT * FROM typedefs WHERE file_path = ?"
-            " AND kind = 'static_var' AND definition IS NOT NULL",
+            " AND kind IN ('static_var', 'global_var')"
+            " AND definition IS NOT NULL",
             (file_path,),
         ).fetchall()
         return [dict(row) for row in rows]

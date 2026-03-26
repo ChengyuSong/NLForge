@@ -1040,12 +1040,13 @@ class FunctionExtractor:
                     })
 
             elif child.kind == CursorKind.VAR_DECL:
-                # Capture file-scope static variables (static const arrays, etc.)
+                # Capture file-scope variables (static and global).
                 # Include vars from main_file and from project-local headers.
                 # System headers (under /usr/, /lib/, etc.) are excluded.
                 # Vars from included headers are stored under main_file so that
-                # get_static_vars_by_file(main_file) finds them at verify time.
-                if (child.storage_class == StorageClass.STATIC
+                # get_file_scope_vars(main_file) finds them at verify time.
+                if (child.storage_class in (StorageClass.STATIC,
+                                            StorageClass.NONE)
                         and not _is_system_header(child_file)):
                     loc_key = (child_file, child.location.line)
                     if loc_key not in seen_locations:
@@ -1059,9 +1060,12 @@ class FunctionExtractor:
                                 child_file, child.extent.start.line, child.extent.end.line
                             ) if pp_file else None,
                         )
+                        kind = ("static_var"
+                                if child.storage_class == StorageClass.STATIC
+                                else "global_var")
                         results.append({
                             "name": child.spelling,
-                            "kind": "static_var",
+                            "kind": kind,
                             "underlying_type": type_spelling,
                             "canonical_type": canonical,
                             "file_path": main_file,
