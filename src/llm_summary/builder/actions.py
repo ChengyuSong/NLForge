@@ -1353,7 +1353,7 @@ def test_build_script(
     Test a build script by running it from scratch in a clean temporary build directory.
 
     Verifies that the script produces compile_commands.json (required).
-    On success, copies compile_commands.json and IR artifacts to the real build dir.
+    On success, moves the entire build output to build_dir.
 
     Args:
         script_content: Shell script content to run
@@ -1464,25 +1464,14 @@ def test_build_script(
             log_prefix="[test_build_script]",
         )
 
-        # Success — copy artifacts to the real build dir
-        build_dir.mkdir(parents=True, exist_ok=True)
+        # Success — move all build content to the real build dir
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        shutil.move(str(temp_build_dir), str(build_dir))
+        temp_build_dir = None  # prevent cleanup in finally block
 
-        # Copy compile_commands.json
-        dest_cc = build_dir / "compile_commands.json"
-        shutil.copy2(str(compile_commands_path), str(dest_cc))
         if verbose:
-            print(f"[test_build_script] Copied compile_commands.json to {dest_cc}")
-
-        # Copy .bc and .ll artifacts
-        ir_count = 0
-        for pattern in ("**/*.bc", "**/*.ll"):
-            for src_file in Path(temp_build_dir).rglob(pattern.split("/")[-1]):
-                dest_file = build_dir / src_file.name
-                shutil.copy2(str(src_file), str(dest_file))
-                ir_count += 1
-
-        if verbose and ir_count > 0:
-            print(f"[test_build_script] Copied {ir_count} IR artifacts to {build_dir}")
+            print(f"[test_build_script] Moved build output to {build_dir}")
 
         return {
             "success": True,
