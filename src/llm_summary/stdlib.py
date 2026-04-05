@@ -352,11 +352,49 @@ STDLIB_FREE_SUMMARIES: dict[str, FreeSummary] = {
                 target="ptr",
                 target_kind="parameter",
                 deallocator="realloc",
-                conditional=False,
+                conditional=True,
+                condition="realloc succeeds (returns non-NULL)",
                 nulled_after=False,
             )
         ],
-        description="Frees old pointer when reallocating to a new size.",
+        description=(
+            "Frees old pointer only on success; "
+            "on failure returns NULL and old pointer remains valid."
+        ),
+    ),
+    "reallocarray": FreeSummary(
+        function_name="reallocarray",
+        frees=[
+            FreeOp(
+                target="ptr",
+                target_kind="parameter",
+                deallocator="reallocarray",
+                conditional=True,
+                condition="reallocarray succeeds (returns non-NULL)",
+                nulled_after=False,
+            )
+        ],
+        description=(
+            "Frees old pointer only on success; "
+            "on failure returns NULL and old pointer remains valid."
+        ),
+    ),
+    "getline": FreeSummary(
+        function_name="getline",
+        frees=[
+            FreeOp(
+                target="*lineptr",
+                target_kind="parameter",
+                deallocator="realloc (internal)",
+                conditional=True,
+                condition="internal buffer is reallocated to fit the line",
+                nulled_after=False,
+            )
+        ],
+        description=(
+            "May internally realloc *lineptr, freeing the old buffer; "
+            "caller must free the final *lineptr."
+        ),
     ),
     "fclose": FreeSummary(
         function_name="fclose",

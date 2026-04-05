@@ -511,6 +511,53 @@ def run_one_task(
             reachable_ids = driver.compute_reachable({main_id}, graph)
             log.debug("  Reachable from main: %d functions", len(reachable_ids))
 
+        # Init stdlib summaries for stubs (malloc, free, realloc, etc.)
+        if from_phase <= 1:
+            from llm_summary.stdlib import (
+                STDLIB_ATTRIBUTES,
+                get_all_stdlib_free_summaries,
+                get_all_stdlib_init_summaries,
+                get_all_stdlib_memsafe_summaries,
+                get_all_stdlib_summaries,
+            )
+
+            for name, summary in get_all_stdlib_summaries().items():
+                funcs = db.get_function_by_name(name)
+                if funcs:
+                    f = funcs[0]
+                    attrs = STDLIB_ATTRIBUTES.get(name, "")
+                    if attrs and not f.attributes:
+                        f.attributes = attrs
+                        db.conn.execute(
+                            "UPDATE functions SET attributes = ? "
+                            "WHERE id = ?", (attrs, f.id),
+                        )
+                    db.upsert_summary(f, summary, model_used="builtin")
+            for name, fs in get_all_stdlib_free_summaries().items():
+                funcs = db.get_function_by_name(name)
+                if funcs:
+                    db.upsert_free_summary(funcs[0], fs, model_used="builtin")
+            for name, isum in get_all_stdlib_init_summaries().items():
+                funcs = db.get_function_by_name(name)
+                if funcs:
+                    db.upsert_init_summary(funcs[0], isum, model_used="builtin")
+            for name, msum in get_all_stdlib_memsafe_summaries().items():
+                funcs = db.get_function_by_name(name)
+                if funcs:
+                    db.upsert_memsafe_summary(
+                        funcs[0], msum, model_used="builtin",
+                    )
+            # Update attributes for attribute-only functions
+            for name in STDLIB_ATTRIBUTES:
+                funcs = db.get_function_by_name(name)
+                if funcs and not funcs[0].attributes:
+                    attrs = STDLIB_ATTRIBUTES[name]
+                    db.conn.execute(
+                        "UPDATE functions SET attributes = ? "
+                        "WHERE id = ?", (attrs, funcs[0].id),
+                    )
+            db.conn.commit()
+
         # Load alias context from vsnapshot if available
         alias_builder = None
         vsnap_path = work_dir / "v-snapshot.vsnap"
