@@ -47,8 +47,11 @@ For each initialization, identify:
 (e.g., "n", "len", "sizeof(int)", "count * sizeof(T)"), or null if truly unknown. \
 Do NOT use "full"; always prefer the actual size expression or sizeof(return_type) for return values
 5. **conditional** (optional): true if the initialization only happens on some exit paths
-6. **condition** (optional): the condition under which the initialization occurs \
-(e.g., "return value == 0", "n > 0 && s != NULL"); only present when conditional is true
+6. **condition** (optional): the condition under which the initialization occurs, \
+expressed in terms of **caller-observable quantities only** — the function's own \
+parameters and/or return value. The caller cannot see internal locals or callee results. \
+Over-approximation is fine: soundness matters more than precision. \
+Only present when conditional is true
 
 **IMPORTANT**: Enumerate EVERY distinct initialization site individually. \
 Do NOT collapse multiple inits into a single entry.

@@ -40,10 +40,11 @@ For each operation (in either list), identify:
    - "return_value" — the freed pointer is also returned (rare)
 3. **deallocator**: The function that performs the free (e.g., "free", "close", "sem_destroy")
 4. **conditional**: true if the free is inside an if-block, error path, or conditional
-5. **condition**: If conditional is true, the C expression that guards the free \
-(e.g., "do_close != 0", "ptr != NULL", "error path"). \
-If a callee's free is conditional on one of this function's parameters, \
-record the condition in terms of this function's parameters. Omit if conditional is false.
+5. **condition**: If conditional is true, express the condition in terms of \
+**caller-observable quantities only** — the function's own parameters \
+and/or return value. The caller cannot see internal locals or callee results. \
+Over-approximation is fine: soundness matters more than precision. \
+Omit if conditional is false.
 6. **nulled_after**: true if the pointer is set to NULL after the free
 
 **Caller-visible abstraction**: Only report frees at the abstraction level of \
