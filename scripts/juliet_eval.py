@@ -69,6 +69,10 @@ SUBPROP_TO_KINDS: dict[str, set[str]] = {
     "valid-free": {"double_free", "use_after_free", "invalid_free"},
     "valid-deref": {"null_deref", "buffer_overflow", "use_after_free"},
     "valid-memtrack": {"memory_leak"},
+    "valid-memsafety": {
+        "double_free", "use_after_free", "invalid_free",
+        "null_deref", "buffer_overflow", "memory_leak",
+    },
     "no-overflow": {"integer_overflow"},
 }
 
@@ -126,37 +130,47 @@ class TaskResult:
     llm_calls: int = 0
 
 
-def parse_yml(yml_path: Path) -> dict[str, Any]:
-    """Parse a Juliet .yml task file."""
+def parse_yml(yml_path: Path) -> dict[str, Any] | None:
+    """Parse an SV-COMP .yml task file. Returns None if no relevant property."""
     with open(yml_path) as f:
         data = yaml.safe_load(f)
 
+    # input_files is relative to the yml's directory
     i_file = data["input_files"]
+    source_path = yml_path.parent / i_file
     props = data.get("properties", [])
+
+    # Properties we can evaluate (valid-memsafety has sub-properties)
+    relevant_props = {"valid-memsafety", "no-overflow"}
 
     expected_verdict = True
     subproperty = ""
+    found = False
     for prop in props:
-        if "expected_verdict" in prop:
+        if "expected_verdict" not in prop:
+            continue
+        pf = prop.get("property_file", "")
+        base = Path(pf).stem  # e.g., "valid-memsafety", "no-overflow"
+        sub = prop.get("subproperty", "")
+        if base in relevant_props or sub in SUBPROP_TO_KINDS:
             expected_verdict = prop["expected_verdict"]
-            subproperty = prop.get("subproperty", "")
-            if not subproperty:
-                # Derive from property_file, e.g., "no-overflow.prp"
-                pf = prop.get("property_file", "")
-                base = Path(pf).stem  # "no-overflow"
-                if base in SUBPROP_TO_KINDS:
-                    subproperty = base
+            subproperty = sub if sub else base
+            found = True
             break
+
+    if not found:
+        return None
 
     return {
         "i_file": i_file,
+        "source_path": str(source_path),
         "expected_verdict": expected_verdict,
         "subproperty": subproperty,
     }
 
 
-def find_target_functions(db: SummaryDB, variant: str) -> list[str]:
-    """Find CWE-specific functions to verify.
+def find_juliet_target_functions(db: SummaryDB, variant: str) -> list[str]:
+    """Find Juliet CWE-specific functions to check.
 
     For _bad files: the CWE*_bad named function.
     For _good files: static helpers like goodG2B, goodB2G.
@@ -199,7 +213,7 @@ def phase_scan(
     work_dir: Path,
     db: SummaryDB,
 ) -> int:
-    """Extract functions from .i file into DB. Returns function count."""
+    """Extract functions from source file into DB. Returns function count."""
     cc_json = [{
         "directory": str(i_path.parent),
         "file": str(i_path),
@@ -212,7 +226,7 @@ def phase_scan(
 
     extractor = FunctionExtractor(
         compile_commands=compile_commands,
-        enable_preprocessing=False,
+        enable_preprocessing=(i_path.suffix != ".i"),
     )
     functions = extractor.extract_from_file(i_path)
     db.insert_functions_batch(functions)
@@ -337,14 +351,13 @@ def phase_verify(
 
 # ── Phase 4: evaluate ───────────────────────────────────────────────────────
 
-def phase_evaluate(
+def _collect_issues(
     db: SummaryDB,
-    variant: str,
+    target_names: list[str],
 ) -> list[dict[str, Any]]:
-    """Collect issues from target functions. Returns issues list."""
-    targets = find_target_functions(db, variant)
+    """Collect verification issues from named functions."""
     issues: list[dict[str, Any]] = []
-    for tname in targets:
+    for tname in target_names:
         for f in db.get_function_by_name(tname):
             assert f.id is not None
             vsm = db.get_verification_summary_by_function_id(f.id)
@@ -352,6 +365,27 @@ def phase_evaluate(
                 for issue in vsm.issues:
                     issues.append(issue.to_dict())
     return issues
+
+
+def phase_evaluate(
+    db: SummaryDB,
+    variant: str | None,
+    reachable_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect issues from target functions. Returns issues list."""
+    if variant:
+        # Juliet: use variant-specific target selection
+        targets = find_juliet_target_functions(db, variant)
+    else:
+        # General: collect issues from all reachable functions with source
+        targets = []
+        for f in db.get_all_functions():
+            if not f.source:
+                continue
+            if reachable_ids and f.id not in reachable_ids:
+                continue
+            targets.append(f.name)
+    return _collect_issues(db, targets)
 
 
 # ── Summary cache for boilerplate functions ─────────────────────────────────
@@ -421,7 +455,7 @@ def apply_summary_cache(db: SummaryDB, cache: SummaryCache) -> int:
 
 def run_one_task(
     i_path: Path,
-    variant: str,
+    variant: str | None,
     work_dir: Path,
     backend: str,
     model: str | None,
@@ -492,16 +526,9 @@ def run_one_task(
             db.close()
             return [], total_llm
 
-        # Find targets (needed for phase 4: evaluate)
-        targets = find_target_functions(db, variant)
-        if not targets:
-            log.warning("  No target functions found")
-            db.close()
-            return [], 0
-        log.debug("  Targets: %s", targets)
-
         # Phase 4: evaluate
-        issues = phase_evaluate(db, variant)
+        issues = phase_evaluate(db, variant, reachable_ids=reachable_ids)
+        log.debug("  Issues: %d", len(issues))
         db.close()
         return issues, total_llm
 
@@ -512,17 +539,17 @@ def run_one_task(
 
 def collect_tasks_from_set_file(
     set_file: Path,
-    benchmarks_base: Path,
     cwe_filter: str | None,
 ) -> list[tuple[Path, dict[str, Any]]]:
-    """Collect tasks from a .set file (glob patterns relative to benchmarks_base)."""
+    """Collect tasks from a .set file (glob patterns relative to set file dir)."""
+    base_dir = set_file.parent
     seen: set[Path] = set()
     tasks: list[tuple[Path, dict[str, Any]]] = []
     for line in set_file.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        for yml_path in sorted(benchmarks_base.glob(line)):
+        for yml_path in sorted(base_dir.glob(line)):
             if yml_path in seen:
                 continue
             seen.add(yml_path)
@@ -534,6 +561,8 @@ def collect_tasks_from_set_file(
                 info = parse_yml(yml_path)
             except Exception as e:
                 log.warning("Failed to parse %s: %s", yml_path, e)
+                continue
+            if info is None:
                 continue
             tasks.append((yml_path, info))
     return tasks
@@ -563,6 +592,8 @@ def collect_tasks(
         except Exception as e:
             log.warning("Failed to parse %s: %s", yml_path, e)
             continue
+        if info is None:
+            continue
 
         tasks.append((yml_path, info))
 
@@ -574,8 +605,8 @@ def main() -> None:
         description="Evaluate llm-summary on Juliet benchmarks",
     )
     parser.add_argument(
-        "--benchmarks", required=True,
-        help="Path to Juliet_Test directory",
+        "--benchmarks", default=None,
+        help="Path to benchmark directory (required without --set-file)",
     )
     parser.add_argument(
         "--cwe", default=None,
@@ -637,11 +668,6 @@ def main() -> None:
     if args.verbose:
         log.setLevel(logging.DEBUG)
 
-    benchmarks_dir = Path(args.benchmarks)
-    if not benchmarks_dir.exists():
-        log.error("Benchmarks directory not found: %s", benchmarks_dir)
-        sys.exit(1)
-
     func_scans = Path(args.func_scans_dir)
 
     if args.set_file:
@@ -649,11 +675,16 @@ def main() -> None:
         if not set_path.exists():
             log.error("Set file not found: %s", set_path)
             sys.exit(1)
-        tasks = collect_tasks_from_set_file(
-            set_path, benchmarks_dir.parent, args.cwe,
-        )
-    else:
+        tasks = collect_tasks_from_set_file(set_path, args.cwe)
+    elif args.benchmarks:
+        benchmarks_dir = Path(args.benchmarks)
+        if not benchmarks_dir.exists():
+            log.error("Benchmarks directory not found: %s", benchmarks_dir)
+            sys.exit(1)
         tasks = collect_tasks(benchmarks_dir, args.cwe, args.variant)
+    else:
+        log.error("Either --benchmarks or --set-file is required")
+        sys.exit(1)
     log.info("Collected %d tasks", len(tasks))
 
     if args.limit > 0:
@@ -670,28 +701,25 @@ def main() -> None:
     summary_cache: SummaryCache = {}
 
     for idx, (yml_path, info) in enumerate(tasks):
-        i_file = info["i_file"]
-        i_path = benchmarks_dir / i_file
+        i_path = Path(info["source_path"])
         expected_safe: bool = info["expected_verdict"]
         subprop: str = info["subproperty"]
 
+        # Juliet variant detection (optional)
+        variant: str | None = None
         if "_bad" in yml_path.stem:
             variant = "bad"
         elif "_good" in yml_path.stem:
             variant = "good"
-        else:
-            log.warning("Cannot determine variant for %s", yml_path.name)
-            continue
 
         stem = yml_path.stem
-        cwe = stem.split("---")[0] if "---" in stem else stem.split("_")[0]
-        work_dir = func_scans / task_dir_name(stem)
+        work_dir = func_scans / yml_path.parent.name / stem
 
         result = TaskResult(
             yml_file=yml_path.name,
-            i_file=i_file,
-            cwe=cwe,
-            variant=variant,
+            i_file=info["i_file"],
+            cwe=stem.split("---")[0] if "---" in stem else stem.split("_")[0],
+            variant=variant or "",
             expected_safe=expected_safe,
             subproperty=subprop,
         )
