@@ -230,6 +230,9 @@ def phase_scan(
     )
     functions = extractor.extract_from_file(i_path)
     db.insert_functions_batch(functions)
+    typedefs = extractor.extract_typedefs_from_file(i_path)
+    if typedefs:
+        db.insert_typedefs_batch(typedefs)
     return len(functions)
 
 
