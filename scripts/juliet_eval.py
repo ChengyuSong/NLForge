@@ -248,6 +248,7 @@ def phase_callgraph(
     """Compile .i to .bc, run KAMain, import call graph. Returns edge count."""
     bc_path = work_dir / "input.bc"
     cg_json = work_dir / "callgraph.json"
+    vsnap_path = work_dir / "v-snapshot.vsnap"
 
     compile_cmd = [
         "clang-18", "-emit-llvm", "-c", "-Wno-everything",
@@ -262,6 +263,7 @@ def phase_callgraph(
     kamain_cmd = [
         kamain_bin, str(bc_path),
         "--callgraph-json", str(cg_json),
+        "--v-snapshot", str(vsnap_path),
         "--verbose", "0",
     ]
     result = subprocess.run(
@@ -289,6 +291,7 @@ def phase_summarize(
     log_llm: str | None,
     force: bool,
     reachable_ids: set[int] | None = None,
+    alias_builder: Any | None = None,
 ) -> int:
     """Run alloc/free/init/memsafe passes. Returns LLM call count."""
     llm = create_backend(backend, model=model)
@@ -311,7 +314,7 @@ def phase_summarize(
         AllocationPass(alloc_s, db, llm.model),
         FreePass(free_s, db, llm.model),
         InitPass(init_s, db, llm.model),
-        MemsafePass(memsafe_s, db, llm.model),
+        MemsafePass(memsafe_s, db, llm.model, alias_builder=alias_builder),
     ]
 
     driver = BottomUpDriver(db, verbose=verbose)
@@ -336,6 +339,7 @@ def phase_verify(
     force: bool,
     reachable_ids: set[int] | None = None,
     entry_functions: set[str] | None = None,
+    alias_builder: Any | None = None,
 ) -> int:
     """Run verification pass. Returns LLM call count."""
     llm = create_backend(backend, model=model)
@@ -346,7 +350,9 @@ def phase_verify(
         entry_functions=entry_functions,
     )
 
-    v_passes: list[SummaryPass] = [VerificationPass(verify_s, db, llm.model)]
+    v_passes: list[SummaryPass] = [
+        VerificationPass(verify_s, db, llm.model, alias_builder=alias_builder),
+    ]
 
     driver = BottomUpDriver(db, verbose=verbose)
     driver.run(v_passes, force=force, target_ids=reachable_ids)
@@ -505,6 +511,13 @@ def run_one_task(
             reachable_ids = driver.compute_reachable({main_id}, graph)
             log.debug("  Reachable from main: %d functions", len(reachable_ids))
 
+        # Load alias context from vsnapshot if available
+        alias_builder = None
+        vsnap_path = work_dir / "v-snapshot.vsnap"
+        if vsnap_path.exists():
+            from llm_summary.alias_context import AliasContextBuilder
+            alias_builder = AliasContextBuilder(str(vsnap_path), db)
+
         # Inject cached summaries before summarization
         if summary_cache and not force:
             n_cached = apply_summary_cache(db, summary_cache)
@@ -517,6 +530,7 @@ def run_one_task(
                 db, backend, model, verbose, log_llm,
                 force=force or from_phase <= 0,
                 reachable_ids=reachable_ids,
+                alias_builder=alias_builder,
             )
 
         # Phase 3: verify
@@ -526,6 +540,7 @@ def run_one_task(
                 force=force or from_phase <= 0,
                 reachable_ids=reachable_ids,
                 entry_functions={"main"} if main_funcs else None,
+                alias_builder=alias_builder,
             )
 
         if to_phase < 4:
