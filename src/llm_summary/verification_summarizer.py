@@ -86,7 +86,7 @@ File: {file_path}
 
 {own_contracts}
 
-## Callee Information
+{own_alloc_free_section}## Callee Information
 
 {callee_section}
 
@@ -101,7 +101,9 @@ Unchecked `may_be_null` return dereferenced → `null_deref`.
 Use after callee frees → `use_after_free`.
 Passing a non-heap pointer or non-base heap pointer to a callee that may free it → `invalid_free`.
 Integer issues: overflow, underflow, truncation, sign conversion errors → `integer_overflow`.
-Allocated memory becomes inaccessible without freeing → `memory_leak`.
+**Leak detection**: Match this function's allocations against its frees. \
+An allocation that is not freed internally, not returned, and not stored \
+to any caller-visible location before the function returns → `memory_leak`.
 
 **CRITICAL — contract-based reasoning**: A callee call is only a bug if it \
 violates the callee's stated PRE-conditions. If `PRE[callee(...)]: no \
@@ -608,6 +610,47 @@ class VerificationSummarizer:
         lines.append("```\n\n")
         return "\n".join(lines)
 
+    def _build_own_alloc_free_section(self, func: Function) -> str:
+        """Build a section showing this function's own allocations and frees."""
+        if func.id is None:
+            return ""
+        parts: list[str] = []
+
+        alloc_summary = self.db.get_summary_by_function_id(func.id)
+        if alloc_summary and alloc_summary.allocations:
+            parts.append("Allocations in this function:")
+            for a in alloc_summary.allocations:
+                desc = f"  - {a.source}"
+                if a.size_expr:
+                    desc += f"({a.size_expr})"
+                extras = []
+                if a.returned:
+                    extras.append("returned")
+                if a.stored_to:
+                    extras.append(f"stored to {a.stored_to}")
+                if a.may_be_null:
+                    extras.append("may be null")
+                if extras:
+                    desc += f" [{', '.join(extras)}]"
+                parts.append(desc)
+
+        free_summary = self.db.get_free_summary_by_function_id(func.id)
+        if free_summary and free_summary.frees:
+            parts.append("Frees in this function:")
+            for fr in free_summary.frees:
+                desc = f"  - {fr.deallocator}({fr.target})"
+                if fr.conditional:
+                    cond = fr.condition or "conditional"
+                    desc += f" [when {cond}]"
+                parts.append(desc)
+
+        if not parts:
+            return ""
+        return (
+            "## This Function's Allocations and Frees\n\n"
+            + "\n".join(parts) + "\n\n"
+        )
+
     def _build_prompt_and_system(
         self, source: str, func: Function, own_contracts: str,
         callee_section: str, alias_context: str | None,
@@ -619,6 +662,7 @@ class VerificationSummarizer:
         context tightly coupled in a single prompt.
         """
         type_defs_section = self._build_type_defs_section(source, func.file_path)
+        own_alloc_free_section = self._build_own_alloc_free_section(func)
         prompt = VERIFICATION_PROMPT.format(
             source=source,
             name=func.name,
@@ -626,6 +670,7 @@ class VerificationSummarizer:
             file_path=func.file_path,
             type_defs_section=type_defs_section,
             own_contracts=own_contracts,
+            own_alloc_free_section=own_alloc_free_section,
             callee_section=callee_section,
             alias_context=alias_context or "",
         )
