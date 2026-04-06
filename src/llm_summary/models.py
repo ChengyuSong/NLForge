@@ -466,6 +466,30 @@ class VerificationSummary:
 
 
 @dataclass
+class LeakSummary:
+    """Leak detection result for a function.
+
+    Carries simplified allocation/free summaries (unresolved after
+    internal matching) plus any ``memory_leak`` issues detected.
+    """
+
+    function_name: str
+    simplified_allocations: list[Allocation] = field(default_factory=list)
+    simplified_frees: list[FreeOp] = field(default_factory=list)
+    issues: list[SafetyIssue] = field(default_factory=list)
+    description: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "function": self.function_name,
+            "simplified_allocations": [a.to_dict() for a in self.simplified_allocations],
+            "simplified_frees": [f.to_dict() for f in self.simplified_frees],
+            "issues": [i.to_dict() for i in self.issues],
+            "description": self.description,
+        }
+
+
+@dataclass
 class ParameterInfo:
     """Information about a function parameter's role in allocation."""
 

@@ -26,6 +26,7 @@ from .models import (
     IndirectCallTarget,
     InitOp,
     InitSummary,
+    LeakSummary,
     MemsafeContract,
     MemsafeSummary,
     OutputRange,
@@ -100,6 +101,17 @@ CREATE TABLE IF NOT EXISTS memsafe_summaries (
 
 -- Verification summaries table (Pass 5)
 CREATE TABLE IF NOT EXISTS verification_summaries (
+    id INTEGER PRIMARY KEY,
+    function_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
+    summary_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    model_used TEXT,
+    UNIQUE(function_id)
+);
+
+-- Leak summaries table (leak detection pass)
+CREATE TABLE IF NOT EXISTS leak_summaries (
     id INTEGER PRIMARY KEY,
     function_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
     summary_json TEXT NOT NULL,
@@ -1144,6 +1156,84 @@ class SummaryDB:
             description=data.get("description", ""),
         )
 
+    # ========== Leak Summary Operations ==========
+
+    def upsert_leak_summary(
+        self, func: Function, summary: "LeakSummary", model_used: str = ""
+    ) -> None:
+        """Insert or update a leak summary."""
+        if func.id is None:
+            raise ValueError("Function must have an ID")
+
+        summary_json = json.dumps(summary.to_dict())
+        self.conn.execute(
+            """
+            INSERT INTO leak_summaries (function_id, summary_json, model_used)
+            VALUES (?, ?, ?)
+            ON CONFLICT(function_id) DO UPDATE SET
+                summary_json = excluded.summary_json,
+                updated_at = CURRENT_TIMESTAMP,
+                model_used = excluded.model_used
+            """,
+            (func.id, summary_json, model_used),
+        )
+        self.conn.commit()
+
+    def get_leak_summary_by_function_id(
+        self, func_id: int
+    ) -> "LeakSummary | None":
+        """Get leak summary for a function by ID."""
+        row = self.conn.execute(
+            "SELECT summary_json FROM leak_summaries WHERE function_id = ?",
+            (func_id,),
+        ).fetchone()
+        if row:
+            return self._json_to_leak_summary(row["summary_json"])
+        return None
+
+    def _json_to_leak_summary(self, json_str: str) -> "LeakSummary":
+        """Convert JSON string to LeakSummary."""
+        data = json.loads(json_str)
+        allocations = [
+            Allocation(
+                alloc_type=AllocationType(a.get("type", "heap")),
+                source=a.get("source", ""),
+                size_expr=a.get("size_expr"),
+                returned=a.get("returned", False),
+                stored_to=a.get("stored_to"),
+                may_be_null=a.get("may_be_null", True),
+            )
+            for a in data.get("simplified_allocations", [])
+        ]
+        frees = [
+            FreeOp(
+                target=f.get("target", ""),
+                target_kind=f.get("target_kind", "parameter"),
+                deallocator=f.get("deallocator", "free"),
+                conditional=f.get("conditional", False),
+                nulled_after=f.get("nulled_after", False),
+                condition=f.get("condition"),
+                description=f.get("description"),
+            )
+            for f in data.get("simplified_frees", [])
+        ]
+        issues = [
+            SafetyIssue(
+                location=i.get("location", ""),
+                issue_kind=i.get("issue_kind", "memory_leak"),
+                description=i.get("description", ""),
+                severity=i.get("severity", "medium"),
+            )
+            for i in data.get("issues", [])
+        ]
+        return LeakSummary(
+            function_name=data.get("function", ""),
+            simplified_allocations=allocations,
+            simplified_frees=frees,
+            issues=issues,
+            description=data.get("description", ""),
+        )
+
     # ========== Issue Review Operations ==========
 
     def upsert_issue_review(
@@ -1880,6 +1970,7 @@ class SummaryDB:
             "init_summaries",
             "memsafe_summaries",
             "verification_summaries",
+            "leak_summaries",
             "call_edges",
             "address_taken_functions",
             "address_flows",

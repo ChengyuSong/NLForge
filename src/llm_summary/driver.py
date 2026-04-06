@@ -15,6 +15,7 @@ from .models import (
     FreeSummary,
     Function,
     InitSummary,
+    LeakSummary,
     MemsafeSummary,
     VerificationSummary,
 )
@@ -75,6 +76,7 @@ PASS_TABLE_MAP: dict[str, str] = {
     "init": "init_summaries",
     "memsafe": "memsafe_summaries",
     "verify": "verification_summaries",
+    "leak": "leak_summaries",
 }
 
 
@@ -242,6 +244,34 @@ class VerificationPass:
 
     def store(self, func: Function, summary: VerificationSummary) -> None:
         self.db.upsert_verification_summary(func, summary, model_used=self.model)
+
+
+class LeakPass:
+    """Adapter that wraps LeakSummarizer as a SummaryPass."""
+
+    name = "leak"
+
+    def __init__(self, summarizer: Any, db: SummaryDB, model: str):
+        self.summarizer = summarizer
+        self.db = db
+        self.model = model
+
+    def get_cached(self, func_id: int, func: Function) -> LeakSummary | None:
+        return self.db.get_leak_summary_by_function_id(func_id)
+
+    def summarize(
+        self,
+        func: Function,
+        callee_summaries: dict[str, LeakSummary],
+        **kwargs: Any,
+    ) -> LeakSummary:
+        result: LeakSummary = self.summarizer.summarize_function(
+            func, callee_summaries,
+        )
+        return result
+
+    def store(self, func: Function, summary: LeakSummary) -> None:
+        self.db.upsert_leak_summary(func, summary, model_used=self.model)
 
 
 class BottomUpDriver:

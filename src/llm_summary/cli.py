@@ -19,6 +19,7 @@ from .driver import (
     BottomUpDriver,
     FreePass,
     InitPass,
+    LeakPass,
     MemsafePass,
     SummaryPass,
     VerificationPass,
@@ -115,7 +116,7 @@ def main():
 @click.option(
     "--type", "summary_types", multiple=True,
     type=click.Choice(
-        ["allocation", "free", "init", "memsafe", "verify"]
+        ["allocation", "free", "init", "memsafe", "verify", "leak"]
     ),
     help="Summary pass(es) to run (default: allocation). "
          "Can be specified multiple times.",
@@ -164,6 +165,7 @@ def summarize(
         --type init
         --type memsafe
         --type verify      (requires all four prior passes)
+        --type leak        (requires allocation + free passes)
         --type allocation --type free --type init --type memsafe  (run all)
 
     Example:
@@ -192,6 +194,20 @@ def summarize(
                 " Run call graph import first.[/red]"
             )
             sys.exit(1)
+
+        # Prerequisite check for leak pass
+        if "leak" in summary_types:
+            missing = []
+            for req in ["allocation_summaries", "free_summaries"]:
+                if stats.get(req, 0) == 0:
+                    missing.append(req.replace("_summaries", ""))
+            if missing:
+                console.print(
+                    f"[red]Error: --type leak requires allocation and free passes. "
+                    f"Missing: {', '.join(missing)}. "
+                    f"Run --type allocation --type free first.[/red]"
+                )
+                return
 
         # Prerequisite check for verify pass
         if "verify" in summary_types:
@@ -433,6 +449,16 @@ def summarize(
                 verification_summarizer, db, llm.model,
                 alias_builder=alias_builder,
             ))
+
+        leak_summarizer = None
+        if "leak" in summary_types:
+            from .leak_summarizer import LeakSummarizer
+
+            leak_summarizer = LeakSummarizer(
+                db, llm, verbose=verbose, log_file=log_llm,
+                entry_functions=set(entry_functions) if entry_functions else None,
+            )
+            passes.append(LeakPass(leak_summarizer, db, llm.model))
 
         pass_names = " + ".join(p.name for p in passes)
         console.print(f"\n[bold]Running passes: {pass_names}[/bold]")
@@ -4108,14 +4134,21 @@ def show_issues(
         for func in functions:
             assert func.id is not None
             vsummary = db.get_verification_summary_by_function_id(func.id)
-            if not vsummary or not vsummary.issues:
+            leak_summary = db.get_leak_summary_by_function_id(func.id)
+            # Merge leak issues into verification issues
+            all_issues: list = []
+            if vsummary and vsummary.issues:
+                all_issues.extend(vsummary.issues)
+            if leak_summary and leak_summary.issues:
+                all_issues.extend(leak_summary.issues)
+            if not all_issues:
                 continue
 
             # Build fingerprint->review lookup
-            fingerprints = [iss.fingerprint() for iss in vsummary.issues]
+            fingerprints = [iss.fingerprint() for iss in all_issues]
             reviews = db.get_issue_reviews_by_fingerprints(func.id, fingerprints)
 
-            for idx, issue in enumerate(vsummary.issues):
+            for idx, issue in enumerate(all_issues):
                 fp = issue.fingerprint()
                 review = reviews.get(fp)
                 issue_status = review["status"] if review else "pending"

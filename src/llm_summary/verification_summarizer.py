@@ -101,9 +101,6 @@ Unchecked `may_be_null` return dereferenced → `null_deref`.
 Use after callee frees → `use_after_free`.
 Passing a non-heap pointer or non-base heap pointer to a callee that may free it → `invalid_free`.
 Integer issues: overflow, underflow, truncation, sign conversion errors → `integer_overflow`.
-**Leak detection**: Match this function's allocations against its frees. \
-An allocation that is not freed internally, not returned, and not stored \
-to any caller-visible location before the function returns → `memory_leak`.
 
 **CRITICAL — contract-based reasoning**: A callee call is only a bug if it \
 violates the callee's stated PRE-conditions. If `PRE[callee(...)]: no \
@@ -144,7 +141,7 @@ Respond with JSON:
   "issues": [
     {{"location": "line N",
       "issue_kind":
-        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|memory_leak|integer_overflow|invalid_free",
+        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|integer_overflow|invalid_free",
       "description": "the problem", "severity": "high|medium|low",
       "callee": "if contract violation",
       "contract_kind": "if contract violation"}}
@@ -189,7 +186,7 @@ Respond in JSON:
     {{{{
       "location": "line N or description",
       "issue_kind":
-        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|memory_leak|integer_overflow|invalid_free",
+        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|integer_overflow|invalid_free",
       "description": "what the problem is",
       "severity": "high|medium|low"
     }}}}
@@ -206,7 +203,6 @@ _VALID_ISSUE_KINDS = {
     "use_after_free",
     "double_free",
     "uninitialized_use",
-    "memory_leak",
     "integer_overflow",
     "invalid_free",
 }
