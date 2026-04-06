@@ -67,11 +67,11 @@ DEFAULT_FUNC_SCANS = "func-scans/sv-benchmarks"
 # ── SV-COMP property -> our issue_kind mapping ─────────────────────────────
 SUBPROP_TO_KINDS: dict[str, set[str]] = {
     "valid-free": {"double_free", "use_after_free", "invalid_free"},
-    "valid-deref": {"null_deref", "buffer_overflow", "use_after_free"},
+    "valid-deref": {"null_deref", "buffer_overflow", "use_after_free", "uninitialized_use"},
     "valid-memtrack": {"memory_leak"},
     "valid-memsafety": {
         "double_free", "use_after_free", "invalid_free",
-        "null_deref", "buffer_overflow", "memory_leak",
+        "null_deref", "buffer_overflow", "memory_leak", "uninitialized_use",
     },
     "no-overflow": {"integer_overflow"},
 }
@@ -779,6 +779,15 @@ def main() -> None:
         "--filter", default=None,
         help="Only run tasks whose stem contains this substring",
     )
+    parser.add_argument(
+        "--rerun-from", default=None, metavar="RESULTS_JSON",
+        help="Rerun only tasks with a given classification from a previous "
+             "results JSON (use with --rerun-class)",
+    )
+    parser.add_argument(
+        "--rerun-class", default="FP",
+        help="Classification to rerun (default: FP). Used with --rerun-from",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument(
         "--llm-log-dir", default=None,
@@ -819,6 +828,22 @@ def main() -> None:
             (p, info) for p, info in tasks if args.filter in p.stem
         ]
         log.info("Filtered to %d tasks matching '%s'", len(tasks), args.filter)
+
+    if args.rerun_from:
+        with open(args.rerun_from) as _rf:
+            prev = json.load(_rf)
+        rerun_ymls = {
+            r["yml_file"]
+            for r in prev["results"]
+            if r["classification"] == args.rerun_class
+        }
+        tasks = [
+            (p, info) for p, info in tasks if p.name in rerun_ymls
+        ]
+        log.info(
+            "Rerunning %d %s tasks from %s",
+            len(tasks), args.rerun_class, args.rerun_from,
+        )
 
     if args.limit > 0:
         tasks = tasks[: args.limit]

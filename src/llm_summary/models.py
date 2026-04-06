@@ -144,11 +144,12 @@ class TargetType(str, Enum):
 
 
 class AllocationType(str, Enum):
-    """Type of memory allocation."""
+    """Type of memory allocation or pointer provenance."""
 
     HEAP = "heap"
     STACK = "stack"  # kept for backwards compat with existing DBs
-    STATIC = "static"  # kept for backwards compat with existing DBs
+    STATIC = "static"  # pointer to static or global variable
+    PARAMETER_DERIVED = "parameter_derived"  # returns parameter or &param->field
     ESCAPED_STACK = "escaped_stack"  # stack buffer that escapes — a bug
     UNKNOWN = "unknown"
 

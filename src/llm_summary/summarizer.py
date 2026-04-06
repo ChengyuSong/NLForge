@@ -23,20 +23,27 @@ from .models import (
 # or a generic "<function_name>" marker.
 
 _ALLOC_INSTRUCTIONS = """\
-1. **Allocations**: Any **heap** memory allocations (malloc, calloc, realloc, \
-mmap, new, etc.) or allocations via wrapper/helper functions that ultimately \
-call heap allocators.
-   - Type: "heap" for normal heap allocations. Use "escaped_stack" ONLY if a \
-stack-allocated buffer (local variable, VLA, alloca) escapes the function \
-(returned or stored to a caller-visible location) — this is a bug worth flagging.
-   - Source: The allocating function/operator
-   - Size expression: How size is computed. Trace local vars and args \
-passed to callees back to more persistent source (own parameter, struct \
-field, or global). If no persistent source exists, prefix with `local:`.
+1. **Allocations and returned pointers**: Report every pointer that is \
+**returned** or **stored to a caller-visible location**. This includes:
+   - **Heap allocations** (malloc, calloc, realloc, mmap, new, etc.) or \
+allocations via wrapper/helper functions that ultimately call heap allocators.
+   - **Non-heap returned pointers**: If the function returns a pointer to \
+a static variable, global variable, or a parameter (including pointer \
+arithmetic on these), report it so callers know the provenance.
+
+   Fields:
+   - Type: "heap" for heap allocations. \
+"static" if returning a pointer to a static or global variable. \
+"parameter_derived" if returning a parameter or a pointer derived from \
+a parameter (e.g., `return p;`, `return &p->field;`). \
+Use "escaped_stack" ONLY if a stack-allocated local escapes — this is a bug.
+   - Source: The allocating function/operator, or "static", "global", \
+"parameter" for non-heap pointers
+   - Size expression: How size is computed (heap only, null for non-heap)
    - Size parameters: Which function parameters affect size
-   - Returned: Is the allocation returned?
+   - Returned: Is the pointer returned?
    - Stored to: Is it stored to a field/global?
-   - May be null: Can allocation fail?
+   - May be null: Can it be null? (always false for static/global/parameter)
 
    **IMPORTANT**: Enumerate EVERY distinct allocation site individually. \
 Do NOT collapse multiple allocations into a single entry. Each call to \
@@ -44,8 +51,8 @@ malloc/calloc/realloc (direct or via wrapper) is a separate entry.
 
    **Do NOT report**: ordinary local variables, fixed-size stack arrays, \
 compound literals, static const tables, struct declarations on the stack, \
-or assembly push instructions. These are normal stack/static usage, not \
-allocations of interest.
+or assembly push instructions — UNLESS they are returned or stored to a \
+caller-visible location.
 
 2. **Parameters**: Role of each parameter
    - Role: size_indicator, buffer, count, pointer_out, etc.
@@ -102,8 +109,8 @@ Respond in JSON format:
   {cb},
   "allocations": [
     {ob}
-      "type": "heap",
-      "source": "allocator function name",
+      "type": "heap|static|parameter_derived|escaped_stack",
+      "source": "allocator or provenance",
       "size_expr": "size expression or null",
       "size_params": ["parameter names affecting size"],
       "returned": true|false,
@@ -122,7 +129,7 @@ Respond in JSON format:
 {cb}
 ```
 
-If the function does not allocate memory (directly or via callees), return:
+If the function does not allocate memory or return/store pointers, return:
 ```json
 {ob}
   "function": "{func_name}",

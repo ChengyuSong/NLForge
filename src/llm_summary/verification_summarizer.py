@@ -860,10 +860,13 @@ class VerificationSummarizer:
                         )
                         for a in allocs:
                             extras = []
+                            atype = a.alloc_type.value
+                            if atype != "heap":
+                                extras.append(f"type={atype}")
                             if a.may_be_null:
                                 extras.append("may_be_null")
                             else:
-                                extras.append("never_null")
+                                extras.append("not_null")
                             if a.returned:
                                 extras.append("returned")
                             if a.stored_to:
@@ -987,8 +990,10 @@ class VerificationSummarizer:
             # Post-conditions from Passes 1-3
             post_parts = []
 
-            # Pass 1: Allocations
+            # Pass 1: Allocations (includes non-heap pointer provenance)
             alloc_summary = self.db.get_summary_by_function_id(callee_id)
+            if alloc_summary and not alloc_summary.allocations:
+                post_parts.append("  No heap allocations")
             if alloc_summary and alloc_summary.allocations:
                 alloc_descs = []
                 for a in alloc_summary.allocations:
@@ -996,10 +1001,13 @@ class VerificationSummarizer:
                     if a.size_expr:
                         desc += f"({a.size_expr})"
                     extras = []
+                    atype = a.alloc_type.value
+                    if atype != "heap":
+                        extras.append(f"type={atype}")
                     if a.may_be_null:
                         extras.append("may_be_null")
                     else:
-                        extras.append("never_null")
+                        extras.append("not_null")
                     if a.returned:
                         extras.append("returned")
                     if a.stored_to:
