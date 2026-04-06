@@ -943,6 +943,7 @@ class SummaryDB:
                     conditional=conditional,
                     nulled_after=f.get("nulled_after", False),
                     condition=f.get("condition") if conditional else None,
+                    description=f.get("description"),
                 ))
             return ops
 

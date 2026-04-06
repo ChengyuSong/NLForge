@@ -522,6 +522,10 @@ def run_one_task(
             )
 
             for name, summary in get_all_stdlib_summaries().items():
+                # SV-COMP assumes allocators never fail
+                for alloc in summary.allocations:
+                    if alloc.may_be_null:
+                        alloc.may_be_null = False
                 funcs = db.get_function_by_name(name)
                 if funcs:
                     f = funcs[0]

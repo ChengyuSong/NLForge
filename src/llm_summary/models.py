@@ -259,6 +259,7 @@ class FreeOp:
     conditional: bool  # True if free is inside an if/error path
     nulled_after: bool  # True if pointer is set to NULL after free
     condition: str | None = None  # condition expression, e.g. "do_close != 0"
+    description: str | None = None  # e.g. "frees all nodes reachable via ->next"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -270,6 +271,8 @@ class FreeOp:
         }
         if self.condition:
             d["condition"] = self.condition
+        if self.description:
+            d["description"] = self.description
         return d
 
 

@@ -635,6 +635,8 @@ class AllocationSummarizer:
                     s = f"{a.source}({a.size_expr or 'unknown size'})"
                     if a.stored_to:
                         s += f" → {a.stored_to}"
+                    if not a.may_be_null:
+                        s += " [never null]"
                     parts.append(s)
                 alloc_desc = ", ".join(parts)
                 lines.append(f"- `{name}`: Allocates via {alloc_desc}{attr_suffix}")

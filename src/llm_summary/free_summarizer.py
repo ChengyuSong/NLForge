@@ -46,6 +46,9 @@ and/or return value. The caller cannot see internal locals or callee results. \
 Over-approximation is fine: soundness matters more than precision. \
 Omit if conditional is false.
 6. **nulled_after**: true if the pointer is set to NULL after the free
+7. **description**: For loop-based or transitive frees, describe what is \
+freed (e.g., "frees all elements in a linked list", \
+"frees all entries in a hash table"). Omit for simple single-pointer frees.
 
 **Caller-visible abstraction**: Only report frees at the abstraction level of \
 THIS function's code. If this function calls `cleanup(ctx)` and the callee \
@@ -95,7 +98,8 @@ Respond in JSON format:
       "deallocator": "free function name",
       "conditional": true|false,
       "condition": "guard expression (omit if unconditional)",
-      "nulled_after": true|false
+      "nulled_after": true|false,
+      "description": "for loop/transitive frees only (omit for simple frees)"
     {cb}
   ],
   "resource_releases": [
@@ -227,6 +231,7 @@ _FREE_ITEM = {
         "conditional": {"type": "boolean"},
         "condition": {"type": "string"},
         "nulled_after": {"type": "boolean"},
+        "description": {"type": "string"},
     },
     "required": ["target", "target_kind", "deallocator"],
 }
@@ -395,6 +400,7 @@ class FreeSummarizer:
                     conditional=cond,
                     nulled_after=f.get("nulled_after", False),
                     condition=f.get("condition") if cond else None,
+                    description=f.get("description"),
                 ))
             for f in data.get("resource_releases", []):
                 cond = f.get("conditional", False)
@@ -405,6 +411,7 @@ class FreeSummarizer:
                     conditional=cond,
                     nulled_after=f.get("nulled_after", False),
                     condition=f.get("condition") if cond else None,
+                    description=f.get("description"),
                 ))
 
         for i, block in enumerate(blocks):
@@ -556,6 +563,8 @@ class FreeSummarizer:
                     extras.append("nulled_after")
                 if extras:
                     part += f" [{', '.join(extras)}]"
+                if f.description:
+                    part += f" — {f.description}"
                 parts.append(part)
             return ", ".join(parts)
 
@@ -630,6 +639,7 @@ class FreeSummarizer:
                         conditional=conditional,
                         nulled_after=f.get("nulled_after", False),
                         condition=condition,
+                        description=f.get("description"),
                     )
                 )
             return ops

@@ -1037,6 +1037,8 @@ class VerificationSummarizer:
                             extras.append("nulled_after")
                         if extras:
                             desc += f" [{', '.join(extras)}]"
+                        if f.description:
+                            desc += f" — {f.description}"
                         descs.append(desc)
                     return descs
                 if free_summary.frees:
