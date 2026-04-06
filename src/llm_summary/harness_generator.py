@@ -794,6 +794,17 @@ class HarnessGenerator:
                                 seen.add(fp)
                                 source_files.append(fp)
 
+            # Add shim callees defined in compiled source files to scope
+            # so ko-clang emits their .taint symbols (needed for function
+            # pointer tables in .data.rel.ro).
+            if scope_fns is not None and source_files and shim_callees:
+                src_set = set(source_files)
+                for sc in shim_callees:
+                    sc_funcs = self.db.get_function_by_name(sc)
+                    if sc_funcs and sc_funcs[0].file_path in src_set:
+                        if sc not in scope_fns:
+                            scope_fns.append(sc)
+
             # Compile-and-fix loop (ko-clang handles instrumentation)
             if self.ko_clang_path:
                 ucsan_config = self._build_ucsan_config(
