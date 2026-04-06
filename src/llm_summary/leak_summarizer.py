@@ -80,6 +80,11 @@ Match allocations against frees. For each heap allocation:
 - If returned or stored to caller-visible location → add to `simplified_allocations`
 - If neither freed, returned, nor stored → report as a leak
 
+**Callee propagation**: If a callee has "unfreed allocations (caller must \
+handle)", those allocations are now THIS function's responsibility. Match \
+them against this function's frees. If still unresolved, propagate them \
+as `simplified_allocations` or report as leaks.
+
 {entry_note}
 
 Respond in JSON:
@@ -228,8 +233,16 @@ class LeakSummarizer:
         alloc_summary = self.db.get_summary_by_function_id(func.id)
         free_summary = self.db.get_free_summary_by_function_id(func.id)
 
-        # Quick exit: no allocations -> no leaks possible
-        if not alloc_summary or not alloc_summary.allocations:
+        # Check if any callee has unresolved allocations
+        has_callee_allocs = False
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if cs.simplified_allocations:
+                    has_callee_allocs = True
+                    break
+
+        # Quick exit: no own allocations AND no callee unresolved allocations
+        if (not alloc_summary or not alloc_summary.allocations) and not has_callee_allocs:
             with self._stats_lock:
                 self._stats["functions_processed"] += 1
             # Still propagate frees of caller-provided pointers
@@ -318,18 +331,30 @@ class LeakSummarizer:
         if func.id is None:
             return "No callee information available."
 
-        callee_ids = self.db.get_callees(func.id)
-        if not callee_ids:
+        # Query call edges with is_indirect flag
+        edge_rows = self.db.conn.execute(
+            "SELECT DISTINCT callee_id, is_indirect "
+            "FROM call_edges WHERE caller_id = ?",
+            (func.id,),
+        ).fetchall()
+        if not edge_rows:
             return "No callees (leaf function)."
 
         lines = []
-        for callee_id in callee_ids:
+        for row in edge_rows:
+            callee_id: int = row["callee_id"]
+            is_indirect: bool = bool(row["is_indirect"])
             callee_func = self.db.get_function(callee_id)
             if callee_func is None:
                 continue
 
             callee_name = callee_func.name
             parts = []
+
+            # Mark indirect call targets so the model can connect
+            # function pointer expressions in source to resolved callees
+            if is_indirect:
+                parts.append("(resolved indirect call target)")
 
             # Show noreturn attribute — critical for leak analysis
             if callee_func.attributes and "noreturn" in callee_func.attributes:
@@ -398,7 +423,7 @@ class LeakSummarizer:
         return "\n".join(lines)
 
     def _format_alloc_summary(self, summary: Any) -> str:
-        if not summary.allocations:
+        if not summary or not summary.allocations:
             return "No allocations."
         lines = []
         for a in summary.allocations:
