@@ -51,10 +51,10 @@ def _issues_fingerprint(db_path: Path, func_name: str, severity: str | None = No
     import hashlib
     db = SummaryDB(str(db_path))
     try:
-        funcs = db.get_function_by_name(func_name)
-        if not funcs or funcs[0].id is None:
+        func_id = db.get_function_id_by_name(func_name)
+        if func_id is None:
             return "none"
-        vs = db.get_verification_summary_by_function_id(funcs[0].id)
+        vs = db.get_verification_summary_by_function_id(func_id)
         if not vs or not vs.issues:
             return "none"
         issues = vs.issues
@@ -120,16 +120,15 @@ def _find_issues(
     db = SummaryDB(str(db_path))
     results: list[tuple[str, int]] = []
     try:
-        for func in db.get_all_functions():
-            assert func.id is not None
-            vs = db.get_verification_summary_by_function_id(func.id)
+        for func_id, func_name in db.get_all_function_ids():
+            vs = db.get_verification_summary_by_function_id(func_id)
             if not vs or not vs.issues:
                 continue
             issues = vs.issues
             if severity:
                 issues = [i for i in issues if i.severity == severity]
             if not include_reviewed and issues:
-                reviews = db.get_issue_reviews(func.id)
+                reviews = db.get_issue_reviews(func_id)
                 reviewed_fps = {
                     r["issue_fingerprint"]
                     for r in reviews
@@ -141,7 +140,7 @@ def _find_issues(
                         if i.fingerprint() not in reviewed_fps
                     ]
             if issues:
-                results.append((func.name, len(issues)))
+                results.append((func_name, len(issues)))
     finally:
         db.close()
     return results
@@ -474,10 +473,9 @@ def process_target(
         if not args.force:
             db = SummaryDB(str(db_path))
             try:
-                funcs = db.get_function_by_name(func_name)
-                if funcs:
-                    assert funcs[0].id is not None
-                    for r in db.get_issue_reviews(funcs[0].id):
+                fid = db.get_function_id_by_name(func_name)
+                if fid is not None:
+                    for r in db.get_issue_reviews(fid):
                         if r["status"] != "pending":
                             reviewed_fps[r["issue_fingerprint"]] = r["status"]
             finally:
@@ -665,10 +663,9 @@ def process_target(
                         # marked other issues for the same function
                         db = SummaryDB(str(db_path))
                         try:
-                            funcs = db.get_function_by_name(func_name)
-                            if funcs:
-                                assert funcs[0].id is not None
-                                for r in db.get_issue_reviews(funcs[0].id):
+                            fid = db.get_function_id_by_name(func_name)
+                            if fid is not None:
+                                for r in db.get_issue_reviews(fid):
                                     if r["status"] != "pending":
                                         reviewed_fps[r["issue_fingerprint"]] = r["status"]
                         finally:

@@ -484,6 +484,20 @@ class SummaryDB:
         rows = self.conn.execute("SELECT * FROM functions").fetchall()
         return [self._row_to_function(row) for row in rows]
 
+    def get_all_function_ids(self) -> list[tuple[int, str]]:
+        """Get (id, name) for all functions — no source columns loaded."""
+        rows = self.conn.execute(
+            "SELECT id, name FROM functions",
+        ).fetchall()
+        return [(row["id"], row["name"]) for row in rows]
+
+    def get_function_id_by_name(self, name: str) -> int | None:
+        """Get function ID by name — no source columns loaded."""
+        row = self.conn.execute(
+            "SELECT id FROM functions WHERE name = ? LIMIT 1", (name,),
+        ).fetchone()
+        return row["id"] if row else None
+
     def _row_to_function(self, row: sqlite3.Row) -> Function:
         """Convert a database row to a Function object."""
         import json as _json
