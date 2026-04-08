@@ -47,6 +47,7 @@ from llm_summary.driver import (
     BottomUpDriver,
     FreePass,
     InitPass,
+    IntegerOverflowPass,
     LeakPass,
     MemsafePass,
     SummaryPass,
@@ -55,6 +56,7 @@ from llm_summary.driver import (
 from llm_summary.extractor import FunctionExtractor
 from llm_summary.free_summarizer import FreeSummarizer
 from llm_summary.init_summarizer import InitSummarizer
+from llm_summary.integer_overflow_summarizer import IntegerOverflowSummarizer
 from llm_summary.leak_summarizer import LeakSummarizer
 from llm_summary.llm import create_backend
 from llm_summary.memsafe_summarizer import MemsafeSummarizer
@@ -69,7 +71,7 @@ _TOKEN_KEYS = ("llm_calls", "input_tokens", "output_tokens")
 
 def _merge_stats(*summarizers: Any) -> dict[str, int]:
     """Sum token-tracking keys across multiple summarizers."""
-    merged: dict[str, int] = {k: 0 for k in _TOKEN_KEYS}
+    merged: dict[str, int] = dict.fromkeys(_TOKEN_KEYS, 0)
     for s in summarizers:
         st = s.stats
         for k in _TOKEN_KEYS:
@@ -88,7 +90,7 @@ SUBPROP_TO_KINDS: dict[str, set[str]] = {
         "double_free", "use_after_free", "invalid_free",
         "null_deref", "buffer_overflow", "memory_leak", "uninitialized_use",
     },
-    "no-overflow": {"integer_overflow"},
+    "no-overflow": {"integer_overflow", "division_by_zero", "shift_ub"},
 }
 
 # Boilerplate functions shared across all Juliet .i files (identical source)
@@ -309,8 +311,8 @@ def phase_summarize(
     force: bool,
     reachable_ids: set[int] | None = None,
     alias_builder: Any | None = None,
-) -> int:
-    """Run alloc/free/init/memsafe passes. Returns LLM call count."""
+) -> dict[str, int]:
+    """Run alloc/free/init/memsafe passes. Returns token stats."""
     llm = create_backend(backend, model=model)
     cache_mode = "source" if backend == "claude" else "none"
 
@@ -351,8 +353,8 @@ def phase_leak(
     force: bool,
     reachable_ids: set[int] | None = None,
     entry_functions: set[str] | None = None,
-) -> int:
-    """Run leak detection pass. Returns LLM call count."""
+) -> dict[str, int]:
+    """Run leak detection pass. Returns token stats."""
     llm = create_backend(backend, model=model)
 
     leak_s = LeakSummarizer(
@@ -370,6 +372,34 @@ def phase_leak(
     return _merge_stats(leak_s)
 
 
+# ── Phase 2.6: integer overflow detection ───────────────────────────────────
+
+def phase_overflow(
+    db: SummaryDB,
+    backend: str,
+    model: str | None,
+    verbose: bool,
+    log_llm: str | None,
+    force: bool,
+    reachable_ids: set[int] | None = None,
+) -> dict[str, int]:
+    """Run integer overflow detection pass. Returns token stats."""
+    llm = create_backend(backend, model=model)
+
+    ovf_s = IntegerOverflowSummarizer(
+        db, llm, verbose=verbose, log_file=log_llm,
+    )
+
+    o_passes: list[SummaryPass] = [
+        IntegerOverflowPass(ovf_s, db, llm.model),
+    ]
+
+    driver = BottomUpDriver(db, verbose=verbose)
+    driver.run(o_passes, force=force, target_ids=reachable_ids)
+
+    return _merge_stats(ovf_s)
+
+
 # ── Phase 3: verify ─────────────────────────────────────────────────────────
 
 def phase_verify(
@@ -382,8 +412,8 @@ def phase_verify(
     reachable_ids: set[int] | None = None,
     entry_functions: set[str] | None = None,
     alias_builder: Any | None = None,
-) -> int:
-    """Run verification pass. Returns LLM call count."""
+) -> dict[str, int]:
+    """Run verification pass. Returns token stats."""
     llm = create_backend(backend, model=model)
     cache_mode = "source" if backend == "claude" else "none"
 
@@ -421,6 +451,10 @@ def _collect_issues(
             if lsm and lsm.issues:
                 for issue in lsm.issues:
                     issues.append(issue.to_dict())
+            osm = db.get_integer_overflow_summary_by_function_id(f.id)
+            if osm and osm.issues:
+                for issue in osm.issues:
+                    issues.append(issue.to_dict())
     return issues
 
 
@@ -454,6 +488,7 @@ SUMMARY_TABLES = [
     "memsafe_summaries",
     "verification_summaries",
     "leak_summaries",
+    "integer_overflow_summaries",
 ]
 
 # Key: (func_name, source_hash) → {table_name: summary_json}
@@ -532,7 +567,7 @@ def run_one_task(
     work_dir.mkdir(parents=True, exist_ok=True)
     db_path = work_dir / "functions.db"
     db = SummaryDB(str(db_path))
-    total_stats: dict[str, int] = {k: 0 for k in _TOKEN_KEYS}
+    total_stats: dict[str, int] = dict.fromkeys(_TOKEN_KEYS, 0)
 
     def _add_stats(phase_stats: dict[str, int]) -> None:
         for k in _TOKEN_KEYS:
@@ -690,13 +725,18 @@ def run_one_task(
                 alias_builder=alias_builder,
             ))
 
-        # Phase 3: leak + verify
+        # Phase 3: leak + overflow + verify
         if from_phase <= 3 and to_phase >= 3:
             _add_stats(phase_leak(
                 db, backend, model, verbose, log_llm,
                 force=force,
                 reachable_ids=reachable_ids,
                 entry_functions={"main"} if main_funcs else None,
+            ))
+            _add_stats(phase_overflow(
+                db, backend, model, verbose, log_llm,
+                force=force,
+                reachable_ids=reachable_ids,
             ))
             _add_stats(phase_verify(
                 db, backend, model, verbose, log_llm,

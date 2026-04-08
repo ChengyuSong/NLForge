@@ -100,7 +100,6 @@ An `allow_null` callee parameter accepts NULL safely — not a bug.
 Unchecked `may_be_null` return dereferenced → `null_deref`.
 Use after callee frees → `use_after_free`.
 Passing a non-heap pointer or non-base heap pointer to a callee that may free it → `invalid_free`.
-Integer issues: overflow, underflow, truncation, sign conversion errors → `integer_overflow`.
 Reading a variable/field value (in branch, index, arithmetic, or as source operand) \
 before it is written → `uninitialized_use`. Write-only dereference like \
 `p->field = val` is NOT uninitialized use — it only requires `p` to be non-null.
@@ -112,7 +111,6 @@ is safe — the callee's summary guarantees it does not use the pointer \
 unsafely. Do NOT override this with general knowledge. Trust the contracts.
 
 Pay special attention to these commonly missed patterns:
-- **Integer overflow in size calculations**: narrow integer in multiplication for allocation/VLA
 - **Off-by-one in bounds checks**: loop bounds, size comparisons, fence-post errors
 - **Struct field overflow**: write length exceeds field's declared size — check type defs
 - **Wrong size variable**: total vs remaining length, container vs payload size
@@ -146,7 +144,7 @@ Respond with JSON:
   "issues": [
     {{"location": "line N",
       "issue_kind":
-        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|integer_overflow|invalid_free",
+        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|invalid_free",
       "description": "the problem", "severity": "high|medium|low",
       "callee": "if contract violation",
       "contract_kind": "if contract violation"}}
@@ -191,7 +189,7 @@ Respond in JSON:
     {{{{
       "location": "line N or description",
       "issue_kind":
-        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|integer_overflow|invalid_free",
+        "null_deref|buffer_overflow|use_after_free|double_free|uninitialized_use|invalid_free",
       "description": "what the problem is",
       "severity": "high|medium|low"
     }}}}
@@ -208,7 +206,6 @@ _VALID_ISSUE_KINDS = {
     "use_after_free",
     "double_free",
     "uninitialized_use",
-    "integer_overflow",
     "invalid_free",
 }
 _VALID_SEVERITIES = {"high", "medium", "low"}
@@ -318,6 +315,9 @@ class VerificationSummarizer(BaseSummarizer):
 
         annotated_source = self._annotate_source(
             func, callee_summaries, callee_params,
+        )
+        annotated_source = self._inject_overflow_warnings(
+            func, annotated_source,
         )
 
         prompt, system, cache_system = self._build_prompt_and_system(
@@ -931,6 +931,44 @@ class VerificationSummarizer(BaseSummarizer):
             result.extend(post_lines)
 
         return "\n".join(result)
+
+    def _inject_overflow_warnings(
+        self,
+        func: Function,
+        annotated_source: str,
+    ) -> str:
+        """Inject ``/* INT OVERFLOW: ... */`` comments from the overflow pass.
+
+        If the integer-overflow pass found issues in this function, insert
+        warning comments so the memory-safety verifier can account for
+        potentially-bogus values in size/index expressions.
+        """
+        if func.id is None:
+            return annotated_source
+
+        ovf = self.db.get_integer_overflow_summary_by_function_id(func.id)
+        if not ovf or not ovf.issues:
+            return annotated_source
+
+        # Build warning block
+        warnings = []
+        for issue in ovf.issues:
+            loc = issue.location
+            desc = issue.description
+            warnings.append(f"/* INT OVERFLOW ({loc}): {desc} */")
+
+        # Insert after the opening brace of the function body
+        lines = annotated_source.splitlines()
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            if "{" in line:
+                insert_idx = i + 1
+                break
+
+        indent = "  "
+        warning_lines = [f"{indent}{w}" for w in warnings]
+        lines[insert_idx:insert_idx] = warning_lines
+        return "\n".join(lines)
 
     def _build_callee_section(
         self,

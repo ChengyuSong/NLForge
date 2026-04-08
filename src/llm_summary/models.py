@@ -490,6 +490,55 @@ class LeakSummary:
 
 
 @dataclass
+class IntegerConstraint:
+    """Pre-condition on a parameter's integer range.
+
+    Represents what callers must guarantee to avoid integer UB inside
+    this function.
+    """
+
+    target: str  # "n", "len", "param->field"
+    range: str  # "[0, INT_MAX/2]", "> 0", "!= -1"
+    description: str  # "required to avoid overflow in n * 2"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "range": self.range,
+            "description": self.description,
+        }
+
+
+@dataclass
+class IntegerOverflowSummary:
+    """Integer UB analysis result for a function.
+
+    Compositional summary:
+    - **constraints** (pre-conditions): what callers must ensure about
+      parameter ranges to avoid integer UB inside this function.
+    - **output_ranges** (post-conditions): value ranges this function
+      guarantees for return values and out-parameters (including
+      full-range when no narrowing occurs).
+    - **issues**: integer UB bugs found in this function.
+    """
+
+    function_name: str
+    constraints: list[IntegerConstraint] = field(default_factory=list)
+    output_ranges: list[OutputRange] = field(default_factory=list)
+    issues: list[SafetyIssue] = field(default_factory=list)
+    description: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "function": self.function_name,
+            "constraints": [c.to_dict() for c in self.constraints],
+            "output_ranges": [o.to_dict() for o in self.output_ranges],
+            "issues": [i.to_dict() for i in self.issues],
+            "description": self.description,
+        }
+
+
+@dataclass
 class ParameterInfo:
     """Information about a function parameter's role in allocation."""
 

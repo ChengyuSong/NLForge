@@ -26,6 +26,8 @@ from .models import (
     IndirectCallTarget,
     InitOp,
     InitSummary,
+    IntegerConstraint,
+    IntegerOverflowSummary,
     LeakSummary,
     MemsafeContract,
     MemsafeSummary,
@@ -112,6 +114,17 @@ CREATE TABLE IF NOT EXISTS verification_summaries (
 
 -- Leak summaries table (leak detection pass)
 CREATE TABLE IF NOT EXISTS leak_summaries (
+    id INTEGER PRIMARY KEY,
+    function_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
+    summary_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    model_used TEXT,
+    UNIQUE(function_id)
+);
+
+-- Integer overflow summaries table (integer overflow detection pass)
+CREATE TABLE IF NOT EXISTS integer_overflow_summaries (
     id INTEGER PRIMARY KEY,
     function_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
     summary_json TEXT NOT NULL,
@@ -1244,6 +1257,84 @@ class SummaryDB:
             function_name=data.get("function", ""),
             simplified_allocations=allocations,
             simplified_frees=frees,
+            issues=issues,
+            description=data.get("description", ""),
+        )
+
+    # ========== Integer Overflow Summary Operations ==========
+
+    def upsert_integer_overflow_summary(
+        self,
+        func: "Function",
+        summary: "IntegerOverflowSummary",
+        model_used: str = "",
+    ) -> None:
+        """Insert or update an integer overflow summary."""
+        if func.id is None:
+            raise ValueError("Function must have an ID")
+
+        summary_json = json.dumps(summary.to_dict())
+        self.conn.execute(
+            """
+            INSERT INTO integer_overflow_summaries
+                (function_id, summary_json, model_used)
+            VALUES (?, ?, ?)
+            ON CONFLICT(function_id) DO UPDATE SET
+                summary_json = excluded.summary_json,
+                updated_at = CURRENT_TIMESTAMP,
+                model_used = excluded.model_used
+            """,
+            (func.id, summary_json, model_used),
+        )
+        self.conn.commit()
+
+    def get_integer_overflow_summary_by_function_id(
+        self, func_id: int
+    ) -> "IntegerOverflowSummary | None":
+        """Get integer overflow summary for a function by ID."""
+        row = self.conn.execute(
+            "SELECT summary_json FROM integer_overflow_summaries "
+            "WHERE function_id = ?",
+            (func_id,),
+        ).fetchone()
+        if row:
+            return self._json_to_integer_overflow_summary(row["summary_json"])
+        return None
+
+    def _json_to_integer_overflow_summary(
+        self, json_str: str
+    ) -> "IntegerOverflowSummary":
+        """Convert JSON string to IntegerOverflowSummary."""
+        data = json.loads(json_str)
+        constraints = [
+            IntegerConstraint(
+                target=c.get("target", ""),
+                range=c.get("range", ""),
+                description=c.get("description", ""),
+            )
+            for c in data.get("constraints", [])
+        ]
+        output_ranges = [
+            OutputRange(
+                target=o.get("target", ""),
+                range=o.get("range", ""),
+                description=o.get("description", ""),
+            )
+            for o in data.get("output_ranges", [])
+        ]
+        issues = [
+            SafetyIssue(
+                location=i.get("location", ""),
+                issue_kind=i.get("issue_kind", "integer_overflow"),
+                description=i.get("description", ""),
+                severity=i.get("severity", "medium"),
+            )
+            for i in data.get("issues", [])
+        ]
+        return IntegerOverflowSummary(
+            function_name=data.get("function", ""),
+            constraints=constraints,
+            output_ranges=output_ranges,
             issues=issues,
             description=data.get("description", ""),
         )

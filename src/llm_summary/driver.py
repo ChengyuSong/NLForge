@@ -15,6 +15,7 @@ from .models import (
     FreeSummary,
     Function,
     InitSummary,
+    IntegerOverflowSummary,
     LeakSummary,
     MemsafeSummary,
     VerificationSummary,
@@ -77,6 +78,7 @@ PASS_TABLE_MAP: dict[str, str] = {
     "memsafe": "memsafe_summaries",
     "verify": "verification_summaries",
     "leak": "leak_summaries",
+    "overflow": "integer_overflow_summaries",
 }
 
 
@@ -272,6 +274,40 @@ class LeakPass:
 
     def store(self, func: Function, summary: LeakSummary) -> None:
         self.db.upsert_leak_summary(func, summary, model_used=self.model)
+
+
+class IntegerOverflowPass:
+    """Adapter that wraps IntegerOverflowSummarizer as a SummaryPass."""
+
+    name = "overflow"
+
+    def __init__(self, summarizer: Any, db: SummaryDB, model: str):
+        self.summarizer = summarizer
+        self.db = db
+        self.model = model
+
+    def get_cached(
+        self, func_id: int, func: Function,
+    ) -> IntegerOverflowSummary | None:
+        return self.db.get_integer_overflow_summary_by_function_id(func_id)
+
+    def summarize(
+        self,
+        func: Function,
+        callee_summaries: dict[str, IntegerOverflowSummary],
+        **kwargs: Any,
+    ) -> IntegerOverflowSummary:
+        result: IntegerOverflowSummary = self.summarizer.summarize_function(
+            func, callee_summaries,
+        )
+        return result
+
+    def store(
+        self, func: Function, summary: IntegerOverflowSummary,
+    ) -> None:
+        self.db.upsert_integer_overflow_summary(
+            func, summary, model_used=self.model,
+        )
 
 
 class BottomUpDriver:
