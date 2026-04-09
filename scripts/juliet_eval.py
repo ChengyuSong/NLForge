@@ -58,7 +58,7 @@ from llm_summary.free_summarizer import FreeSummarizer
 from llm_summary.init_summarizer import InitSummarizer
 from llm_summary.integer_overflow_summarizer import IntegerOverflowSummarizer
 from llm_summary.leak_summarizer import LeakSummarizer
-from llm_summary.llm import LLMBackend, create_backend
+from llm_summary.llm import LLMBackend, build_backend_kwargs, create_backend
 from llm_summary.memsafe_summarizer import MemsafeSummarizer
 from llm_summary.summarizer import AllocationSummarizer
 from llm_summary.verification_summarizer import VerificationSummarizer
@@ -554,6 +554,8 @@ def run_one_task(
     force: bool = False,
     summary_cache: SummaryCache | None = None,
     disable_thinking: bool = False,
+    llm_host: str = "localhost",
+    llm_port: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Run pipeline phases on one .i file using persistent work_dir.
 
@@ -565,9 +567,10 @@ def run_one_task(
     total_stats: dict[str, int] = dict.fromkeys(_TOKEN_KEYS, 0)
 
     # Create one backend instance for all phases
-    backend_kwargs: dict[str, Any] = {}
-    if disable_thinking:
-        backend_kwargs["enable_thinking"] = False
+    backend_kwargs = build_backend_kwargs(
+        backend, llm_host=llm_host, llm_port=llm_port,
+        disable_thinking=disable_thinking,
+    )
     llm = create_backend(backend, model=model, **backend_kwargs)
     cache_mode = "source" if backend == "claude" else "none"
 
@@ -848,6 +851,8 @@ def main() -> None:
     )
     parser.add_argument("--backend", default="claude", help="LLM backend")
     parser.add_argument("--model", default=None, help="Model override")
+    parser.add_argument("--llm-host", default="localhost", help="LLM server host")
+    parser.add_argument("--llm-port", type=int, default=None, help="LLM server port")
     parser.add_argument(
         "--output", "-o", default="juliet_eval_results.json",
         help="Output JSON file",
@@ -1014,6 +1019,8 @@ def main() -> None:
                 force=args.force,
                 summary_cache=summary_cache,
                 disable_thinking=args.disable_thinking,
+                llm_host=args.llm_host,
+                llm_port=args.llm_port,
             )
             result.elapsed_s = time.time() - t0
             result.llm_calls = task_stats["llm_calls"]
