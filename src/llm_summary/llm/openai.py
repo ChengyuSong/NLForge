@@ -30,6 +30,26 @@ class OpenAIBackend(LLMBackend):
         return "gpt-4o"
 
     @property
+    def _uses_responses_api(self) -> bool:
+        """Codex models are exposed only via the Responses API."""
+        return "codex" in (self.model or "").lower()
+
+    @property
+    def _max_tokens_param(self) -> str:
+        """gpt-5 and newer models require ``max_completion_tokens``."""
+        name = (self.model or "").lower()
+        if name.startswith("gpt-5") or name.startswith("o1") or name.startswith("o3"):
+            return "max_completion_tokens"
+        return "max_tokens"
+
+    @property
+    def _is_openai_endpoint(self) -> bool:
+        """True when base_url is unset or points at api.openai.com."""
+        if not self.base_url:
+            return True
+        return "api.openai.com" in self.base_url
+
+    @property
     def client(self):
         if self._client is None:
             try:
@@ -66,6 +86,9 @@ class OpenAIBackend(LLMBackend):
         response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
+        if self._uses_responses_api:
+            return self._complete_responses(prompt, system, response_format)
+
         messages: list[dict[str, str]] = []
 
         if system:
@@ -76,7 +99,7 @@ class OpenAIBackend(LLMBackend):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
+            self._max_tokens_param: self.max_tokens,
         }
         if response_format:
             kwargs["response_format"] = response_format
@@ -112,6 +135,54 @@ class OpenAIBackend(LLMBackend):
             cached=False,
         )
 
+    def _complete_responses(
+        self,
+        prompt: str,
+        system: str | None,
+        response_format: dict | None,
+    ) -> LLMResponse:
+        """Single-turn completion via the Responses API (for codex models)."""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "input": prompt,
+            "max_output_tokens": self.max_tokens,
+        }
+        if system:
+            kwargs["instructions"] = system
+        if response_format:
+            kwargs["text"] = {
+                "format": _to_responses_text_format(
+                    response_format, strict_schema=not self._is_openai_endpoint,
+                )
+            }
+
+        response = self.client.responses.create(**kwargs)
+
+        content = getattr(response, "output_text", "") or ""
+
+        if getattr(response, "status", None) == "incomplete":
+            reason = getattr(response, "incomplete_details", None)
+            print(
+                f"WARNING: OpenAI Responses output may be incomplete "
+                f"(reason={reason}). Consider increasing max_tokens "
+                f"(current: {self.max_tokens}).",
+                file=sys.stderr,
+            )
+
+        input_tokens = 0
+        output_tokens = 0
+        if response.usage:
+            input_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            output_tokens = getattr(response.usage, "output_tokens", 0) or 0
+
+        return LLMResponse(
+            content=content,
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached=False,
+        )
+
     def complete_with_tools(
         self,
         messages: list[dict],
@@ -124,6 +195,9 @@ class OpenAIBackend(LLMBackend):
         OpenAI format, and returns an adapter that mimics the Anthropic
         response structure.
         """
+        if self._uses_responses_api:
+            return self._complete_with_tools_responses(messages, tools, system)
+
         oai_messages: list[dict[str, Any]] = []
 
         if system:
@@ -178,7 +252,7 @@ class OpenAIBackend(LLMBackend):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": oai_messages,
-            "max_tokens": self.max_tokens,
+            self._max_tokens_param: self.max_tokens,
         }
 
         if tools:
@@ -205,6 +279,147 @@ class OpenAIBackend(LLMBackend):
             print(response.model_dump_json(indent=2))
 
         return _OpenAIToolResponse(response)
+
+    def _complete_with_tools_responses(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        system: str | None,
+    ) -> Any:
+        """Tool-use via the Responses API (codex models)."""
+        import json
+
+        input_items: list[dict[str, Any]] = []
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if isinstance(content, str):
+                input_items.append({"role": role, "content": content})
+                continue
+
+            if not isinstance(content, list):
+                continue
+
+            if role == "assistant":
+                text_parts = []
+                tool_call_items = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") == "tool_use":
+                        tool_call_items.append({
+                            "type": "function_call",
+                            "call_id": item["id"],
+                            "name": item["name"],
+                            "arguments": json.dumps(item.get("input", {})),
+                        })
+                if text_parts:
+                    input_items.append({
+                        "role": "assistant",
+                        "content": "\n".join(text_parts),
+                    })
+                input_items.extend(tool_call_items)
+            elif role == "user":
+                for item in content:
+                    if isinstance(item, str):
+                        input_items.append({"role": "user", "content": item})
+                    elif isinstance(item, dict):
+                        if item.get("type") == "tool_result":
+                            result = item.get("content", "")
+                            if not isinstance(result, str):
+                                result = json.dumps(result)
+                            input_items.append({
+                                "type": "function_call_output",
+                                "call_id": item["tool_use_id"],
+                                "output": result,
+                            })
+                        elif item.get("type") == "text":
+                            input_items.append({
+                                "role": "user",
+                                "content": item["text"],
+                            })
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "max_output_tokens": self.max_tokens,
+        }
+        if system:
+            kwargs["instructions"] = system
+        if tools:
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                }
+                for t in tools
+            ]
+
+        response = self.client.responses.create(**kwargs)
+
+        if os.environ.get("OPENAI_DEBUG"):
+            print("[OPENAI DEBUG] Responses tool use:")
+            print(response.model_dump_json(indent=2))
+
+        return _ResponsesToolResponse(response)
+
+
+def _to_responses_text_format(
+    response_format: dict, strict_schema: bool = True,
+) -> dict:
+    """Translate chat-completions response_format to Responses API text.format.
+
+    When ``strict_schema`` is False (real OpenAI endpoint), downgrade
+    ``json_schema`` to ``json_object`` — the JSON shape is already described in
+    the prompt, and OpenAI's json_schema validator rejects schemas that don't
+    meet its strict-mode constraints (every property required, no extras).
+    When True (local OpenAI-compatible servers), keep the schema but inject
+    ``additionalProperties: false`` recursively.
+    """
+    if response_format.get("type") != "json_schema":
+        return response_format
+
+    if not strict_schema:
+        return {"type": "json_object"}
+
+    schema = response_format.get("json_schema", {})
+    out: dict[str, Any] = {"type": "json_schema"}
+    if "name" in schema:
+        out["name"] = schema["name"]
+    if "schema" in schema:
+        out["schema"] = _enforce_no_additional_props(schema["schema"])
+    if "strict" in schema:
+        out["strict"] = schema["strict"]
+    return out
+
+
+def _enforce_no_additional_props(schema: Any) -> Any:
+    """Normalize a schema for the Responses API.
+
+    Recursively sets ``additionalProperties: false`` and forces ``required``
+    to include every key in ``properties`` (the Responses API mandates this
+    for ``json_schema`` format).
+    """
+    if isinstance(schema, dict):
+        out = {k: _enforce_no_additional_props(v) for k, v in schema.items()}
+        if out.get("type") == "object":
+            if "additionalProperties" not in out:
+                out["additionalProperties"] = False
+            props = out.get("properties")
+            if isinstance(props, dict) and props:
+                out["required"] = list(props.keys())
+            elif "required" in out:
+                del out["required"]
+        return out
+    if isinstance(schema, list):
+        return [_enforce_no_additional_props(v) for v in schema]
+    return schema
 
 
 class _OpenAIToolResponse:
@@ -254,3 +469,34 @@ class _ToolUseBlock:
         self.id = id
         self.name = name
         self.input = input
+
+
+class _ResponsesToolResponse:
+    """Adapter for Responses API output mimicking the Anthropic response shape."""
+
+    def __init__(self, response: Any):
+        import json
+
+        self._response = response
+        self.content: list[Any] = []
+        self.stop_reason = "end_turn"
+
+        for item in getattr(response, "output", []) or []:
+            item_type = getattr(item, "type", None)
+            if item_type == "message":
+                for block in getattr(item, "content", []) or []:
+                    block_type = getattr(block, "type", None)
+                    if block_type in ("output_text", "text"):
+                        text = getattr(block, "text", "") or ""
+                        if text:
+                            self.content.append(_TextBlock(text=text))
+            elif item_type == "function_call":
+                self.stop_reason = "tool_use"
+                args = getattr(item, "arguments", "") or ""
+                self.content.append(
+                    _ToolUseBlock(
+                        id=getattr(item, "call_id", "") or getattr(item, "id", ""),
+                        name=getattr(item, "name", ""),
+                        input=json.loads(args) if args else {},
+                    )
+                )
