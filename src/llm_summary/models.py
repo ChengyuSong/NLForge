@@ -1,9 +1,42 @@
 """Data models for the LLM summary system."""
 
 import difflib
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+# LP64 sizes (sv-comp / typical Linux x86_64). ILP32 differs only on `long`,
+# which we conservatively skip (annotate only the cases that don't change).
+_SIZEOF_PRIMITIVE: dict[str, int] = {
+    "char": 1, "signed char": 1, "unsigned char": 1,
+    "_Bool": 1, "bool": 1,
+    "short": 2, "short int": 2, "signed short": 2, "signed short int": 2,
+    "unsigned short": 2, "unsigned short int": 2,
+    "int": 4, "signed int": 4, "signed": 4, "unsigned": 4, "unsigned int": 4,
+    "long long": 8, "long long int": 8,
+    "signed long long": 8, "signed long long int": 8,
+    "unsigned long long": 8, "unsigned long long int": 8,
+    "float": 4, "double": 8, "long double": 16,
+}
+
+_SIZEOF_RE = re.compile(r"\bsizeof\s*\(\s*([^()]+?)\s*\)")
+
+
+def _annotate_sizeof(source: str) -> str:
+    """Append `/*=N*/` after each `sizeof(T)` whose T is a known primitive.
+
+    Only annotates sizes that are stable across LP64/ILP32 — skips `long`
+    and pointer types (they differ between data models). Struct/typedef
+    sizes are unknown without compilation, so those pass through unchanged.
+    """
+    def repl(m: re.Match[str]) -> str:
+        t = re.sub(r"\s+", " ", m.group(1).strip())
+        n = _SIZEOF_PRIMITIVE.get(t)
+        if n is None:
+            return m.group(0)
+        return f"{m.group(0)} /*={n}*/"
+    return _SIZEOF_RE.sub(repl, source)
 
 
 def _annotate_macro_diff(source: str, pp_source: str) -> str:
@@ -41,9 +74,16 @@ def _annotate_macro_diff(source: str, pp_source: str) -> str:
         elif tag == "delete":
             # Lines only in original (removed by preprocessor — comments, blank lines)
             for line in src_lines[i1:i2]:
-                if line.strip():
-                    indent = " " * (len(line) - len(line.lstrip()))
-                    result.append(f"{indent}// (macro) {line.strip()}")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("//") or stripped.startswith("/*"):
+                    # Already a comment (e.g. injected callee-contract hint) —
+                    # pass through as-is so we don't double-prefix.
+                    result.append(line)
+                    continue
+                indent = " " * (len(line) - len(line.lstrip()))
+                result.append(f"{indent}// (macro) {stripped}")
         elif tag == "insert":
             # Lines only in expanded output
             result.extend(pp_lines[j1:j2])
@@ -188,11 +228,11 @@ class Function:
         version: unchanged lines pass through, changed lines get the original
         as a ``// (macro)`` comment immediately above the expanded line.
         """
-        if not self.pp_source:
-            return self.source
-        if self.pp_source == self.source:
-            return self.source
-        return _annotate_macro_diff(self.source, self.pp_source)
+        if not self.pp_source or self.pp_source == self.source:
+            base = self.source
+        else:
+            base = _annotate_macro_diff(self.source, self.pp_source)
+        return _annotate_sizeof(base)
 
     def __hash__(self) -> int:
         return hash((self.name, self.signature, self.file_path))

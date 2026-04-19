@@ -180,11 +180,15 @@ def parse_yml(yml_path: Path) -> dict[str, Any] | None:
     if not found:
         return None
 
+    options = data.get("options") or {}
+    data_model = str(options.get("data_model", "")).strip().upper() or None
+
     return {
         "i_file": i_file,
         "source_path": str(source_path),
         "expected_verdict": expected_verdict,
         "subproperty": subproperty,
+        "data_model": data_model,
     }
 
 

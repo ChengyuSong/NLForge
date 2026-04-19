@@ -1,5 +1,6 @@
 """Anthropic Claude backend (direct API and Vertex AI)."""
 
+import json
 import os
 from typing import Any
 
@@ -69,7 +70,9 @@ class ClaudeBackend(LLMBackend):
         response_format: dict | None = None,
     ) -> str:
         """Generate a completion using Claude."""
-        response = self.complete_with_metadata(prompt, system, cache_system=cache_system)
+        response = self.complete_with_metadata(
+            prompt, system, cache_system=cache_system, response_format=response_format,
+        )
         return response.content
 
     def complete_with_tools(
@@ -113,10 +116,24 @@ class ClaudeBackend(LLMBackend):
         response_format: dict | None = None,
     ) -> LLMResponse:
         """Generate a completion with metadata."""
+        # Claude doesn't support response_format API parameter directly.
+        # When JSON schema is requested, inject instructions into the prompt.
+        actual_prompt = prompt
+        if response_format and response_format.get("type") == "json_schema":
+            json_schema = response_format.get("json_schema", {})
+            schema = json_schema.get("schema", {})
+            schema_json = json.dumps(schema, indent=2)
+            actual_prompt = (
+                f"{prompt}\n\n"
+                f"Respond with valid JSON matching this schema:\n"
+                f"```json\n{schema_json}\n```\n"
+                f"Output only the JSON object, no markdown fences or explanatory text."
+            )
+
         kwargs = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": actual_prompt}],
         }
 
         if system:
