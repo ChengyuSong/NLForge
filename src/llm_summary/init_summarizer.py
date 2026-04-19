@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
@@ -315,6 +316,26 @@ class InitSummarizer(BaseSummarizer):
         super().__init__(db, llm, verbose=verbose, log_file=log_file, pass_label="init")
         self.cache_mode = cache_mode
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own stores AND no callee initialises anything."""
+        feats = self._ir_features(func)
+        if not feats:
+            return (False, "")
+        # store_count == 0 → function writes nothing to memory at all.
+        if feats.get("store_count", 0) > 0:
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "inits", None):
+                    return (False, "")
+                if getattr(cs, "output_ranges", None):
+                    return (False, "")
+        return (True, "no own stores and no callee inits")
+
     def summarize_function(
         self,
         func: Function,
@@ -324,6 +345,14 @@ class InitSummarizer(BaseSummarizer):
         """Generate init summary for a single function."""
         if callee_summaries is None:
             callee_summaries = {}
+
+        skip, reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            return InitSummary(
+                function_name=func.name,
+                description=f"Skipped: {reason}.",
+            )
 
         # Check for large function with blocks
         blocks = self.db.get_function_blocks(func.id) if func.id else []

@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
@@ -222,6 +223,28 @@ class MemsafeSummarizer(BaseSummarizer):
         super().__init__(db, llm, verbose=verbose, log_file=log_file, pass_label="memsafe")
         self.cache_mode = cache_mode
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own memory access AND no callee imposes contracts."""
+        feats = self._ir_features(func)
+        if not feats:
+            return (False, "")
+        # No loads, stores, or pointer params -> no derefs possible here.
+        if (
+            feats.get("load_count", 0) > 0
+            or feats.get("store_count", 0) > 0
+            or feats.get("ptr_params", 0) > 0
+        ):
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "contracts", None):
+                    return (False, "")
+        return (True, "no own derefs and no callee contracts")
+
     def summarize_function(
         self,
         func: Function,
@@ -243,6 +266,15 @@ class MemsafeSummarizer(BaseSummarizer):
             callee_summaries = {}
         if callee_params is None:
             callee_params = {}
+
+        skip, reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            return MemsafeSummary(
+                function_name=func.name,
+                contracts=[],
+                description=f"Skipped: {reason}.",
+            )
 
         # Check for large function with blocks
         blocks = self.db.get_function_blocks(func.id) if func.id else []

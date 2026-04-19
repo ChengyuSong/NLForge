@@ -204,6 +204,23 @@ class LeakSummarizer(BaseSummarizer):
         super().__init__(db, llm, verbose=verbose, log_file=log_file, pass_label="leak pass")
         self.entry_functions = entry_functions or {"main"}
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own allocations AND no callee leaves allocs unresolved."""
+        if func.id is None:
+            return (False, "")
+        alloc_summary = self.db.get_summary_by_function_id(func.id)
+        if alloc_summary and alloc_summary.allocations:
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "simplified_allocations", None):
+                    return (False, "")
+        return (True, "no own allocations and no callee unresolved allocs")
+
     def summarize_function(
         self,
         func: Function,
@@ -217,19 +234,11 @@ class LeakSummarizer(BaseSummarizer):
         alloc_summary = self.db.get_summary_by_function_id(func.id)
         free_summary = self.db.get_free_summary_by_function_id(func.id)
 
-        # Check if any callee has unresolved allocations
-        has_callee_allocs = False
-        if callee_summaries:
-            for cs in callee_summaries.values():
-                if cs.simplified_allocations:
-                    has_callee_allocs = True
-                    break
-
-        # Quick exit: no own allocations AND no callee unresolved allocations
-        if (not alloc_summary or not alloc_summary.allocations) and not has_callee_allocs:
-            with self._stats_lock:
-                self._stats["functions_processed"] += 1
-            # Still propagate frees of caller-provided pointers
+        skip, _reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            # Still propagate frees of caller-provided pointers so callers
+            # can see what their inputs got freed.
             simplified_frees: list[FreeOp] = []
             if free_summary and free_summary.frees:
                 simplified_frees = [

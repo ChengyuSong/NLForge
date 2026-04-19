@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
@@ -275,6 +276,27 @@ class FreeSummarizer(BaseSummarizer):
         self.deallocators = deallocators or []
         self.cache_mode = cache_mode
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own frees AND no callee frees anything."""
+        feats = self._ir_features(func)
+        if not feats:
+            return (False, "")
+        # free_count covers known free intrinsics; user wrappers show
+        # up via callee_summaries.
+        if feats.get("free_count", 0) > 0:
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "frees", None):
+                    return (False, "")
+                if getattr(cs, "resource_releases", None):
+                    return (False, "")
+        return (True, "no own frees and no callee frees")
+
     def summarize_function(
         self,
         func: Function,
@@ -284,6 +306,14 @@ class FreeSummarizer(BaseSummarizer):
         """Generate free summary for a single function."""
         if callee_summaries is None:
             callee_summaries = {}
+
+        skip, reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            return FreeSummary(
+                function_name=func.name,
+                description=f"Skipped: {reason}.",
+            )
 
         # Check for large function with blocks
         blocks = self.db.get_function_blocks(func.id) if func.id else []

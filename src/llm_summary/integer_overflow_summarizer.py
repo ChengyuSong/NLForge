@@ -10,6 +10,7 @@ from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
+from .ir_sidecar import annotate_source_with_int_ops
 from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Function,
@@ -63,6 +64,8 @@ NOT overflow.
 not report it.  Update the tracked range after the guard.
 - **Dead / infeasible paths**: if a path is unreachable due to \
 earlier conditions, do not report issues on it.
+- **`// safe` hints**: a line ending with ``// safe`` was proven \
+well-defined by IR analysis — do NOT report it.
 
 ## Analysis method — value-range tracking
 
@@ -252,6 +255,25 @@ class IntegerOverflowSummarizer(BaseSummarizer):
             pass_label="intoverflow",
         )
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own int_ops AND no callee reports any issue."""
+        if func.id is None:
+            return (False, "")
+        ir_facts = self.db.get_ir_facts(func.id)
+        if ir_facts is None:
+            return (False, "")
+        if ir_facts.get("int_ops"):
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "issues", None):
+                    return (False, "")
+        return (True, "no own int_ops and no callee issues")
+
     def summarize_function(
         self,
         func: Function,
@@ -270,15 +292,32 @@ class IntegerOverflowSummarizer(BaseSummarizer):
                 description="No source available.",
             )
 
+        skip, reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            return IntegerOverflowSummary(
+                function_name=func.name,
+                description=f"Skipped: {reason}.",
+            )
+
         callee_section = self._build_callee_section(
             func, callee_summaries or {},
         )
+
+        annotated_source = func.llm_source
+        ir_facts = self.db.get_ir_facts(func.id)
+        if ir_facts:
+            int_ops = ir_facts.get("int_ops") or []
+            if int_ops:
+                annotated_source = annotate_source_with_int_ops(
+                    annotated_source, func.line_start, int_ops,
+                )
 
         prompt = OVERFLOW_USER_PROMPT.format(
             name=func.name,
             signature=func.signature,
             file_path=func.file_path,
-            source=func.llm_source,
+            source=annotated_source,
             callee_section=callee_section,
         )
 

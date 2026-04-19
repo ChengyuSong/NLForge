@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
@@ -323,6 +324,23 @@ class AllocationSummarizer(BaseSummarizer):
         self.allocators = allocators or []
         self.cache_mode = cache_mode
 
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Skip if no own allocs AND no callee allocates anything."""
+        feats = self._ir_features(func)
+        if not feats:
+            return (False, "")
+        if feats.get("alloc_count", 0) > 0:
+            return (False, "")
+        if callee_summaries:
+            for cs in callee_summaries.values():
+                if getattr(cs, "allocations", None):
+                    return (False, "")
+        return (True, "no own allocs and no callee allocs")
+
     def summarize_function(
         self,
         func: Function,
@@ -341,6 +359,14 @@ class AllocationSummarizer(BaseSummarizer):
         """
         if callee_summaries is None:
             callee_summaries = {}
+
+        skip, reason = self.should_skip(func, callee_summaries)
+        if skip:
+            self.record_skip()
+            return AllocationSummary(
+                function_name=func.name,
+                description=f"Skipped: {reason}.",
+            )
 
         # Check for large function with blocks
         blocks = self.db.get_function_blocks(func.id) if func.id else []

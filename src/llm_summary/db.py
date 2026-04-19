@@ -307,6 +307,18 @@ CREATE TABLE IF NOT EXISTS function_blocks (
     summary_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_function ON function_blocks(function_id);
+
+-- Per-function IR facts imported from KAMain's --ir-sidecar-dir output.
+-- One row per function in this DB whose name matches a function in any
+-- imported sidecar. facts_json holds the raw per-function blob (effects,
+-- branches, ranges, int_ops, features, ir_hash, cg_hash).
+CREATE TABLE IF NOT EXISTS function_ir_facts (
+    function_id INTEGER PRIMARY KEY REFERENCES functions(id) ON DELETE CASCADE,
+    ir_hash TEXT,
+    cg_hash TEXT,
+    facts_json TEXT NOT NULL,
+    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -1360,6 +1372,40 @@ class SummaryDB:
             issues=issues,
             description=data.get("description", ""),
         )
+
+    # ========== IR Sidecar Facts Operations ==========
+
+    def upsert_ir_facts(
+        self,
+        function_id: int,
+        ir_hash: str | None,
+        cg_hash: str | None,
+        facts_json: str,
+    ) -> None:
+        """Insert or replace per-function IR facts (KAMain sidecar)."""
+        self.conn.execute(
+            """
+            INSERT INTO function_ir_facts
+                (function_id, ir_hash, cg_hash, facts_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(function_id) DO UPDATE SET
+                ir_hash = excluded.ir_hash,
+                cg_hash = excluded.cg_hash,
+                facts_json = excluded.facts_json,
+                imported_at = CURRENT_TIMESTAMP
+            """,
+            (function_id, ir_hash, cg_hash, facts_json),
+        )
+
+    def get_ir_facts(self, function_id: int) -> dict[str, Any] | None:
+        """Get parsed per-function IR facts; None if not imported."""
+        row = self.conn.execute(
+            "SELECT facts_json FROM function_ir_facts WHERE function_id = ?",
+            (function_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["facts_json"])  # type: ignore[no-any-return]
 
     # ========== Code-Contract Summary Operations ==========
 

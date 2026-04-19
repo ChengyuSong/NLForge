@@ -57,6 +57,7 @@ from llm_summary.extractor import FunctionExtractor
 from llm_summary.free_summarizer import FreeSummarizer
 from llm_summary.init_summarizer import InitSummarizer
 from llm_summary.integer_overflow_summarizer import IntegerOverflowSummarizer
+from llm_summary.ir_sidecar import import_sidecar_dir
 from llm_summary.leak_summarizer import LeakSummarizer
 from llm_summary.llm import LLMBackend, build_backend_kwargs, create_backend
 from llm_summary.memsafe_summarizer import MemsafeSummarizer
@@ -267,14 +268,21 @@ def phase_callgraph(
     db: SummaryDB,
     kamain_bin: str,
     verbose: bool,
+    emit_ir_sidecar: bool = True,
 ) -> int:
-    """Compile .i to .bc, run KAMain, import call graph. Returns edge count."""
+    """Compile .i to .bc, run KAMain, import call graph. Returns edge count.
+
+    When *emit_ir_sidecar* is True, also asks KAMain to write per-function
+    IR fact JSON to ``<work_dir>/sidecar/`` and imports those facts into
+    the ``function_ir_facts`` table.
+    """
     bc_path = work_dir / "input.bc"
     cg_json = work_dir / "callgraph.json"
     vsnap_path = work_dir / "v-snapshot.vsnap"
+    sidecar_dir = work_dir / "sidecar"
 
     compile_cmd = [
-        "clang-18", "-emit-llvm", "-c", "-Wno-everything",
+        "clang-18", "-emit-llvm", "-c", "-g", "-Wno-everything",
         str(i_path), "-o", str(bc_path),
     ]
     result = subprocess.run(
@@ -289,6 +297,9 @@ def phase_callgraph(
         "--v-snapshot", str(vsnap_path),
         "--verbose", "0",
     ]
+    if emit_ir_sidecar:
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        kamain_cmd += ["--ir-sidecar-dir", str(sidecar_dir)]
     result = subprocess.run(
         kamain_cmd, capture_output=True, text=True, timeout=60,
     )
@@ -301,6 +312,17 @@ def phase_callgraph(
         "  KAMain: %d edges (%d direct, %d indirect)",
         stats.edges_imported, stats.direct_edges, stats.indirect_edges,
     )
+
+    if emit_ir_sidecar:
+        ir_stats = import_sidecar_dir(db, sidecar_dir)
+        log.debug(
+            "  IR sidecar: %d files, %d functions imported "
+            "(%d unmatched in sidecar)",
+            ir_stats.files_read,
+            ir_stats.functions_imported,
+            ir_stats.functions_unmatched,
+        )
+
     return int(stats.edges_imported)
 
 
@@ -384,7 +406,14 @@ def phase_overflow(
     reachable_ids: set[int] | None = None,
     cache_mode: str = "none",
 ) -> dict[str, int]:
-    """Run integer overflow detection pass. Returns token stats."""
+    """Run integer overflow detection pass. Returns token stats.
+
+    Per-function skip decisions live in ``IntegerOverflowSummarizer.
+    should_skip``: a function is skipped (no LLM call) when its IR
+    sidecar carries no ``int_ops`` and no callee summary reports any
+    issue. This mirrors the per-pass skip pattern used by the other
+    summarizers.
+    """
 
     ovf_s = IntegerOverflowSummarizer(
         db, llm, verbose=verbose, log_file=log_llm,
@@ -560,6 +589,7 @@ def run_one_task(
     disable_thinking: bool = False,
     llm_host: str = "localhost",
     llm_port: int | None = None,
+    emit_ir_sidecar: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Run pipeline phases on one .i file using persistent work_dir.
 
@@ -592,6 +622,7 @@ def run_one_task(
         if from_phase <= 1:
             n_edges = phase_callgraph(
                 i_path, work_dir, db, kamain_bin, verbose,
+                emit_ir_sidecar=emit_ir_sidecar,
             )
             log.debug("  Call edges: %d", n_edges)
 
@@ -913,6 +944,13 @@ def main() -> None:
         "--llm-log-dir", default=None,
         help="Directory for per-target LLM interaction logs",
     )
+    parser.add_argument(
+        "--no-ir-sidecar", action="store_true",
+        help="Disable KAMain IR fact sidecar production. Without sidecar "
+             "facts, per-pass skip predicates degrade to a no-op so every "
+             "function gets the LLM call (baseline mode for A/B "
+             "comparison).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1025,6 +1063,7 @@ def main() -> None:
                 disable_thinking=args.disable_thinking,
                 llm_host=args.llm_host,
                 llm_port=args.llm_port,
+                emit_ir_sidecar=not args.no_ir_sidecar,
             )
             result.elapsed_s = time.time() - t0
             result.llm_calls = task_stats["llm_calls"]

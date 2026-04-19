@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 from llm_summary.db import SummaryDB
 from llm_summary.llm.base import LLMBackend, LLMResponse
+from llm_summary.models import Function
 
 
 class BaseSummarizer:
@@ -37,6 +39,7 @@ class BaseSummarizer:
         self._pass_label = pass_label
         self._stats: dict[str, int] = {
             "functions_processed": 0,
+            "functions_skipped": 0,
             "llm_calls": 0,
             "cache_hits": 0,
             "errors": 0,
@@ -75,6 +78,36 @@ class BaseSummarizer:
         """Increment the error counter (thread-safe)."""
         with self._stats_lock:
             self._stats["errors"] += 1
+
+    def should_skip(
+        self,
+        func: Function,
+        callee_summaries: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Decide whether *func* can skip the LLM call entirely.
+
+        Subclasses override with pass-specific predicates that combine
+        IR features (``db.get_ir_facts(func.id)['features']``) and
+        callee summaries. Returning ``(True, reason)`` means the
+        summarizer must produce a trivial empty summary instead of
+        calling the LLM. Default: never skip.
+        """
+        return (False, "")
+
+    def record_skip(self) -> None:
+        """Increment the skip counter (thread-safe)."""
+        with self._stats_lock:
+            self._stats["functions_processed"] += 1
+            self._stats["functions_skipped"] += 1
+
+    def _ir_features(self, func: Function) -> dict[str, Any]:
+        """Return KAMain IR features for *func*, or ``{}`` if absent."""
+        if func.id is None:
+            return {}
+        facts = self.db.get_ir_facts(func.id)
+        if not facts:
+            return {}
+        return facts.get("features") or {}
 
     def _log_interaction(
         self, func_name: str, prompt: str, response: str,
