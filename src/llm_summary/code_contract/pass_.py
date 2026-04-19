@@ -27,10 +27,11 @@ from typing import Any, TextIO
 
 from ..builder.json_utils import extract_json
 from ..db import SummaryDB
+from ..ir_sidecar import annotate_source_with_ir_facts
 from ..llm.base import LLMBackend, make_json_response_format
 from ..llm.pool import LLMPool
 from ..models import Function
-from .features import features_for, property_set
+from .features import attrs_drops, features_for, property_set
 from .inliner import build_callee_block, ordered_callee_names
 from .models import (
     PROPERTIES,
@@ -177,12 +178,17 @@ class CodeContractPass:
         edges: dict[str, set[str]],
     ) -> CodeContractSummary:
         """Per-property summarization for one function."""
-        features = features_for(func)
+        features = features_for(func, db=self.db)
         callee_names = ordered_callee_names(func, edges, summaries)
         callee_summaries_list = [
             summaries[n] for n in callee_names if n in summaries
         ]
-        props = property_set(features, callee_summaries_list)
+        ir_facts = (
+            self.db.get_ir_facts(func.id) if func.id is not None else None
+        ) or {}
+        props = property_set(
+            features, callee_summaries_list, drops=attrs_drops(ir_facts),
+        )
 
         summary = CodeContractSummary(function=func.name, properties=props)
         # Seed noreturn from explicit attribute (extern decl with
@@ -219,6 +225,17 @@ class CodeContractPass:
                 func, summaries, prop, callee_names,
             )
             source_inlined = prepare_source(func, summaries, edges, prop)
+            # Overlay KAMain IR facts: int_ops only for overflow (no signal
+            # for the others), but effects + attrs preamble apply to every
+            # pass — pointer attrs (nonnull/dereferenceable) tighten the
+            # memsafe/memleak reasoning too.
+            if ir_facts:
+                source_inlined = annotate_source_with_ir_facts(
+                    source_inlined, func.line_start, ir_facts,
+                    include_int_ops=(prop == "overflow"),
+                    include_effects=True,
+                    include_attrs_preamble=True,
+                )
             # Prepend the typedef section so the LLM can resolve struct
             # field offsets and typedef'd integer widths.
             if type_defs:
@@ -306,6 +323,9 @@ class CodeContractPass:
             return issues_by_prop
 
         callee_names = ordered_callee_names(func, edges, summaries)
+        ir_facts = (
+            self.db.get_ir_facts(func.id) if func.id is not None else None
+        ) or {}
         response_format = make_json_response_format(
             VERIFY_SCHEMA, name="verify",
         )
@@ -320,6 +340,13 @@ class CodeContractPass:
                 func, summaries, prop, callee_names,
             )
             source_inlined = prepare_source(func, summaries, edges, prop)
+            if ir_facts:
+                source_inlined = annotate_source_with_ir_facts(
+                    source_inlined, func.line_start, ir_facts,
+                    include_int_ops=(prop == "overflow"),
+                    include_effects=True,
+                    include_attrs_preamble=True,
+                )
             own_contract = self._format_own_contract(summary, prop)
             fmt_kwargs: dict[str, Any] = {
                 "name": func.name,

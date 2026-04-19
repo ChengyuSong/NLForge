@@ -322,6 +322,9 @@ class InitSummarizer(BaseSummarizer):
         callee_summaries: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Skip if no own stores AND no callee initialises anything."""
+        attrs_reason = self._attrs_skip_reason(func, "init")
+        if attrs_reason:
+            return (True, attrs_reason)
         feats = self._ir_features(func)
         if not feats:
             return (False, "")

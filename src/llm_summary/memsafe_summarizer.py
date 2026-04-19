@@ -229,6 +229,9 @@ class MemsafeSummarizer(BaseSummarizer):
         callee_summaries: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Skip if no own memory access AND no callee imposes contracts."""
+        attrs_reason = self._attrs_skip_reason(func, "memsafe")
+        if attrs_reason:
+            return (True, attrs_reason)
         feats = self._ir_features(func)
         if not feats:
             return (False, "")

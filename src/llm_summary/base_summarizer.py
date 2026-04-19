@@ -109,6 +109,67 @@ class BaseSummarizer:
             return {}
         return facts.get("features") or {}
 
+    def _ir_attrs(self, func: Function) -> dict[str, Any]:
+        """Return KAMain LLVM-attr block for *func*, or ``{}`` if absent.
+
+        Block shape: ``{"function": {...}, "params": [...], "ret": {...},
+        "callsites": {...}}``. Only attrs LLVM actually inferred are present.
+        """
+        if func.id is None:
+            return {}
+        facts = self.db.get_ir_facts(func.id)
+        if not facts:
+            return {}
+        return facts.get("attrs") or {}
+
+    # Pass names that may be hard-skipped purely from LLVM-inferred function
+    # memory effects. Passes that touch reads (memsafe, overflow) are NOT in
+    # this set for ``readonly`` because reads can still deref bad pointers
+    # and arith on loaded values can still overflow.
+    _ATTRS_PASSES_NO_WRITES = frozenset(
+        {"leak", "init", "alloc", "free"},
+    )
+
+    def _attrs_skip_reason(
+        self,
+        func: Function,
+        pass_name: str,
+    ) -> str | None:
+        """Return a skip reason if LLVM attrs prove this pass has no work.
+
+        Cheaper and stronger than the bitfield rollup when present.
+        Subclass ``should_skip`` should call this *before* its own
+        bitfield logic and short-circuit on a non-None result.
+
+        KAMain emits ``attrs.function`` as a flat ``list[str]`` of
+        attribute names. (A future schema may use a value-dict; we
+        accept both.)
+
+        Rules:
+          - ``readnone`` present → skip every pass (no memory effects).
+          - ``readonly`` present → skip leak/init/alloc/free; memsafe
+            and overflow still run (reads can deref bad ptrs, arith on
+            loaded values can overflow).
+          - ``writeonly`` → no skip (writes can smash invariants).
+        """
+        attrs = self._ir_attrs(func)
+        if not attrs:
+            return None
+        fn_attrs = attrs.get("function")
+        if isinstance(fn_attrs, list):
+            fn_set = {a for a in fn_attrs if isinstance(a, str)}
+        elif isinstance(fn_attrs, dict):
+            # Forward-compat: doc-spec dict shape with a "memory" key.
+            mem = fn_attrs.get("memory")
+            fn_set = {mem} if isinstance(mem, str) else set()
+        else:
+            return None
+        if "readnone" in fn_set:
+            return "readnone function (no memory effects)"
+        if "readonly" in fn_set and pass_name in self._ATTRS_PASSES_NO_WRITES:
+            return "readonly function (no writes/allocs/frees)"
+        return None
+
     def _log_interaction(
         self, func_name: str, prompt: str, response: str,
     ) -> None:

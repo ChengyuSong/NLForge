@@ -6,15 +6,16 @@ that could touch it, or (b) any callee published a non-trivial
 requires/ensures for it.
 
 Adapter contract:
-  - `features_for(func) -> Features`
+  - `features_for(func, db=None) -> Features`
   - `property_set(features, callee_summaries) -> list[str]`
+  - `attrs_drops(facts) -> set[str]` (post-filter from LLVM attrs)
 
-Until the KAMain JSON sidecar (`docs/todo-kamain-ir-sidecar.md`) ships,
-`features_for` falls back to the regex helpers lifted from
-`scripts/contract_pipeline.py:262-303`. Each call logs `XXX(mock-until-sidecar)`
-at debug level so future audits can find every site that depends on the
-mock. When KAMain lands, replace the body of `features_for` with the
-sidecar lookup; callers stay unchanged.
+When the KAMain JSON sidecar is available (`db.get_ir_facts(func.id)`
+returns a blob), `features_for` reads the `features` block directly:
+load_count / store_count / ptr_params / alloc_count / free_count /
+signed_arith_count / div_count / shift_count map to the dataclass
+fields. Without sidecar data we fall back to the regex helpers lifted
+from `scripts/contract_pipeline.py:262-303`.
 """
 
 from __future__ import annotations
@@ -22,9 +23,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from ..models import Function
 from .models import PROPERTIES, CodeContractSummary
+
+if TYPE_CHECKING:
+    from ..db import SummaryDB
 
 log = logging.getLogger("code_contract.features")
 
@@ -79,20 +84,87 @@ def _extract_features_regex(source: str) -> Features:
     )
 
 
-def features_for(func: Function) -> Features:
+def _features_from_sidecar(feats: dict[str, Any]) -> Features:
+    """Map KAMain `features` block → Features dataclass.
+
+    has_deref ← load_count > 0 OR store_count > 0  (any actual memory op)
+    has_alloc / has_free ← alloc_count / free_count
+    has_index ← ptr_params > 0  (proxy: pointer params imply indexing risk;
+        plain loads alone don't, since an indirect call site may load a fn
+        pointer with no element access.)
+    has_arith ← signed_arith_count > 0 OR sign_changing_cast_count > 0
+    has_div / has_shift ← div_count / shift_count
+    """
+    return Features(
+        has_deref=int(feats.get("load_count") or 0) > 0
+                  or int(feats.get("store_count") or 0) > 0,
+        has_alloc=int(feats.get("alloc_count") or 0) > 0,
+        has_free=int(feats.get("free_count") or 0) > 0,
+        has_index=int(feats.get("ptr_params") or 0) > 0,
+        has_arith=int(feats.get("signed_arith_count") or 0) > 0
+                  or int(feats.get("sign_changing_cast_count") or 0) > 0,
+        has_div=int(feats.get("div_count") or 0) > 0,
+        has_shift=int(feats.get("shift_count") or 0) > 0,
+    )
+
+
+def features_for(func: Function, db: SummaryDB | None = None) -> Features:
     """Return the SA feature set for `func`.
 
-    Mock fallback: regex over `func.llm_source` (macro-annotated). When
-    KAMain JSON sidecar is wired up, replace the body to read from the
-    sidecar — caller signature stays the same.
+    When `db` is provided AND the KAMain sidecar has a `features` block for
+    this function, read from the sidecar. Otherwise fall back to regex over
+    `func.llm_source`. Both paths produce the same dataclass shape so callers
+    don't need to branch.
     """
-    log.debug("XXX(mock-until-sidecar) features_for %s using regex", func.name)
+    if db is not None and func.id is not None:
+        facts = db.get_ir_facts(func.id)
+        if facts:
+            feats = facts.get("features")
+            if isinstance(feats, dict) and feats:
+                return _features_from_sidecar(feats)
+    log.debug("features_for %s using regex fallback", func.name)
     return _extract_features_regex(func.llm_source)
+
+
+# LLVM function-attribute → set of properties that can be dropped.
+# `readnone` ⇒ no memory effects of any kind ⇒ no memsafe/memleak work.
+#   Overflow can still arise from purely-register arithmetic, so we keep it.
+# `readonly` ⇒ no writes/allocs/frees ⇒ memleak is impossible. Memsafe and
+#   overflow still need to run (loads can deref bad ptrs; loaded values
+#   feed arithmetic).
+# `writeonly` ⇒ writes only, no reads ⇒ caller's invariants can still be
+#   smashed; no property is droppable.
+def attrs_drops(facts: dict[str, Any] | None) -> set[str]:
+    """Return the subset of PROPERTIES that LLVM attrs prove are vacuous.
+
+    Accepts the full facts blob (`db.get_ir_facts(func.id)`); reads the
+    `attrs.function` slot which KAMain emits as ``list[str]`` (we also accept
+    the doc-spec value-dict shape with a ``"memory"`` key for forward-compat).
+    """
+    if not facts:
+        return set()
+    attrs = facts.get("attrs")
+    if not isinstance(attrs, dict):
+        return set()
+    fn_attrs = attrs.get("function")
+    if isinstance(fn_attrs, list):
+        fn_set = {a for a in fn_attrs if isinstance(a, str)}
+    elif isinstance(fn_attrs, dict):
+        mem = fn_attrs.get("memory")
+        fn_set = {mem} if isinstance(mem, str) else set()
+    else:
+        return set()
+    if "readnone" in fn_set:
+        return {"memsafe", "memleak"}
+    if "readonly" in fn_set:
+        return {"memleak"}
+    return set()
 
 
 def property_set(
     features: Features,
     callee_summaries: list[CodeContractSummary],
+    drops: set[str] | None = None,
 ) -> list[str]:
     """Adaptive scoping: which subset of PROPERTIES applies here.
 
@@ -100,6 +172,10 @@ def property_set(
     that could touch it, or (b) any callee published a non-trivial
     requires/ensures for it (so the caller may need to discharge or
     propagate).
+
+    If `drops` is given (e.g. from `attrs_drops(facts)`), those properties
+    are removed from the result regardless of features/callees — LLVM
+    attrs are stronger than our heuristics.
     """
     def callee_touches(prop: str) -> bool:
         return any(
@@ -114,5 +190,7 @@ def property_set(
         props.append("memleak")
     if features.overflow_relevant or callee_touches("overflow"):
         props.append("overflow")
+    if drops:
+        props = [p for p in props if p not in drops]
     # Defensive: PROPERTIES drives the iteration order downstream.
     return [p for p in PROPERTIES if p in props]

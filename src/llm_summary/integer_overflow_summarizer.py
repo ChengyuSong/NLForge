@@ -10,7 +10,7 @@ from typing import Any
 
 from .base_summarizer import BaseSummarizer
 from .db import SummaryDB
-from .ir_sidecar import annotate_source_with_int_ops
+from .ir_sidecar import annotate_source_with_ir_facts
 from .llm.base import LLMBackend, make_json_response_format
 from .models import (
     Function,
@@ -263,6 +263,9 @@ class IntegerOverflowSummarizer(BaseSummarizer):
         """Skip if no own int_ops AND no callee reports any issue."""
         if func.id is None:
             return (False, "")
+        attrs_reason = self._attrs_skip_reason(func, "overflow")
+        if attrs_reason:
+            return (True, attrs_reason)
         ir_facts = self.db.get_ir_facts(func.id)
         if ir_facts is None:
             return (False, "")
@@ -306,12 +309,17 @@ class IntegerOverflowSummarizer(BaseSummarizer):
 
         annotated_source = func.llm_source
         ir_facts = self.db.get_ir_facts(func.id)
-        if ir_facts:
-            int_ops = ir_facts.get("int_ops") or []
-            if int_ops:
-                annotated_source = annotate_source_with_int_ops(
-                    annotated_source, func.line_start, int_ops,
-                )
+        if ir_facts and (ir_facts.get("int_ops") or ir_facts.get("effects")):
+            # Effects contribute load_md.range/nonnull and atomic/volatile
+            # hints. These are arith-relevant: a `// range[0,256]` next to
+            # a load bounds the loaded value for downstream overflow checks.
+            annotated_source = annotate_source_with_ir_facts(
+                annotated_source,
+                func.line_start,
+                ir_facts,
+                include_int_ops=True,
+                include_effects=True,
+            )
 
         prompt = OVERFLOW_USER_PROMPT.format(
             name=func.name,

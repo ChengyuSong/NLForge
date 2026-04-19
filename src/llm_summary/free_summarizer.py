@@ -282,6 +282,9 @@ class FreeSummarizer(BaseSummarizer):
         callee_summaries: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Skip if no own frees AND no callee frees anything."""
+        attrs_reason = self._attrs_skip_reason(func, "free")
+        if attrs_reason:
+            return (True, attrs_reason)
         feats = self._ir_features(func)
         if not feats:
             return (False, "")

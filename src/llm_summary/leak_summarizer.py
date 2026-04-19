@@ -212,6 +212,9 @@ class LeakSummarizer(BaseSummarizer):
         """Skip if no own allocations AND no callee leaves allocs unresolved."""
         if func.id is None:
             return (False, "")
+        attrs_reason = self._attrs_skip_reason(func, "leak")
+        if attrs_reason:
+            return (True, attrs_reason)
         alloc_summary = self.db.get_summary_by_function_id(func.id)
         if alloc_summary and alloc_summary.allocations:
             return (False, "")

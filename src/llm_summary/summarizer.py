@@ -330,6 +330,9 @@ class AllocationSummarizer(BaseSummarizer):
         callee_summaries: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Skip if no own allocs AND no callee allocates anything."""
+        attrs_reason = self._attrs_skip_reason(func, "alloc")
+        if attrs_reason:
+            return (True, attrs_reason)
         feats = self._ir_features(func)
         if not feats:
             return (False, "")
