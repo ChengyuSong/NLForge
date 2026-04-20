@@ -61,6 +61,12 @@ from .svcomp_stdlib import SVCOMP_CONTRACTS, svcomp_malloc_overrides
 
 log = logging.getLogger("code_contract.pass")
 
+_MALFORMED_JSON_MSG = (
+    "Your previous response was not valid JSON. "
+    "Please output only a valid JSON object matching the required schema, "
+    "with no markdown fences or extra text."
+)
+
 
 def _format_scan_issues(
     scan_issues: list[dict[str, Any]], prop: str | None = None,
@@ -379,11 +385,35 @@ class CodeContractPass:
 
             try:
                 data = extract_json(resp.content)
-            except (json.JSONDecodeError, ValueError) as e:
-                raise RuntimeError(
-                    f"{func.name}/{prop}: invalid JSON: {e}\n"
-                    f"{resp.content[:200]}"
-                ) from e
+            except (json.JSONDecodeError, ValueError):
+                log.warning("%s/%s: malformed JSON, retrying", func.name, prop)
+                retry_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": resp.content},
+                    {"role": "user", "content": _MALFORMED_JSON_MSG},
+                ]
+                resp = self.llm.complete_messages_with_metadata(
+                    retry_messages,
+                    system=SYSTEM_PROMPT,
+                    cache_system=self.cache_system,
+                    response_format=response_format,
+                )
+                self.calls += 1
+                self.input_tokens += resp.input_tokens
+                self.output_tokens += resp.output_tokens
+                if self.log_fp:
+                    self.log_fp.write(
+                        f"--- RETRY RESPONSE ({prop}) ---\n{resp.content}\n"
+                    )
+                    self.log_fp.flush()
+                try:
+                    data = extract_json(resp.content)
+                except (json.JSONDecodeError, ValueError):
+                    log.warning(
+                        "%s/%s: malformed JSON after retry, skipping property",
+                        func.name, prop,
+                    )
+                    continue
 
             reqs = list(data.get("requires") or [])
             summary.requires[prop] = reqs
@@ -497,11 +527,35 @@ class CodeContractPass:
 
             try:
                 data = extract_json(resp.content)
-            except (json.JSONDecodeError, ValueError) as e:
-                raise RuntimeError(
-                    f"{func.name}/{prop} verify: invalid JSON: {e}\n"
-                    f"{resp.content[:200]}"
-                ) from e
+            except (json.JSONDecodeError, ValueError):
+                log.warning("%s/%s verify: malformed JSON, retrying", func.name, prop)
+                retry_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": resp.content},
+                    {"role": "user", "content": _MALFORMED_JSON_MSG},
+                ]
+                resp = self.llm.complete_messages_with_metadata(
+                    retry_messages,
+                    system=VERIFY_SYSTEM_PROMPT,
+                    cache_system=self.cache_system,
+                    response_format=response_format,
+                )
+                self.calls += 1
+                self.input_tokens += resp.input_tokens
+                self.output_tokens += resp.output_tokens
+                if self.log_fp:
+                    self.log_fp.write(
+                        f"\n--- VERIFY RETRY RESPONSE ({prop}) ---\n{resp.content}\n"
+                    )
+                    self.log_fp.flush()
+                try:
+                    data = extract_json(resp.content)
+                except (json.JSONDecodeError, ValueError):
+                    log.warning(
+                        "%s/%s verify: malformed JSON after retry, skipping property",
+                        func.name, prop,
+                    )
+                    continue
 
             raw_issues = data.get("issues") or []
             kept: list[dict[str, Any]] = []

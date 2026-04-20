@@ -75,6 +75,21 @@ class LLMBackend(ABC):
         """
         pass
 
+    def complete_messages_with_metadata(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        cache_system: bool = False,
+        response_format: dict | None = None,
+    ) -> LLMResponse:
+        """Multi-turn completion. Default: retries with first user message."""
+        for m in messages:
+            if m.get("role") == "user":
+                return self.complete_with_metadata(
+                    m["content"], system, cache_system, response_format,
+                )
+        raise ValueError("No user message in messages")
+
     def complete_with_tools(
         self,
         messages: list[dict],

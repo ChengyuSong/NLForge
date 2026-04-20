@@ -75,6 +75,74 @@ class ClaudeBackend(LLMBackend):
         )
         return response.content
 
+    def complete_messages_with_metadata(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        cache_system: bool = False,
+        response_format: dict | None = None,
+    ) -> "LLMResponse":
+        """Multi-turn completion: schema injected into first user message only."""
+        from .base import LLMResponse
+
+        actual_messages = [dict(m) for m in messages]
+        if response_format and response_format.get("type") == "json_schema":
+            json_schema = response_format.get("json_schema", {})
+            schema = json_schema.get("schema", {})
+            schema_json = json.dumps(schema, indent=2)
+            suffix = (
+                f"\n\nRespond with valid JSON matching this schema:\n"
+                f"```json\n{schema_json}\n```\n"
+                f"Output only the JSON object, no markdown fences or explanatory text."
+            )
+            for i, m in enumerate(actual_messages):
+                if m.get("role") == "user":
+                    actual_messages[i] = {**m, "content": m["content"] + suffix}
+                    break
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": actual_messages,
+        }
+        if system:
+            if cache_system:
+                kwargs["system"] = [
+                    {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+                ]
+            else:
+                kwargs["system"] = system
+
+        response = self.client.messages.create(**kwargs)
+
+        if response.stop_reason == "max_tokens":
+            import sys
+            print(
+                f"WARNING: Claude response may be incomplete (stop_reason=max_tokens). "
+                f"Consider increasing max_tokens (current: {self.max_tokens}).",
+                file=sys.stderr,
+            )
+
+        content = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                content += block.text
+
+        input_tokens = getattr(response.usage, "input_tokens", 0)
+        output_tokens = getattr(response.usage, "output_tokens", 0)
+        cache_read_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+
+        return LLMResponse(
+            content=content,
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached=cache_read_tokens > 0,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+
     def complete_with_tools(
         self,
         messages: list[dict],
