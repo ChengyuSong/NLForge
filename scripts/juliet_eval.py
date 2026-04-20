@@ -863,9 +863,13 @@ def run_one_task(
 def collect_tasks_from_set_file(
     set_file: Path,
     cwe_filter: str | None,
+    base_dir: Path | None = None,
 ) -> list[tuple[Path, dict[str, Any]]]:
-    """Collect tasks from a .set file (glob patterns relative to set file dir)."""
-    base_dir = set_file.parent
+    """Collect tasks from a .set file. Globs are resolved relative to
+    `base_dir` if given, else the set file's parent directory (sv-comp's
+    convention for in-tree .set files like ControlFlow.set)."""
+    if base_dir is None:
+        base_dir = set_file.parent
     seen: set[Path] = set()
     tasks: list[tuple[Path, dict[str, Any]]] = []
     for line in set_file.read_text().splitlines():

@@ -156,6 +156,44 @@ _WARNING_FEATURE_MAP: dict[str, str] = {
 }
 
 
+# Per-property relevance: which clang `-W<flag>` kinds the property's
+# summarize/verify pass should see. Anything outside the per-property set
+# is dropped before rendering — `unused-but-set-variable` etc. only pad
+# the prompt with noise that the local model has to wade through.
+_PROP_RELEVANT_WARNINGS: dict[str, set[str]] = {
+    "memsafe": {
+        "uninitialized", "maybe-uninitialized", "null-dereference",
+        "array-bounds", "stringop-overflow", "use-after-free",
+    },
+    "overflow": {
+        "integer-overflow",
+        "shift-overflow", "shift-count-negative", "shift-count-overflow",
+        "div-by-zero", "division-by-zero",
+    },
+    "memleak": set(),
+}
+
+
+def relevant_warnings_for(
+    prop: str, scan_issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Filter `scan_issues` to those clang kinds that bear on `prop`.
+
+    Used by the summarize/verify passes to keep the FRONTEND WARNINGS
+    block scoped — e.g. an overflow pass should not see `unused-label`
+    warnings. Unknown properties (no entry in `_PROP_RELEVANT_WARNINGS`)
+    return an empty list rather than passing through, since an unmapped
+    property has no defined notion of relevance.
+    """
+    allowed = _PROP_RELEVANT_WARNINGS.get(prop, set())
+    if not allowed:
+        return []
+    return [
+        i for i in scan_issues
+        if (i.get("kind") or "").strip() in allowed
+    ]
+
+
 def bump_features_from_warnings(
     features: Features, scan_issues: list[dict[str, Any]],
 ) -> Features:
@@ -209,6 +247,33 @@ def attrs_drops(facts: dict[str, Any] | None) -> set[str]:
     if "readonly" in fn_set:
         return {"memleak"}
     return set()
+
+
+# Calibrated from /tmp/cf_full_cc summaries.json: median rendered summary
+# is ~5 lines per property (header + a couple of requires/ensures bullets).
+# A function whose raw body is shorter than that floor is cheaper to paste
+# at every callsite than to summarize + describe.
+LINES_PER_PROP_FLOOR = 5
+
+# Hard cap on the EXPANDED inline body (after substituting transitively
+# inline-body callees). Wrapper-of-wrapper chains can blow up; refuse to
+# inline once the expansion exceeds this.
+MAX_INLINE_BODY_LINES = 50
+
+
+def is_inline_body(func: Function, props: list[str]) -> bool:
+    """True iff `func` should be inlined as raw body at every callsite
+    instead of being summarized.
+
+    Rule: body line count < `LINES_PER_PROP_FLOOR * len(props)`. Functions
+    with no in-scope properties skip this path (they get an empty summary
+    anyway). Functions inside an SCC of size > 1 are rejected by the
+    caller — driver-level decision.
+    """
+    if not props:
+        return False
+    body_lines = max(0, func.line_end - func.line_start + 1)
+    return body_lines < LINES_PER_PROP_FLOOR * len(props)
 
 
 def property_set(

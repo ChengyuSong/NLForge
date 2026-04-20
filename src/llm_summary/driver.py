@@ -407,6 +407,7 @@ class BottomUpDriver:
         total: int,
         force_dirty: dict[str, set[int]] | None = None,
         scc_iter: int = 0,
+        in_scc: bool = False,
     ) -> None:
         """Process a single function through all passes. Thread-safe."""
         # Skip sourceless stubs (e.g. stdlib) — nothing to summarize
@@ -487,6 +488,7 @@ class BottomUpDriver:
                     summary = p.summarize(
                         func, callee_summaries, callee_funcs=callee_funcs,
                         previous_summary_json=prev_json,
+                        in_scc=in_scc,
                     )
                 except TypeError:
                     summary = p.summarize(func, callee_summaries)
@@ -691,6 +693,7 @@ class BottomUpDriver:
                                 results_lock, force, affected,
                                 current, total, force_dirty,
                                 scc_iter=scc_iter,
+                                in_scc=True,
                             )
                             dirty_after = (
                                 self._dirty_size(force_dirty)

@@ -18,6 +18,11 @@ from .models import CodeContractSummary, is_nontrivial
 def _format_callee_for_property(
     s: CodeContractSummary, prop: str,
 ) -> list[str]:
+    if s.inline_body:
+        # Inline-body callees are pasted at the callsite by
+        # `inline_callee_contracts`; skipping them here keeps the callee
+        # block from duplicating their source.
+        return []
     reqs = s.requires.get(prop, [])
     ens = s.ensures.get(prop, [])
     mods = s.modifies.get(prop, [])
@@ -39,6 +44,47 @@ def _format_callee_for_property(
     return lines
 
 
+def build_inline_body(
+    func: Function,
+    summaries: dict[str, CodeContractSummary],
+) -> str:
+    """Build F.inline_body: F's raw source with each inline-body callee's
+    already-expanded body pasted as `// >>> body of <name>:` above the
+    callsite line.
+
+    Bottom-up topo guarantees `summaries[<callee>].inline_body` is already
+    transitively expanded — one pass suffices, no recursion here.
+    """
+    raw_lines = func.source.splitlines()
+    insertions: dict[int, list[str]] = {}
+    for cs in func.callsites:
+        callee_name = cs.get("callee")
+        if not callee_name or callee_name not in summaries:
+            continue
+        callee = summaries[callee_name]
+        if not callee.inline_body:
+            continue
+        line_in_body = cs.get("line_in_body")
+        if line_in_body is None or line_in_body < 0 or line_in_body >= len(raw_lines):
+            continue
+        body_line = raw_lines[line_in_body]
+        indent = " " * (len(body_line) - len(body_line.lstrip()))
+        block = [f"{indent}// >>> body of {callee_name}:"]
+        for src_line in callee.inline_body.splitlines():
+            block.append(f"{indent}// >>>   {src_line}")
+        insertions.setdefault(line_in_body, []).extend(block)
+
+    if not insertions:
+        return func.llm_source
+
+    out: list[str] = []
+    for i, line in enumerate(raw_lines):
+        if i in insertions:
+            out.extend(insertions[i])
+        out.append(line)
+    return "\n".join(out)
+
+
 def build_callee_block(
     func: Function,
     summaries: dict[str, CodeContractSummary],
@@ -58,6 +104,10 @@ def build_callee_block(
     parts = ["=== CALLEE SUMMARIES ==="]
     for name in in_scope:
         parts.extend(_format_callee_for_property(summaries[name], prop))
+    if len(parts) == 1:
+        # Every callee was skipped (e.g. all inline-body; their bodies
+        # appear at the callsites instead).
+        parts.append("(no contract-form callees; bodies inlined at callsites)")
     return "\n".join(parts)
 
 
@@ -125,14 +175,22 @@ def inline_callee_contracts(
         if line_in_body is None or line_in_body < 0 or line_in_body >= len(raw_lines):
             continue
         s = summaries[callee_name]
+        body_line = raw_lines[line_in_body]
+        indent = " " * (len(body_line) - len(body_line.lstrip()))
+        # Inline-body callees: paste the (already-expanded) source above
+        # the callsite instead of the contract.
+        if s.inline_body:
+            block = [f"{indent}// >>> body of {callee_name}:"]
+            for src_line in s.inline_body.splitlines():
+                block.append(f"{indent}// >>>   {src_line}")
+            insertions.setdefault(line_in_body, []).extend(block)
+            continue
         reqs = [r for r in s.requires.get(prop, []) if is_nontrivial(r)]
         ens = [e for e in s.ensures.get(prop, []) if is_nontrivial(e)]
         mods = s.modifies.get(prop, [])
         note = s.notes.get(prop, "").strip()
         if not reqs and not ens and not mods and not note and not s.noreturn:
             continue
-        body_line = raw_lines[line_in_body]
-        indent = " " * (len(body_line) - len(body_line.lstrip()))
         hint: list[str] = [
             f"{indent}// >>> {callee_name} contract for {prop}:"
         ]

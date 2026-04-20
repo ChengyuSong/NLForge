@@ -70,6 +70,12 @@ class CodeContractSummary:
     # declaration, stdlib seed (abort/exit/...), or LLM-detected
     # body-always-aborts. Used by callers for path narrowing.
     noreturn: bool = False
+    # Non-empty iff the function was small enough that its raw body is
+    # cheaper to paste at every callsite than to summarize. The body text
+    # (raw `func.llm_source`) is what the inliner pastes at each callsite
+    # under `// >>> inlined body of <name>`. When set, `properties` and
+    # the per-property maps are empty — there is no contract.
+    inline_body: str = ""
 
     def has_requires(self, prop: str) -> bool:
         return any(is_nontrivial(r) for r in self.requires.get(prop, []))
@@ -87,6 +93,7 @@ class CodeContractSummary:
             "notes":    dict(self.notes),
             "origin":   {k: list(v) for k, v in self.origin.items()},
             "noreturn": bool(self.noreturn),
+            "inline_body": self.inline_body,
         }
 
     @classmethod
@@ -100,6 +107,7 @@ class CodeContractSummary:
             notes=dict(d.get("notes") or {}),
             origin={k: list(v) for k, v in (d.get("origin") or {}).items()},
             noreturn=bool(d.get("noreturn", False)),
+            inline_body=str(d.get("inline_body") or ""),
         )
 
     def to_annotated_source(self, function_source: str) -> str:

@@ -298,7 +298,10 @@ def main() -> None:
             sys.exit(1)
         tasks = [(Path(args.yml), info)]
     elif args.set_file:
-        tasks = je.collect_tasks_from_set_file(Path(args.set_file), args.cwe)
+        base = Path(args.benchmarks) if args.benchmarks else None
+        tasks = je.collect_tasks_from_set_file(
+            Path(args.set_file), args.cwe, base_dir=base,
+        )
     elif args.benchmarks:
         tasks = je.collect_tasks(Path(args.benchmarks), args.cwe, args.variant)
     else:

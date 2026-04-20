@@ -32,12 +32,15 @@ from ..llm.base import LLMBackend, make_json_response_format
 from ..llm.pool import LLMPool
 from ..models import Function
 from .features import (
+    MAX_INLINE_BODY_LINES,
     attrs_drops,
     bump_features_from_warnings,
     features_for,
+    is_inline_body,
     property_set,
+    relevant_warnings_for,
 )
-from .inliner import build_callee_block, ordered_callee_names
+from .inliner import build_callee_block, build_inline_body, ordered_callee_names
 from .models import (
     PROPERTIES,
     PROPERTY_SCHEMA,
@@ -59,17 +62,26 @@ from .svcomp_stdlib import SVCOMP_CONTRACTS, svcomp_malloc_overrides
 log = logging.getLogger("code_contract.pass")
 
 
-def _format_scan_issues(scan_issues: list[dict[str, Any]]) -> str:
+def _format_scan_issues(
+    scan_issues: list[dict[str, Any]], prop: str | None = None,
+) -> str:
     """Render frontend warnings as a `// ... ` comment block.
 
-    Empty input → empty string. Lets the LLM see clang's `-Wall` findings
-    (e.g. `-Winteger-overflow` on a constexpr) and decide whether each
-    warning is feasible at runtime.
+    Empty input → empty string. When `prop` is given, drops warnings whose
+    kind is not relevant to that property (e.g. `unused-but-set-variable`
+    is hidden from both memsafe and overflow passes — only useful as
+    feature-bit input via `bump_features_from_warnings`).
     """
     if not scan_issues:
         return ""
+    issues = (
+        relevant_warnings_for(prop, scan_issues)
+        if prop is not None else scan_issues
+    )
+    if not issues:
+        return ""
     lines = ["// FRONTEND WARNINGS (clang -Wall) — assess feasibility:"]
-    for issue in scan_issues:
+    for issue in issues:
         line = issue.get("line")
         kind = (issue.get("kind") or "").strip()
         msg = (issue.get("message") or "").strip()
@@ -171,7 +183,8 @@ class CodeContractPass:
         summaries.update(callee_summaries)
 
         edges = self._get_edges()
-        summary = self._summarize_one(func, summaries, edges)
+        in_scc = bool(kwargs.get("in_scc"))
+        summary = self._summarize_one(func, summaries, edges, in_scc=in_scc)
         # Make the just-produced summary visible to the verify call (so the
         # function's own contract goes into the prompt's `own_contract`).
         summaries[func.name] = summary
@@ -207,6 +220,7 @@ class CodeContractPass:
         func: Function,
         summaries: dict[str, CodeContractSummary],
         edges: dict[str, set[str]],
+        in_scc: bool = False,
     ) -> CodeContractSummary:
         """Per-property summarization for one function."""
         features = features_for(func, db=self.db)
@@ -220,7 +234,6 @@ class CodeContractPass:
         scan_issues = (
             self.db.get_scan_issues(func.id) if func.id is not None else []
         )
-        warnings_section = _format_scan_issues(scan_issues)
         # Re-enable any feature bits the warnings imply — constant-folded UB
         # has no IR signature but still warrants a property pass.
         features = bump_features_from_warnings(features, scan_issues)
@@ -234,6 +247,33 @@ class CodeContractPass:
         # `noreturn: true` per-property below — OR-merge.
         if func.attributes and "noreturn" in func.attributes.lower():
             summary.noreturn = True
+
+        # Inline-body shortcut: small wrappers cost more to summarize than
+        # they save. Paste the (transitively-expanded) body at every
+        # callsite instead. Skip when:
+        #   - the function has no project-internal caller (entry points
+        #     like `main` would be lost — no caller's verify pass would
+        #     ever see the inlined body),
+        #   - the function is inside a multi-member SCC (driver flag —
+        #     would create a cycle of unresolved bodies), OR
+        #   - the expansion blows past the cap.
+        # In all three cases we fall through to normal per-property
+        # summarization.
+        has_project_caller = any(
+            func.name in callees for callees in edges.values()
+        )
+        if has_project_caller and not in_scc and is_inline_body(func, props):
+            expanded = build_inline_body(func, summaries)
+            if len(expanded.splitlines()) <= MAX_INLINE_BODY_LINES:
+                summary.inline_body = expanded
+                summary.properties = []  # no per-property contract
+                if self.log_fp:
+                    self.log_fp.write(
+                        f"\n\n===== FUNCTION: {func.name} (INLINE BODY) =====\n"
+                        f"--- BODY ({len(expanded.splitlines())} lines) ---\n"
+                        f"{expanded}\n"
+                    )
+                return summary
 
         if self.log_fp:
             self.log_fp.write(f"\n\n===== FUNCTION: {func.name} =====\n")
@@ -274,6 +314,7 @@ class CodeContractPass:
                     include_effects=True,
                     include_attrs_preamble=True,
                 )
+            warnings_section = _format_scan_issues(scan_issues, prop)
             if warnings_section:
                 source_inlined = warnings_section + source_inlined
             # Prepend the typedef section so the LLM can resolve struct
@@ -362,6 +403,10 @@ class CodeContractPass:
         contract_pipeline.py:1236 `_verify_one`. Returns issues_by_prop;
         empty dict means body is safe under its published contract."""
         issues_by_prop: dict[str, list[dict[str, Any]]] = {}
+        if summary.inline_body:
+            # Inline-body functions made no claims — verification is
+            # delegated to whichever caller pastes the body.
+            return issues_by_prop
         if not summary.properties:
             return issues_by_prop
 
@@ -372,7 +417,6 @@ class CodeContractPass:
         scan_issues = (
             self.db.get_scan_issues(func.id) if func.id is not None else []
         )
-        warnings_section = _format_scan_issues(scan_issues)
         response_format = make_json_response_format(
             VERIFY_SCHEMA, name="verify",
         )
@@ -394,6 +438,7 @@ class CodeContractPass:
                     include_effects=True,
                     include_attrs_preamble=True,
                 )
+            warnings_section = _format_scan_issues(scan_issues, prop)
             if warnings_section:
                 source_inlined = warnings_section + source_inlined
             own_contract = self._format_own_contract(summary, prop)
