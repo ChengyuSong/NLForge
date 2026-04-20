@@ -67,19 +67,64 @@ def _reachable_ids(db: SummaryDB, entry_name: str) -> set[int] | None:
     return driver.compute_reachable({entry_id}, graph)
 
 
-def _backend_call_stats(llm: Any) -> tuple[int, int, int]:
-    """Pull (calls, input_tokens, output_tokens) off the backend if it
-    exposes them. Best-effort — backends without these counters report 0."""
-    calls = getattr(llm, "calls", 0) or 0
-    in_tok = getattr(llm, "input_tokens", 0) or 0
-    out_tok = getattr(llm, "output_tokens", 0) or 0
-    return int(calls), int(in_tok), int(out_tok)
+
+
+def _has_ir_facts(db: SummaryDB) -> bool:
+    cur = db.conn.execute("SELECT 1 FROM function_ir_facts LIMIT 1")
+    return cur.fetchone() is not None
+
+
+def _ensure_cached_db(
+    i_path: Path, cache_dir: Path, kamain_bin: str,
+    *, rescan: bool, verbose: bool, emit_ir_sidecar: bool,
+    data_model: str | None,
+) -> Path:
+    """Make sure ``cache_dir/functions.db`` exists (with sidecar facts
+    when ``emit_ir_sidecar``).
+
+    Builds the cache via ``juliet_eval.phase_scan`` + ``phase_callgraph``.
+    When the DB is present but lacks ``function_ir_facts`` rows and
+    sidecar emission is enabled, we re-run ``phase_callgraph`` to
+    backfill — idempotent because both the call-graph importer and the
+    sidecar importer upsert.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cache_dir / "functions.db"
+    if rescan and db_path.exists():
+        db_path.unlink()
+    if not db_path.exists():
+        db = SummaryDB(str(db_path))
+        try:
+            je.phase_scan(i_path, cache_dir, db)
+            je.phase_callgraph(
+                i_path, cache_dir, db, kamain_bin, verbose,
+                emit_ir_sidecar=emit_ir_sidecar,
+                data_model=data_model,
+            )
+        finally:
+            db.close()
+        return db_path
+    db = SummaryDB(str(db_path))
+    try:
+        if emit_ir_sidecar and not _has_ir_facts(db):
+            log.info("  Backfilling sidecar facts in %s", db_path)
+            je.phase_callgraph(
+                i_path, cache_dir, db, kamain_bin, verbose,
+                emit_ir_sidecar=True,
+                data_model=data_model,
+            )
+    finally:
+        db.close()
+    return db_path
 
 
 def _run_one_task(
-    yml_path: Path, info: dict[str, Any], db_src: Path, llm: Any,
-    *, svcomp: bool, work_dir: Path, summary_dump: dict[str, Any] | None,
+    yml_path: Path, info: dict[str, Any], llm: Any,
+    *, cache_dir: Path, kamain_bin: str, svcomp: bool,
+    work_dir: Path, summary_dump: dict[str, Any] | None,
     llm_log_dir: Path | None = None,
+    rescan: bool = False, verbose: bool = False,
+    emit_ir_sidecar: bool = True,
 ) -> TaskResult:
     stem = yml_path.stem
     expected_safe = bool(info["expected_verdict"])
@@ -91,20 +136,29 @@ def _run_one_task(
         subproperty=info["subproperty"],
     )
 
-    # Copy DB so we don't pollute the source func-scans tree.
+    # Build/backfill the cached DB (scan + callgraph + sidecar facts),
+    # then copy it into the work dir so analysis tables don't leak back
+    # into the cache.
+    i_path = Path(info["source_path"])
+    db_src = _ensure_cached_db(
+        i_path, cache_dir, kamain_bin,
+        rescan=rescan, verbose=verbose,
+        emit_ir_sidecar=emit_ir_sidecar,
+        data_model=info.get("data_model"),
+    )
     work_dir.mkdir(parents=True, exist_ok=True)
     db_path = work_dir / "functions.db"
     shutil.copyfile(db_src, db_path)
 
     db = SummaryDB(str(db_path))
     t0 = time.time()
-    pre_calls, pre_in, pre_out = _backend_call_stats(llm)
 
     log_fp = None
     if llm_log_dir is not None:
         llm_log_dir.mkdir(parents=True, exist_ok=True)
         log_fp = open(llm_log_dir / f"{stem}.log", "w")
 
+    cc_pass: CodeContractPass | None = None
     try:
         target_ids = _reachable_ids(db, "main")
         if target_ids is None:
@@ -148,10 +202,10 @@ def _run_one_task(
         log.exception("  -> ERROR")
     finally:
         result.elapsed_s = time.time() - t0
-        post_calls, post_in, post_out = _backend_call_stats(llm)
-        result.llm_calls = post_calls - pre_calls
-        result.input_tokens = post_in - pre_in
-        result.output_tokens = post_out - pre_out
+        if cc_pass is not None:
+            result.llm_calls = cc_pass.calls
+            result.input_tokens = cc_pass.input_tokens
+            result.output_tokens = cc_pass.output_tokens
         db.close()
         if log_fp is not None:
             log_fp.close()
@@ -193,7 +247,22 @@ def main() -> None:
                    help="Substring filter on yml stem")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--func-scans-dir", default=je.DEFAULT_FUNC_SCANS,
-                   help="Pre-scanned func-scans root (functions.db per task)")
+                   help="Persistent scan cache (functions.db + sidecar/ "
+                        "per task). Built on demand if missing.")
+    p.add_argument("--kamain-bin", default=je.DEFAULT_KAMAIN,
+                   help="KAMain binary used for callgraph + IR sidecar")
+    p.add_argument("--rescan", action="store_true",
+                   help="Re-run scan + callgraph even if a cached DB exists")
+    p.add_argument("--no-ir-sidecar", action="store_true",
+                   help="Disable KAMain IR fact sidecar emission. Without "
+                        "sidecar facts, feature extraction degrades to the "
+                        "regex fallback (baseline mode for A/B comparison).")
+    p.add_argument("--rerun-from", default=None, metavar="RESULTS_JSON",
+                   help="Rerun only tasks with a given classification from a "
+                        "previous results JSON (use with --rerun-class)")
+    p.add_argument("--rerun-class", default="FP",
+                   help="Classification to rerun (default: FP). Used with "
+                        "--rerun-from")
     p.add_argument("--work-root", default=None,
                    help="Where to copy DBs for the run "
                         "(defaults to a tempdir)")
@@ -238,6 +307,16 @@ def main() -> None:
 
     if args.filter:
         tasks = [(p, i) for p, i in tasks if args.filter in p.stem]
+    if args.rerun_from:
+        prior = json.loads(Path(args.rerun_from).read_text())
+        keep = {
+            r["yml_file"] for r in prior.get("results", [])
+            if r.get("classification") == args.rerun_class
+        }
+        before = len(tasks)
+        tasks = [(p, i) for p, i in tasks if p.name in keep]
+        log.info("rerun-from %s [%s]: %d → %d tasks",
+                 args.rerun_from, args.rerun_class, before, len(tasks))
     if args.limit > 0:
         tasks = tasks[: args.limit]
 
@@ -263,21 +342,22 @@ def main() -> None:
 
     for idx, (yml_path, info) in enumerate(tasks):
         stem = yml_path.stem
-        db_src = func_scans / yml_path.parent.name / stem / "functions.db"
-        if not db_src.exists():
-            log.warning("[%d/%d] %s: no pre-scanned DB at %s — skipping",
-                        idx + 1, len(tasks), stem, db_src)
-            continue
+        cache_dir = func_scans / yml_path.parent.name / stem
         log.info("[%d/%d] %s (expected: %s, subprop: %s)",
                  idx + 1, len(tasks), stem,
                  "safe" if info["expected_verdict"] else "UNSAFE",
                  info["subproperty"])
         r = _run_one_task(
-            yml_path, info, db_src, llm,
+            yml_path, info, llm,
+            cache_dir=cache_dir,
+            kamain_bin=args.kamain_bin,
             svcomp=args.svcomp,
             work_dir=work_root / yml_path.parent.name / stem,
             summary_dump=summary_dump,
             llm_log_dir=Path(args.llm_log_dir) if args.llm_log_dir else None,
+            rescan=args.rescan,
+            verbose=args.verbose,
+            emit_ir_sidecar=not args.no_ir_sidecar,
         )
         results.append(r)
         if r.error:

@@ -134,6 +134,56 @@ def features_for(func: Function, db: SummaryDB | None = None) -> Features:
 #   feed arithmetic).
 # `writeonly` ⇒ writes only, no reads ⇒ caller's invariants can still be
 #   smashed; no property is droppable.
+# Map clang `-W<flag>` (the bare flag, no `-W` prefix) to the feature bit
+# the warning implies. A frontend warning means the source-level construct
+# exists even when constant-folding deletes it from IR (e.g. `INT_MAX + 1`
+# becomes a literal, with no `add` instruction left for KAMain to count).
+# Without this bump, a warning-only function gets adaptive-skipped because
+# `signed_arith_count == 0`.
+_WARNING_FEATURE_MAP: dict[str, str] = {
+    "integer-overflow": "has_arith",
+    "shift-overflow": "has_shift",
+    "shift-count-negative": "has_shift",
+    "shift-count-overflow": "has_shift",
+    "div-by-zero": "has_div",
+    "division-by-zero": "has_div",
+    "uninitialized": "has_deref",
+    "maybe-uninitialized": "has_deref",
+    "null-dereference": "has_deref",
+    "array-bounds": "has_index",
+    "stringop-overflow": "has_index",
+    "use-after-free": "has_deref",
+}
+
+
+def bump_features_from_warnings(
+    features: Features, scan_issues: list[dict[str, Any]],
+) -> Features:
+    """Re-enable feature bits implied by clang `-Wall` warnings.
+
+    Constant-folded UB (e.g. `int x = INT_MAX + 1;`) disappears from IR but
+    still produces a clang warning. Setting the corresponding bit puts the
+    relevant property back into scope so the LLM is asked to assess it.
+    """
+    if not scan_issues:
+        return features
+    bumped = {
+        "has_deref": features.has_deref,
+        "has_alloc": features.has_alloc,
+        "has_free": features.has_free,
+        "has_index": features.has_index,
+        "has_arith": features.has_arith,
+        "has_div": features.has_div,
+        "has_shift": features.has_shift,
+    }
+    for issue in scan_issues:
+        kind = (issue.get("kind") or "").strip()
+        bit = _WARNING_FEATURE_MAP.get(kind)
+        if bit is not None:
+            bumped[bit] = True
+    return Features(**bumped)
+
+
 def attrs_drops(facts: dict[str, Any] | None) -> set[str]:
     """Return the subset of PROPERTIES that LLVM attrs prove are vacuous.
 

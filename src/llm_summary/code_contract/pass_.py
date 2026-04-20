@@ -31,7 +31,12 @@ from ..ir_sidecar import annotate_source_with_ir_facts
 from ..llm.base import LLMBackend, make_json_response_format
 from ..llm.pool import LLMPool
 from ..models import Function
-from .features import attrs_drops, features_for, property_set
+from .features import (
+    attrs_drops,
+    bump_features_from_warnings,
+    features_for,
+    property_set,
+)
 from .inliner import build_callee_block, ordered_callee_names
 from .models import (
     PROPERTIES,
@@ -52,6 +57,25 @@ from .stdlib import STDLIB_CONTRACTS
 from .svcomp_stdlib import SVCOMP_CONTRACTS, svcomp_malloc_overrides
 
 log = logging.getLogger("code_contract.pass")
+
+
+def _format_scan_issues(scan_issues: list[dict[str, Any]]) -> str:
+    """Render frontend warnings as a `// ... ` comment block.
+
+    Empty input → empty string. Lets the LLM see clang's `-Wall` findings
+    (e.g. `-Winteger-overflow` on a constexpr) and decide whether each
+    warning is feasible at runtime.
+    """
+    if not scan_issues:
+        return ""
+    lines = ["// FRONTEND WARNINGS (clang -Wall) — assess feasibility:"]
+    for issue in scan_issues:
+        line = issue.get("line")
+        kind = (issue.get("kind") or "").strip()
+        msg = (issue.get("message") or "").strip()
+        loc = f"line {line}" if line else "line ?"
+        lines.append(f"//   {loc}: {kind}: {msg}")
+    return "\n".join(lines) + "\n"
 
 
 def seed_stdlib_summaries(*, svcomp: bool) -> dict[str, CodeContractSummary]:
@@ -112,6 +136,13 @@ class CodeContractPass:
         # `summarize()`. Eval reads this to compute the safety verdict
         # (mirrors contract_pipeline.py: `predicted_safe = len(issues) == 0`).
         self.issues: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        # Running totals across every `complete_with_metadata` call this
+        # pass made — mirrors `contract_pipeline.py:run_one_task`'s
+        # local accumulators. Drivers/eval scripts read these after
+        # `driver.run` to fill `TaskResult.{llm_calls,input_tokens,output_tokens}`.
+        self.calls: int = 0
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
 
     # ── SummaryPass Protocol ────────────────────────────────────────────
 
@@ -186,6 +217,13 @@ class CodeContractPass:
         ir_facts = (
             self.db.get_ir_facts(func.id) if func.id is not None else None
         ) or {}
+        scan_issues = (
+            self.db.get_scan_issues(func.id) if func.id is not None else []
+        )
+        warnings_section = _format_scan_issues(scan_issues)
+        # Re-enable any feature bits the warnings imply — constant-folded UB
+        # has no IR signature but still warrants a property pass.
+        features = bump_features_from_warnings(features, scan_issues)
         props = property_set(
             features, callee_summaries_list, drops=attrs_drops(ir_facts),
         )
@@ -236,6 +274,8 @@ class CodeContractPass:
                     include_effects=True,
                     include_attrs_preamble=True,
                 )
+            if warnings_section:
+                source_inlined = warnings_section + source_inlined
             # Prepend the typedef section so the LLM can resolve struct
             # field offsets and typedef'd integer widths.
             if type_defs:
@@ -262,6 +302,9 @@ class CodeContractPass:
                 cache_system=self.cache_system,
                 response_format=response_format,
             )
+            self.calls += 1
+            self.input_tokens += resp.input_tokens
+            self.output_tokens += resp.output_tokens
 
             if self.log_fp:
                 self.log_fp.write(
@@ -326,6 +369,10 @@ class CodeContractPass:
         ir_facts = (
             self.db.get_ir_facts(func.id) if func.id is not None else None
         ) or {}
+        scan_issues = (
+            self.db.get_scan_issues(func.id) if func.id is not None else []
+        )
+        warnings_section = _format_scan_issues(scan_issues)
         response_format = make_json_response_format(
             VERIFY_SCHEMA, name="verify",
         )
@@ -347,6 +394,8 @@ class CodeContractPass:
                     include_effects=True,
                     include_attrs_preamble=True,
                 )
+            if warnings_section:
+                source_inlined = warnings_section + source_inlined
             own_contract = self._format_own_contract(summary, prop)
             fmt_kwargs: dict[str, Any] = {
                 "name": func.name,
@@ -367,6 +416,9 @@ class CodeContractPass:
                 cache_system=self.cache_system,
                 response_format=response_format,
             )
+            self.calls += 1
+            self.input_tokens += resp.input_tokens
+            self.output_tokens += resp.output_tokens
 
             if self.log_fp:
                 self.log_fp.write(

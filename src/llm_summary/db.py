@@ -319,6 +319,22 @@ CREATE TABLE IF NOT EXISTS function_ir_facts (
     facts_json TEXT NOT NULL,
     imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Frontend-time issues from clang's diagnostic output during the scan
+-- compile (e.g. -Winteger-overflow on constant-expression UB). One row
+-- per (function_id, line, kind). `kind` mirrors the clang warning flag
+-- (e.g. 'integer-overflow') minus the leading '-W'. Eval reads these
+-- before any LLM round trip.
+CREATE TABLE IF NOT EXISTS function_scan_issues (
+    function_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+    line INTEGER,
+    column INTEGER,
+    kind TEXT NOT NULL,
+    message TEXT,
+    PRIMARY KEY(function_id, line, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_issues_function
+    ON function_scan_issues(function_id);
 """
 
 
@@ -1406,6 +1422,50 @@ class SummaryDB:
         if row is None:
             return None
         return json.loads(row["facts_json"])  # type: ignore[no-any-return]
+
+    # ========== Frontend Scan Issues (clang diagnostics) ==========
+
+    def upsert_scan_issue(
+        self,
+        function_id: int,
+        line: int | None,
+        column: int | None,
+        kind: str,
+        message: str,
+    ) -> None:
+        """Record a clang frontend warning for `function_id`. Idempotent on
+        (function_id, line, kind)."""
+        self.conn.execute(
+            """
+            INSERT INTO function_scan_issues
+                (function_id, line, column, kind, message)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(function_id, line, kind) DO UPDATE SET
+                column = excluded.column,
+                message = excluded.message
+            """,
+            (function_id, line, column, kind, message),
+        )
+
+    def clear_scan_issues(self, function_id: int) -> None:
+        """Drop all scan issues for `function_id`."""
+        self.conn.execute(
+            "DELETE FROM function_scan_issues WHERE function_id = ?",
+            (function_id,),
+        )
+
+    def get_scan_issues(self, function_id: int) -> list[dict[str, Any]]:
+        """Return scan issues for `function_id` (empty list when none)."""
+        rows = self.conn.execute(
+            "SELECT line, column, kind, message FROM function_scan_issues "
+            "WHERE function_id = ? ORDER BY line, kind",
+            (function_id,),
+        ).fetchall()
+        return [
+            {"line": r["line"], "column": r["column"],
+             "kind": r["kind"], "message": r["message"]}
+            for r in rows
+        ]
 
     # ========== Code-Contract Summary Operations ==========
 

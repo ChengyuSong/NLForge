@@ -262,6 +262,45 @@ def phase_scan(
 
 # ── Phase 1: callgraph ─────────────────────────────────────────────────────
 
+_CLANG_WARNING_RE = re.compile(
+    r"^[^:]+:(?P<line>\d+):(?P<col>\d+):\s+warning:\s+"
+    r"(?P<message>.*?)\s*\[-W(?P<flag>[^\]]+)\]\s*$"
+)
+
+
+def _import_clang_warnings(db: SummaryDB, stderr: str) -> int:
+    """Parse clang stderr lines of the form
+    ``<file>:<line>:<col>: warning: <msg> [-W<flag>]`` and store each one
+    on the function whose ``[line_start, line_end]`` range contains
+    `<line>`. Returns the number of warnings stored.
+    """
+    if not stderr:
+        return 0
+    funcs = sorted(
+        (f for f in db.get_all_functions() if f.id is not None),
+        key=lambda f: (f.line_start, f.line_end),
+    )
+    n = 0
+    for raw in stderr.splitlines():
+        m = _CLANG_WARNING_RE.match(raw)
+        if m is None:
+            continue
+        line = int(m.group("line"))
+        owner = next(
+            (f for f in funcs if f.line_start <= line <= f.line_end), None,
+        )
+        if owner is None or owner.id is None:
+            continue
+        db.upsert_scan_issue(
+            owner.id, line=line, column=int(m.group("col")),
+            kind=m.group("flag"), message=m.group("message"),
+        )
+        n += 1
+    if n:
+        db.conn.commit()
+    return n
+
+
 def phase_callgraph(
     i_path: Path,
     work_dir: Path,
@@ -269,12 +308,23 @@ def phase_callgraph(
     kamain_bin: str,
     verbose: bool,
     emit_ir_sidecar: bool = True,
+    data_model: str | None = None,
 ) -> int:
     """Compile .i to .bc, run KAMain, import call graph. Returns edge count.
 
     When *emit_ir_sidecar* is True, also asks KAMain to write per-function
     IR fact JSON to ``<work_dir>/sidecar/`` and imports those facts into
     the ``function_ir_facts`` table.
+
+    `data_model` (``"ILP32"`` / ``"LP64"`` / ``None``) controls clang's
+    target data layout. Honoring it matters for sv-comp tasks that
+    declare ``data_model: ILP32`` — without ``-m32`` clang defaults to
+    LP64 and signed-arithmetic / pointer widths in the IR no longer
+    match the benchmark's stated assumptions.
+
+    Clang's stderr is parsed for ``-Wall``-class warnings (constexpr
+    overflow, bounds, etc.); each one is stored in
+    ``function_scan_issues`` for the LLM to assess feasibility.
     """
     bc_path = work_dir / "input.bc"
     cg_json = work_dir / "callgraph.json"
@@ -282,14 +332,19 @@ def phase_callgraph(
     sidecar_dir = work_dir / "sidecar"
 
     compile_cmd = [
-        "clang-18", "-emit-llvm", "-c", "-g", "-Wno-everything",
+        "clang-18", "-emit-llvm", "-c", "-g", "-Wall",
         str(i_path), "-o", str(bc_path),
     ]
+    if (data_model or "").upper() == "ILP32":
+        compile_cmd.insert(1, "-m32")
     result = subprocess.run(
         compile_cmd, capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"clang -emit-llvm failed: {result.stderr}")
+    n_warn = _import_clang_warnings(db, result.stderr)
+    if n_warn:
+        log.debug("  clang warnings stored: %d", n_warn)
 
     kamain_cmd = [
         kamain_bin, str(bc_path),

@@ -557,6 +557,14 @@ In-scope kinds (use these exact `kind` strings):
 ## Function's published memsafe contract (assume `requires` hold on entry)
 {own_contract}
 
+## Frontend warnings
+
+If the source begins with a `// FRONTEND WARNINGS (clang -Wall) ...` block, \
+treat each warning as a candidate issue. Decide if it is feasible at runtime \
+(reachable path, operand range admits UB) and emit the matching `issues[]` \
+entry. Skip warnings that are clearly dead code or already discharged by the \
+contract.
+
 {callee_block}
 
 === SOURCE (callsites annotated with `// >>> callee contract for memsafe`) ===
@@ -587,6 +595,12 @@ In-scope kinds:
 
 ## Function's published memleak contract (assume `requires` hold on entry)
 {own_contract}
+
+## Frontend warnings
+
+If the source begins with a `// FRONTEND WARNINGS (clang -Wall) ...` block, \
+treat each warning as a candidate `memory_leak` (or `callee_requires`) when it \
+implies an unreleased acquisition; otherwise leave it alone.
 
 {callee_block}
 
@@ -666,6 +680,15 @@ callee.requires[overflow]? If not, emit `callee_requires`.
 
 ## Function's published overflow contract (assume `requires` hold on entry)
 {own_contract}
+
+## Frontend warnings
+
+If the source begins with a `// FRONTEND WARNINGS (clang -Wall) ...` block, \
+treat each warning as a candidate `integer_overflow` / `division_by_zero` / \
+`shift_ub` issue. Constant-folded expressions whose result clang flagged \
+(e.g. `INT_MAX + 1`) are STILL UB at the source level — emit the issue even \
+when no `add` instruction survives in IR. Skip warnings only when the path is \
+provably unreachable.
 
 {callee_block}
 
