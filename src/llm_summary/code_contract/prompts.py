@@ -163,10 +163,21 @@ the obligation in `requires`. Walk the body and check:
   testing `p != NULL` on the same path, publish `p != NULL` in
   `requires`. This applies even when CIL / sv-comp encodes pointers as
   `int` — at runtime it is still a pointer and the deref still UBs.
-- **Index without bound**: if the body executes `buf[i]` (or
-  `*(buf + i)`) with `i` derived from a parameter `n` and the body does
-  not constrain `i < len(buf)`, publish the bound (`n <= sizeof(buf)`,
-  `i < n`, etc.).
+- **Buffer access bounds**: for EVERY `buf[expr]`, `*(buf + expr)`,
+  `memcpy(buf + expr, ..., len)`, or `memset(buf + expr, ..., len)` in
+  the body, decompose `expr` into its constituent variables and emit
+  the bound as a C expression in `requires`.
+  Procedure: (1) identify the buffer pointer and its allocation size
+  (parameter, struct field, or callee ensures); (2) identify the
+  maximum index expression used; (3) emit `max_index < alloc_size`
+  (or `offset + len <= alloc_size` for memcpy/memset).
+  When the pointer, index, and size are struct fields of the same
+  parameter, the bound is a relational invariant — e.g. if the body
+  accesses `ctx->buf[ctx->pos + ctx->len]` and the buffer has
+  `ctx->capacity` elements, emit `ctx->pos + ctx->len < ctx->capacity`.
+  **Size positivity**: when the body accesses `buf[0]` or calls
+  `memset(buf, 0, n * sizeof(T))` without guarding `n > 0`, publish
+  `n > 0` — unsigned underflow of `n - 1` wraps to a huge value.
 - **Read of uninitialized memory**: if the body READS `*p` (RHS of an
   assignment, branch test, index, arithmetic operand) for a
   non-allocator parameter `p`, publish `*p initialized` in `requires`.
@@ -264,18 +275,28 @@ verbatim; do NOT invent preconditions a callee did not declare.
 
 Output JSON exactly matching:
 {{
-  "requires": ["<expr or short prose>", ...],
-  "ensures":  ["<expr or short prose>", ...],
+  "requires": ["<C boolean expression>", ...],
+  "ensures":  ["<C boolean expression or short prose>", ...],
   "modifies": ["<sym>", ...],
   "notes":    "<one-line context propagated to YOUR caller alongside contract>"
 }}
 
+## Format rules
+
+**`requires` MUST be C boolean expressions** that a caller can evaluate
+at the callsite — `p != NULL`, `n > 0`, `i + k < ctx->size`. Avoid prose
+("buffer must be large enough"); write the actual bound instead.
+Exception: `*p initialized` is acceptable because C has no syntax for it.
+
+**`ensures`** may use prose for facts C cannot express (init ranges,
+allocation pairing), but prefer C expressions when possible:
+`result != NULL`, `*out == 0`, `ctx->len == n`.
+
 Guidance:
-- `requires` examples: `Context != NULL` (only if a callee declared it),
-  `len <= sizeof(buf)` (if function indexes `buf[i]` with `i < len`),
-  `initialized(p, n)` (if function reads `*p`).
-- `ensures` examples: `*out initialized for n bytes`, `return value != NULL`,
-  `<inherits callee.ensures[memsafe]>`.
+- `requires` examples: `ctx != NULL`, `n > 0`,
+  `ctx->pos + ctx->len <= ctx->capacity`.
+- `ensures` examples: `result allocated for n * sizeof(T) bytes`,
+  `result != NULL`, `s->buf[0..n-1] initialized`, `freed(p)`.
 - `modifies`: list stack locals and heap regions written here (out-params,
   *p where p was malloc'd in this function, etc.). SKIP globals/statics
   (zero-init at startup → no use-before-init obligation).
@@ -484,9 +505,10 @@ VERIFY_SCHEMA: dict[str, object] = {
                 "properties": {
                     "kind": {"type": "string"},
                     "line": {"type": ["integer", "null"]},
-                    "description": {"type": "string"},
+                    "analysis": {"type": "string"},
+                    "is_ub": {"type": "boolean"},
                 },
-                "required": ["kind", "description"],
+                "required": ["kind", "analysis", "is_ub"],
             },
         },
     },
@@ -557,6 +579,19 @@ In-scope kinds (use these exact `kind` strings):
 ## Function's published memsafe contract (assume `requires` hold on entry)
 {own_contract}
 
+## Unsigned wrap in bounds guards
+
+Unsigned arithmetic wraps modulo 2^N — this is not integer UB, but when a
+wrapped result is used in a comparison that guards a memory operation
+(e.g. `if (pos + len >= space)` before `memcpy(buf + pos, src, len)`),
+the wrap can make the guard evaluate false, skipping a realloc or bounds
+check. Flag as `buffer_overflow` when: (1) unsigned addition or
+multiplication in a branch condition can wrap on the target data model,
+AND (2) the unguarded (false) path reaches a memory access that assumes
+the check passed. Pay special attention to `size_t` sums that feed
+allocation-size or bounds comparisons — on ILP32, `pos + len` can wrap
+past SIZE_MAX even when both operands are individually valid.
+
 ## Frontend warnings
 
 If the source begins with a `// FRONTEND WARNINGS (clang -Wall) ...` block, \
@@ -575,10 +610,14 @@ Output JSON exactly matching:
   "issues": [
     {{"kind": "<one of the kinds above>",
      "line": <int|null>,
-     "description": "<one-line: cite the operation/callsite and why the published \
-requires (plus path facts) don't cover it>"}}
+     "analysis": "<one sentence: cite the op, state whether path facts \
+discharge it, conclude safe or unsafe>",
+     "is_ub": true}}
   ]
 }}
+
+Set `is_ub` to `false` when analysis shows the op is safe. \
+Only `is_ub: true` entries become real issues.
 """
 
 
@@ -612,9 +651,14 @@ Output JSON exactly matching:
   "issues": [
     {{"kind": "memory_leak|callee_requires",
      "line": <int|null>,
-     "description": "<one-line: cite the allocation and the path on which it leaks>"}}
+     "analysis": "<one sentence: cite the allocation/callsite, state whether \
+it leaks or is released, conclude safe or unsafe>",
+     "is_ub": true}}
   ]
 }}
+
+Set `is_ub` to `false` when analysis shows no leak. \
+Only `is_ub: true` entries become real issues.
 """
 
 
@@ -700,11 +744,15 @@ Output JSON exactly matching:
   "issues": [
     {{"kind": "integer_overflow|division_by_zero|shift_ub|callee_requires",
      "line": <int|null>,
-     "description": "<one-line: cite the operation and the operand range that admits UB>"}}
+     "analysis": "<one sentence: cite the op, state operand type and \
+range, conclude UB or well-defined>",
+     "is_ub": true}}
   ]
 }}
 
-Empty list = body is overflow-safe under its published requires.
+Set `is_ub` to `false` for ops that are well-defined (unsigned wrap, \
+guarded paths, values in range). Only `is_ub: true` entries become \
+real issues.
 """
 
 

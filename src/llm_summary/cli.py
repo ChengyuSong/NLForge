@@ -903,37 +903,94 @@ def show(db_path, name, file_path, allocating_only, fmt, limit, offset):
                 if summary:
                     if allocating_only and not summary.allocations:
                         continue
-                    output.append({
-                        "function": func.name,
-                        "file": func.file_path,
-                        "line": func.line_start,
-                        "summary": summary.to_dict(),
-                    })
+                entry: dict[str, Any] = {
+                    "function": func.name,
+                    "file": func.file_path,
+                    "line": func.line_start,
+                }
+                if summary:
+                    entry["summary"] = summary.to_dict()
+                cc = db.get_code_contract_summary(func.id)
+                if cc:
+                    entry["code_contract"] = cc.to_dict()
+                if summary or cc:
+                    output.append(entry)
             console.print(json.dumps(output, indent=2))
 
         else:
-            table = Table(title="Allocation Summaries")
-            table.add_column("Function", style="cyan")
-            table.add_column("File", style="dim")
-            table.add_column("Allocations", style="green")
-            table.add_column("Description")
+            has_cc = any(
+                db.get_code_contract_summary(f.id) is not None
+                for f in functions if f.id is not None
+            )
+            if has_cc:
+                table = Table(title="Code Contract Summaries")
+                table.add_column("Function", style="cyan")
+                table.add_column("File", style="dim")
+                table.add_column("Properties", style="green")
+                table.add_column("Requires")
+                table.add_column("Ensures")
 
-            for func in functions:
-                assert func.id is not None
-                summary = db.get_summary_by_function_id(func.id)
-                if summary:
-                    if allocating_only and not summary.allocations:
+                for func in functions:
+                    assert func.id is not None
+                    cc = db.get_code_contract_summary(func.id)
+                    if not cc or (not cc.properties and not cc.inline_body):
                         continue
-
-                    alloc_str = ", ".join(a.source for a in summary.allocations) or "-"
+                    if cc.inline_body:
+                        table.add_row(
+                            func.name,
+                            Path(func.file_path).name,
+                            "(inlined)", "", "",
+                        )
+                        continue
+                    props = ", ".join(cc.properties)
+                    req_parts = []
+                    for p in cc.properties:
+                        clauses = [c for c in cc.requires.get(p, [])
+                                   if c.strip().lower() not in ("true", "")]
+                        if clauses:
+                            req_parts.append(
+                                f"[{p}] " + "; ".join(clauses))
+                    ens_parts = []
+                    for p in cc.properties:
+                        clauses = [c for c in cc.ensures.get(p, [])
+                                   if c.strip().lower() not in
+                                   ("true", "", "(no observable effect)")]
+                        if clauses:
+                            ens_parts.append(
+                                f"[{p}] " + "; ".join(clauses))
+                    req_str = "\n".join(req_parts) if req_parts else "true"
+                    ens_str = "\n".join(ens_parts) if ens_parts else "-"
                     table.add_row(
                         func.name,
                         Path(func.file_path).name,
-                        alloc_str,
-                        (summary.description[:50] + "..."
-                         if len(summary.description) > 50
-                         else summary.description),
+                        props,
+                        req_str[:120] + "..." if len(req_str) > 120 else req_str,
+                        ens_str[:120] + "..." if len(ens_str) > 120 else ens_str,
                     )
+            else:
+                table = Table(title="Allocation Summaries")
+                table.add_column("Function", style="cyan")
+                table.add_column("File", style="dim")
+                table.add_column("Allocations", style="green")
+                table.add_column("Description")
+
+                for func in functions:
+                    assert func.id is not None
+                    summary = db.get_summary_by_function_id(func.id)
+                    if summary:
+                        if allocating_only and not summary.allocations:
+                            continue
+
+                        alloc_str = ", ".join(
+                            a.source for a in summary.allocations) or "-"
+                        table.add_row(
+                            func.name,
+                            Path(func.file_path).name,
+                            alloc_str,
+                            (summary.description[:50] + "..."
+                             if len(summary.description) > 50
+                             else summary.description),
+                        )
 
             console.print(table)
 
@@ -1258,12 +1315,7 @@ def init_stdlib(
             if force:
                 return True  # re-apply all when --force is given
             assert f.id is not None
-            return (
-                db.get_summary_by_function_id(f.id) is None
-                or db.get_free_summary_by_function_id(f.id) is None
-                or db.get_init_summary_by_function_id(f.id) is None
-                or db.get_code_contract_summary(f.id) is None
-            )
+            return db.get_code_contract_summary(f.id) is None
 
         needs = [f for f in sourceless if _needs_summary(f)]
 
@@ -1274,8 +1326,8 @@ def init_stdlib(
         in_known = [f for f in needs if f.name in known_externals]
         not_known = [f for f in needs if f.name not in known_externals]
 
-        cache_hits = [f for f in in_known if cache.has(f.name)]
-        cache_misses = [f for f in in_known if not cache.has(f.name)]
+        cache_hits = [f for f in in_known if cache.has(f.name, "code_contract")]
+        cache_misses = [f for f in in_known if not cache.has(f.name, "code_contract")]
 
         console.print(
             f"  Functions needing summaries: {len(needs)} total  "
@@ -1291,7 +1343,7 @@ def init_stdlib(
             names = sorted(f.name for f in cache_misses)
             console.print(
                 f"\n[red]Error: {len(cache_misses)} known-external function(s) have no cached "
-                f"summary and no --backend was given.[/red]"
+                f"code-contract summary and no --backend was given.[/red]"
             )
             console.print("  Re-run with --backend <claude|gemini|…> to generate them.")
             console.print(f"  Missing: {', '.join(names)}")

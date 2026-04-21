@@ -30,7 +30,7 @@ from ..db import SummaryDB
 from ..ir_sidecar import annotate_source_with_ir_facts
 from ..llm.base import LLMBackend, make_json_response_format
 from ..llm.pool import LLMPool
-from ..models import Function
+from ..models import Function, SafetyIssue, VerificationSummary
 from .features import (
     MAX_INLINE_BODY_LINES,
     attrs_drops,
@@ -145,6 +145,7 @@ class CodeContractPass:
         cache_system: bool = True,
         log_fp: TextIO | None = None,
         verbose: bool = False,
+        verify_only: bool = False,
     ):
         self.db = db
         self.model = model
@@ -154,6 +155,7 @@ class CodeContractPass:
         self.data_model_note = data_model_note(data_model)
         self.cache_system = cache_system
         self.verbose = verbose
+        self.verify_only = verify_only
         # Per-task LLM log fp (mirrors `scripts/contract_pipeline.py`'s
         # `log_fp`). Caller manages open/close; we just write into it.
         self.log_fp = log_fp
@@ -185,7 +187,19 @@ class CodeContractPass:
         self, func_id: int, func: Function,
     ) -> CodeContractSummary | None:
         existing: CodeContractSummary | None = self.db.get_code_contract_summary(func_id)
-        if existing and not self.db.needs_code_contract_update(func):
+        if not existing:
+            return None
+        if self.verify_only:
+            # No contract properties — nothing to verify; skip.
+            if not existing.properties:
+                return existing
+            # Has a verification_summary already — skip.
+            vs = self.db.get_verification_summary_by_function_id(func_id)
+            if vs is not None:
+                return existing
+            # Contract exists but not yet verified — force re-run.
+            return None
+        if not self.db.needs_code_contract_update(func):
             return existing
         return None
 
@@ -202,10 +216,11 @@ class CodeContractPass:
         if self.verbose:
             cur = self.summarizer._progress_current
             tot = self.summarizer._progress_total
+            label = "verify-only" if self.verify_only else "code-contract"
             if tot > 0:
-                print(f"  ({cur}/{tot}) code-contract: {func.name}", flush=True)
+                print(f"  ({cur}/{tot}) {label}: {func.name}", flush=True)
             else:
-                print(f"  code-contract: {func.name}", flush=True)
+                print(f"  {label}: {func.name}", flush=True)
         # Merge stdlib seeds with the per-call-graph callee summaries the
         # driver passes us. Stdlib seeds are static per-process, so the
         # merge is cheap.
@@ -213,8 +228,17 @@ class CodeContractPass:
         summaries.update(callee_summaries)
 
         edges = self._get_edges()
-        in_scc = bool(kwargs.get("in_scc"))
-        summary = self._summarize_one(func, summaries, edges, in_scc=in_scc)
+
+        if self.verify_only:
+            summary = self.db.get_code_contract_summary(
+                func.id,  # type: ignore[arg-type]
+            )
+            assert summary is not None, (
+                f"verify-only: no cached contract for {func.name}"
+            )
+        else:
+            in_scc = bool(kwargs.get("in_scc"))
+            summary = self._summarize_one(func, summaries, edges, in_scc=in_scc)
         # Make the just-produced summary visible to the verify call (so the
         # function's own contract goes into the prompt's `own_contract`).
         summaries[func.name] = summary
@@ -227,6 +251,21 @@ class CodeContractPass:
         self.db.store_code_contract_summary(
             func, summary, model_used=self.model,
         )
+        func_issues = self.issues.get(func.name, {})
+        safety_issues: list[SafetyIssue] = []
+        for prop, issue_list in func_issues.items():
+            for it in issue_list:
+                safety_issues.append(SafetyIssue(
+                    location=f"line {it.get('line', '?')}",
+                    issue_kind=it["kind"],
+                    description=f"[{prop}] {it['description']}",
+                    severity="high",
+                ))
+        vs = VerificationSummary(
+            function_name=func.name,
+            issues=safety_issues,
+        )
+        self.db.upsert_verification_summary(func, vs, model_used=self.model)
 
     # ── Internal ────────────────────────────────────────────────────────
 
@@ -562,8 +601,12 @@ class CodeContractPass:
             for it in raw_issues:
                 if not isinstance(it, dict):
                     continue
+                if not it.get("is_ub", True):
+                    continue
                 kind = str(it.get("kind") or "").strip()
-                desc = str(it.get("description") or "").strip()
+                desc = str(
+                    it.get("analysis") or it.get("description") or ""
+                ).strip()
                 if not kind or not desc:
                     continue
                 kept.append({
