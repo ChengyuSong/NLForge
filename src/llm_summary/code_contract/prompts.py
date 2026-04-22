@@ -406,12 +406,18 @@ the input file uses (C or C++); use that language's expression syntax.
     `cond ==> n != INT_MIN`                (precondition only on a path)
 
 - `ensures` items are boolean expressions or value-range forms about the
-  return value and out-parameters on exit. Use the literal name `result`
-  for the return value, and `*out_p` for an out-parameter. Examples:
+  return value, out-parameters, and values written to struct fields via
+  pointer parameters on exit. Use the literal name `result` for the return
+  value, `*out_p` for a simple out-parameter, and `p->field` for a struct
+  field written through a pointer parameter. Examples:
     `result: [0, INT_MAX]`                 (return value range)
     `result == a + b`                      (exact value, holds under requires)
     `*out_p >= 0`                          (out-parameter postcondition)
     `result != 0 ==> *err == 0`            (conditional postcondition)
+    `p->depth: [0, MAX_DEPTH]`             (struct field written via pointer param)
+
+  Only report when the bound is derivable from the body and narrower than
+  the full type range — skip tautological ranges like `int: [INT_MIN, INT_MAX]`.
 
   If the function does not return an integer or has no integer effect,
   `ensures` may be empty. Empty is a valid answer.
@@ -456,6 +462,11 @@ the input file uses (C or C++); use that language's expression syntax.
 - **Shift operands.** `1U << n` or `x << n` is UB when `n >= bit-width`
   of the promoted left operand. Always emit `n: [0, W-1]` (W = 32 or 64)
   for shift amounts read from external sources.
+- **Published output bounds.** When the function writes a value to a struct
+  field (or any caller-visible location) and that value's range is derivable
+  and narrower than the type, publish it in `ensures`. Callers reading that
+  field in a shift or comparison cannot derive the bound themselves.
+  Example: function assigns `p->count = n` where `n < MAX` → `ensures: p->count: [0, MAX-1]`.
 
 ## Resolve typedefs
 
