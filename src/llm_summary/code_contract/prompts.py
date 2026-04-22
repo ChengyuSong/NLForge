@@ -432,11 +432,38 @@ the input file uses (C or C++); use that language's expression syntax.
 - A function with no signed arithmetic, no division/modulo, no shifts, AND
   whose callees all publish empty `requires[overflow]` and `ensures[overflow]`
   → output empty arrays.
-- DO NOT add a `requires` "just because the function has nondet inputs and
-  performs arithmetic" — emit the predicate that ACTUALLY excludes the UB
-  case (`x != INT_MIN`, `denom != 0`, `0 <= s < 32`). If you can write the
-  predicate, write it; if you can't pin it down, propagate the callee
-  obligation verbatim.
+- **Mitigate external inputs.** Any signed op whose operand comes from an
+  external source (parameter, struct field via pointer, global) and whose
+  full type range admits UB MUST produce a `requires` constraining the
+  input to the safe sub-range. Do NOT skip because "the value is probably
+  small" — emit the constraint and let the verify pass judge feasibility.
+  Examples:
+    `int x = (int)p->count;  x - 1` → requires: `p->count` (unsigned) `<= INT_MAX`
+    `a << n` where n is a signed param → requires: `n: [0, 31]`
+- Each `requires` must be a concrete predicate that ACTUALLY excludes the
+  UB case (`x != INT_MIN`, `denom != 0`, `0 <= s < 32`).
+- **No tautologies.** `x: [INT_MIN, INT_MAX]` for an `int` is the full
+  range — it excludes nothing. Drop it.
+- **No memsafe concerns.** Do not emit pointer-validity, buffer-size, or
+  availability constraints here (e.g. `avail_in >= 5`). Those belong to
+  the memsafe pass.
+- **Overapproximate complex expressions.** If the exact safe range depends
+  on runtime state (array lookups, loop variables, multi-field invariants),
+  widen to a simpler bound on the entry-visible inputs. For example, if
+  safety requires `bi_valid + tree[sym].len <= 16` and `tree[sym].len` is
+  at most 15, emit `bi_valid: [0, 1]` or `bi_valid + 15 <= 16` — not a
+  constraint that references `tree[sym]`.
+- **Shift operands.** `1U << n` or `x << n` is UB when `n >= bit-width`
+  of the promoted left operand. Always emit `n: [0, W-1]` (W = 32 or 64)
+  for shift amounts read from external sources.
+
+## Resolve typedefs
+
+The source may be preceded by a `## Type definitions` block listing
+`typedef` and `struct` definitions. Before reasoning about any
+variable's signedness or bit-width, resolve its declared type through
+those typedefs to the underlying primitive. An op on an unsigned type
+is NOT signed overflow.
 
 ## C-semantics reminders (apply BEFORE flagging an op as UB)
 
@@ -567,7 +594,10 @@ memsafe contract.
 
 In-scope kinds (use these exact `kind` strings):
   - `null_deref`         — `*p`, `p->f`, `p[i]` with p potentially NULL
-  - `buffer_overflow`    — `a[i]` with i potentially outside [0, len(a))
+  - `buffer_overflow`    — `a[i]` or `*(p + offset)` with index/offset
+                           potentially outside [0, len). Include cases where
+                           integer overflow or type confusion in the offset
+                           computation leads to an out-of-bounds pointer.
   - `use_after_free`     — deref of a pointer freed earlier on the path
   - `double_free`        — free of a pointer already freed on the path
   - `invalid_free`       — free of a pointer not from malloc / not at base
@@ -675,16 +705,24 @@ In-scope kinds:
   - `callee_requires`  — a callsite where callee.requires[overflow] may not
                          hold (cite which clause)
 
+NOT in scope (handled by the memsafe pass):
+  - Pointer arithmetic (`p + i`, `p - q`). Whether `p + i` stays within
+    the allocation is a buffer-bounds question, not integer overflow.
+    Only flag the integer sub-expression if it overflows on its OWN type
+    before being added to the pointer.
+
 ## Method (value-range; use the source language's expression syntax)
 
 Walk the body statement by statement, tracking each integer's range from:
-  (a) the function's published `requires[overflow]`,
+  (a) the function's published `requires[overflow]` — these are FACTS;
+      propagate them to every variable derived from the constrained input,
   (b) C constants assigned along the path,
   (c) callee `ensures[overflow]` after each callsite,
   (d) branch narrowing (`if (x > 0)` ⇒ `x >= 1` on the true side),
   (e) `assume_abort_if_not(c)` adds `c` to the path.
-For each in-scope op, ask: can the operand range admit UB? If yes, that op
-is an `integer_overflow` / `division_by_zero` / `shift_ub` issue.
+For each in-scope op, ask: can the operand range admit UB given the
+narrowed ranges? If yes, that op is an issue. If the requires already
+exclude the dangerous sub-range, the op is safe — do not re-flag it.
 
 **Skip dead branches.** If path facts make a branch's guard unsatisfiable
 (e.g. a `case` selector ruled out by an earlier `if`, code after a
@@ -717,6 +755,14 @@ callee.requires[overflow]? If not, emit `callee_requires`.
 - **Noreturn callees in guards.** A callsite annotated
   `// >>> noreturn: true` (e.g. `abort`, `exit`) does not return; if it
   sits in `if (G) noreturnCallee();`, code after the `if` may assume `!G`.
+
+## Resolve typedefs
+
+The source may be preceded by a `## Type definitions` block listing
+`typedef` and `struct` definitions. Before reasoning about any
+variable's signedness or bit-width, resolve its declared type through
+those typedefs to the underlying primitive. An op on an unsigned type
+is NOT signed overflow.
 
 ## Data model
 

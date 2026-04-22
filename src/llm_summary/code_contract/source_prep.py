@@ -70,30 +70,48 @@ def build_type_defs_section(
     # pp_definition stores the annotated macro-expanded form (// (macro)
     # lines) produced at scan time; use it when available.
     seen: dict[str, str] = {}
+    seen_canonical: dict[str, str] = {}
+    seen_kind: dict[str, str] = {}
     seen_from_same_file: set[str] = set()
     for row in rows + static_rows:
         name = row["name"]
         defn = row.get("pp_definition") or row.get("definition") or ""
         if not defn:
             continue
+        canonical = row.get("canonical_type") or ""
+        kind = row.get("kind") or ""
         same_file = row.get("file_path") == file_path
         if same_file:
             seen[name] = defn
+            seen_canonical[name] = canonical
+            seen_kind[name] = kind
             seen_from_same_file.add(name)
         elif name not in seen_from_same_file:
             if name not in seen or len(defn) < len(seen[name]):
                 seen[name] = defn
+                seen_canonical[name] = canonical
+                seen_kind[name] = kind
 
     if not seen:
         return ""
 
-    # Emit each unique definition block only once
+    # Emit each unique definition block only once.
+    # When the definition text doesn't reveal the primitive type
+    # (e.g. "typedef Z_U4 z_crc_t;"), append a canonical-type comment.
     emitted: set[str] = set()
     lines = ["## Referenced Type Definitions\n", "```c"]
-    for defn in seen.values():
+    for name, defn in seen.items():
         if defn not in emitted:
             emitted.add(defn)
-            lines.append(defn)
+            canonical = seen_canonical.get(name, "")
+            if (
+                canonical
+                and canonical not in defn
+                and seen_kind.get(name) == "typedef"
+            ):
+                lines.append(f"{defn}  // canonical: {canonical}")
+            else:
+                lines.append(defn)
             lines.append("")
     lines.append("```\n\n")
     return "\n".join(lines)

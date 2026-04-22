@@ -207,6 +207,11 @@ _VALID_ISSUE_KINDS = {
     "double_free",
     "uninitialized_use",
     "invalid_free",
+    "integer_overflow",
+    "division_by_zero",
+    "shift_ub",
+    "callee_requires",
+    "memory_leak",
 }
 _VALID_SEVERITIES = {"high", "medium", "low"}
 _VALID_CONTRACT_KINDS = {"disallow_null", "allow_null", "not_freed", "initialized", "buffer_size"}
