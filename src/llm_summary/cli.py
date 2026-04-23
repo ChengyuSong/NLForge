@@ -124,9 +124,9 @@ def main():
             "leak", "intoverflow", "code-contract",
         ]
     ),
-    help="Summary pass(es) to run (default: allocation). "
-         "Can be specified multiple times. "
-         "'code-contract' is mutually exclusive with the legacy types.",
+    help="Summary pass to run (default: code-contract). "
+         "Legacy types (allocation, free, init, memsafe, verify, leak, "
+         "intoverflow) are deprecated; use code-contract instead.",
 )
 @click.option(
     "--svcomp", is_flag=True,
@@ -171,31 +171,32 @@ def summarize(
     jobs, cache_mode, function_names, incremental, entry_functions,
     verify_only,
 ):
-    """Generate allocation, free, init, memsafe, and/or verify
-    summaries on a pre-populated database.
+    """Generate per-function safety contracts on a pre-populated database.
 
     Requires a database that already has functions and call_edges
     (populated via 'extract', 'scan', and/or 'import-callgraph').
 
-    Use --type to select which summary passes to run:
-        --type allocation  (default)
-        --type free
-        --type init
-        --type memsafe
-        --type verify      (requires all four prior passes)
-        --type leak        (requires allocation + free passes)
-        --type allocation --type free --type init --type memsafe  (run all)
+    The default pass is code-contract, which produces Hoare-style
+    requires/ensures contracts per function.  Legacy passes (allocation,
+    free, init, memsafe, verify, leak, intoverflow) are deprecated.
 
     Example:
-        llm-summary summarize --db func-scans/libpng/functions.db --backend ollama --model qwen3 -v
-        llm-summary summarize --db func-scans/libpng/functions.db --type free --backend llamacpp -v
-        llm-summary summarize --db func-scans/libpng/functions.db --type verify --backend ollama -v
+        llm-summary summarize --db functions.db --backend claude -v
+        llm-summary summarize --db functions.db --type code-contract --backend ollama -v
     """
-    # Default to allocation if no --type given
+    # Default to code-contract if no --type given
     if not summary_types:
-        summary_types = ("allocation",)
+        summary_types = ("code-contract",)
 
-    # code-contract is the new pipeline; mutually exclusive with the
+    legacy_types = {"allocation", "free", "init", "memsafe", "verify", "leak", "intoverflow"}
+    if legacy_types & set(summary_types):
+        console.print(
+            "[yellow]Warning: legacy summary types "
+            f"({', '.join(t for t in summary_types if t in legacy_types)}) "
+            "are deprecated. Use --type code-contract instead.[/yellow]"
+        )
+
+    # code-contract is the primary pipeline; mutually exclusive with the
     # legacy per-property cascade (those gates assume the old tables).
     if "code-contract" in summary_types and len(summary_types) > 1:
         console.print(

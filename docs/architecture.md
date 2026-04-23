@@ -4,9 +4,11 @@ This document describes the architecture of the LLM-based memory safety analysis
 
 ## System Overview
 
-The tool performs compositional, bottom-up analysis of C/C++ code to generate memory safety summaries across five passes (allocation, free, initialization, safety contracts, verification). It processes functions in dependency order (callees before callers) so that callee summaries are available when analyzing callers.
+The tool performs compositional, bottom-up analysis of C/C++ code to generate Hoare-style safety contracts (requires/ensures) per function. It processes functions in dependency order (callees before callers) so that callee contracts are available when analyzing callers.
 
-Analysis is **link-unit aware**: each build target (library, executable) gets its own database, and targets are processed in dependency order so that library summaries are available when analyzing executables that link them.
+The primary summarization pipeline is the **code-contract** pass, which produces per-function, per-property (memsafe/memleak/overflow) contracts in a single unified pass with interleaved verification. A legacy multi-pass pipeline (allocation, free, init, memsafe, verify) still exists but is being phased out.
+
+Analysis is **link-unit aware**: each build target (library, executable) gets its own database, and targets are processed in dependency order so that library contracts are available when analyzing executables that link them.
 
 ```
 Phase 0         Phase 1            Phase 2          Phase 3
@@ -24,8 +26,12 @@ build-learn ──▶ discover-link- ──▶ scan (per ──▶ call graph
                                    └────────┬────────┘
                                             ▼
                                        Phase 6
-                                       summarize (bottom-up)
-                                       alloc → free → init → memsafe → verify
+                                       summarize --type code-contract
+                                       (bottom-up, per-property)
+                                            │
+                                            ▼
+                                       Phase 7
+                                       check (entry-point obligations)
                                             │
                                             ▼
                                        functions.db
@@ -114,24 +120,49 @@ Abstraction layer for different LLM providers.
 
 ### 6. Graph Traversal Driver (`driver.py`)
 
-Unified bottom-up traversal engine. Builds the call graph once, computes SCCs, and runs one or more summary passes over functions in topological order (callees first). All five passes (`allocation`, `free`, `init`, `memsafe`, `verify`) can run together. Sourceless stubs (stdlib functions without bodies) are skipped from all passes.
+Unified bottom-up traversal engine. Builds the call graph once, computes SCCs, and runs one or more summary passes over functions in topological order (callees first). Sourceless stubs (stdlib functions without bodies) are skipped from all passes.
 
 **Key classes:**
 - `BottomUpDriver`: Owns graph building (cached) and SCC traversal. `run(passes, force, dirty_ids, pool)` executes all passes per function.
 - `SummaryPass` (Protocol): Interface each pass implements — `get_cached()`, `summarize()`, `store()`
-- `AllocationPass`: Adapter wrapping `AllocationSummarizer`
-- `FreePass`: Adapter wrapping `FreeSummarizer`
-- `InitPass`: Adapter wrapping `InitSummarizer`
-- `MemsafePass`: Adapter wrapping `MemsafeSummarizer` (accepts `alias_builder`)
-- `VerificationPass`: Adapter wrapping `VerificationSummarizer` (accepts `alias_builder`)
+- `CodeContractPass`: The primary pass — Hoare-style per-property contracts (see §7a)
+- `AllocationPass`, `FreePass`, `InitPass`, `MemsafePass`, `VerificationPass`: Legacy pass adapters (being phased out)
 
 **Parallel execution:** When `-j N` is given (N > 1), the driver uses `LLMPool` and `orderer.get_parallel_levels()` to execute functions at the same depth in the SCC DAG concurrently. Synchronizes at level boundaries to ensure transitive dependencies are resolved.
 
 **Incremental support:** When `dirty_ids` is provided, the driver computes the affected set (dirty functions + transitive callers via reverse edges) and only re-summarizes those; all others load from cache.
 
-### 7. Summary Generators (`summarizer.py`, `free_summarizer.py`, `init_summarizer.py`, `memsafe_summarizer.py`, `verification_summarizer.py`)
+### 7. Code-Contract Pipeline (`code_contract/`)
 
-Per-function LLM summarization logic. Each summarizer builds a prompt from the function source and callee summaries, queries the LLM, and parses the structured response.
+The primary summarization pipeline. Produces Hoare-style contracts (requires/ensures/modifies) per function, per safety property, with interleaved verification. Designed for efficient use with small/local models (Haiku, Qwen) via cached system prompts and per-property single-turn calls.
+
+**Properties:** `memsafe` (null deref, buffer overflow, use-after-free), `memleak` (resource leaks), `overflow` (integer overflow, division-by-zero, shift UB).
+
+**Modules:**
+- `models.py`: `CodeContractSummary` dataclass — per-property `requires` (preconditions), `ensures` (postconditions), `modifies` (written locations), `notes`, `origin` (provenance tracking for each requires clause), `noreturn` flag, optional `inline_body`
+- `pass_.py`: `CodeContractPass` — implements `SummaryPass` protocol; per-property LLM calls with interleaved verification; callee discharge (every callee requires must be discharged or propagated)
+- `prompts.py`: System prompt + per-property prompts (`MEMSAFE_PROMPT`, `MEMLEAK_PROMPT`, `OVERFLOW_PROMPT`, `VERIFY_PROMPT`) with detailed rules for contract generation
+- `features.py`: Static-analysis feature gating — determines which properties are in scope per function using regex heuristics or KAMain IR sidecar data; clang warning bump; LLVM attribute drops (`readnone` → skip memsafe+memleak)
+- `inliner.py`: Builds callee contract blocks and inlines callsite annotations; expands inline-body callees as comments
+- `source_prep.py`: Prepares function source with typedef sections and macro annotations
+- `checker.py`: Phase 7 entry-point obligation checking — walks call graph from entry functions, surfaces non-trivial `requires` clauses with witness chains tracing back through `origin` links to leaf operations
+- `stdlib.py`: Hardcoded stdlib contracts (malloc, free, memcpy, etc.) that seed the pipeline
+
+**Key design principles:**
+- **Code is the summary** — contracts are C-expression predicates attached to source, not JSON taxonomies
+- **No verdict field** — compositional pre/post only; bug-finding is the separate entry-point check
+- **Callee discharge is mandatory** — every callee `requires` must be either discharged (satisfied locally) or propagated; no inventing new clauses
+- **Adaptive scoping** — only ask property questions a function can answer (static features + callee signatures)
+- **Inline small functions** — if body < threshold, paste at callsites instead of summarizing
+
+**DB table:** `code_contract_summaries`
+**CLI:** `llm-summary summarize --type code-contract`, `llm-summary check`
+
+### 7-legacy. Summary Generators (legacy, being phased out)
+
+`summarizer.py`, `free_summarizer.py`, `init_summarizer.py`, `memsafe_summarizer.py`, `verification_summarizer.py`
+
+Per-function LLM summarization logic across five separate passes. Each summarizer builds a prompt from the function source and callee summaries, queries the LLM, and parses the structured response.
 
 **Key classes:**
 - `AllocationSummarizer`: Allocation/buffer-size-pair analysis
@@ -153,6 +184,7 @@ SQLite storage for all analysis data.
 - `init_summaries`: Generated initialization summaries as JSON
 - `memsafe_summaries`: Generated safety contract summaries as JSON
 - `verification_summaries`: Generated verification results as JSON
+- `code_contract_summaries`: Hoare-style per-property contracts as JSON (primary pipeline)
 - `call_edges`: Call graph with callsite locations
 - `address_taken_functions`: Functions whose addresses are taken
 - `address_flows`: Where function addresses flow to
@@ -164,24 +196,13 @@ SQLite storage for all analysis data.
 - `typedefs`: Type declarations (typedef, using, struct/class/union)
 - `issue_reviews`: Manual triage records for verification issues (status, reason, reviewer)
 
-### 9. Standard Library (`stdlib.py`)
+### 9. Standard Library (`stdlib.py`, `code_contract/stdlib.py`)
 
-Pre-defined allocation, free, and initialization summaries for common C standard library functions.
+Pre-defined summaries for common C standard library functions, seeded before bottom-up analysis so they are cache hits.
 
-**Allocation summaries:**
-- Memory: `malloc`, `calloc`, `realloc`, `reallocarray`, `aligned_alloc`
-- Strings: `strdup`, `strndup`, `asprintf`, `getline`
-- Files: `fopen`, `fdopen`, `tmpfile`, `opendir`
-- Memory mapping: `mmap`, `munmap`
+**Code-contract stdlib** (`code_contract/stdlib.py`): Hoare-style requires/ensures/modifies contracts for libc functions (malloc, free, memcpy, memset, strlen, printf, etc.). Used by the primary code-contract pipeline.
 
-**Free summaries:**
-- `free`, `realloc`, `fclose`, `closedir`, `munmap`, `freeaddrinfo`
-
-**Init summaries:**
-- `calloc`, `memset`, `memcpy`, `memmove`, `strncpy`, `snprintf`, `strdup`, `strndup`
-
-**Memsafe summaries:**
-- `memcpy`, `memmove`, `memset`, `free`, `strlen`, `strcpy`, `strncpy`, `strcmp`, `snprintf`, `printf`, `fprintf`, `fwrite`, `fread`, `malloc`
+**Legacy stdlib** (`stdlib.py`): Per-pass summaries (allocation, free, init, memsafe) for the legacy multi-pass pipeline.
 
 ### 10. V-Snapshot Alias Context (`vsnapshot.py`, `alias_context.py`)
 
@@ -242,7 +263,8 @@ See [link-unit-analysis.md](link-unit-analysis.md) for the full design.
 Command-line interface using Click.
 
 **Commands:**
-- `summarize`: Generate summaries (`--type allocation|free|init|memsafe|verify`, `-j N` for parallel)
+- `summarize`: Generate summaries (`--type code-contract` for the primary pipeline; legacy types: `allocation|free|init|memsafe|verify`, `-j N` for parallel)
+- `check`: Entry-point obligation check — surfaces non-trivial `requires` at entry functions with witness chains (no LLM)
 - `extract`: Function and call graph extraction only
 - `callgraph`: Export call graph
 - `show`: Display summaries
@@ -268,7 +290,7 @@ Command-line interface using Click.
 
 ## End-to-End Pipeline
 
-The full pipeline for analyzing a project has seven phases. Each phase corresponds to one or more CLI commands. For link-unit projects, phases 2–6 run per target in dependency order (libraries before executables).
+The full pipeline for analyzing a project has nine phases (7 core + 2 optional). Each phase corresponds to one or more CLI commands. For link-unit projects, phases 2–7 run per target in dependency order (libraries before executables).
 
 See [link-unit-analysis.md](link-unit-analysis.md) for the full link-unit design and cross-project dependency handling.
 
@@ -328,9 +350,26 @@ Before summarization, populate the target DB with pre-existing summaries so the 
 
 **Output:** stdlib and dependency function stubs + summaries in `functions.db`
 
-### Phase 6: Summarize (`summarize`)
+### Phase 6: Summarize (`summarize --type code-contract`)
 
-Bottom-up LLM summarization via `BottomUpDriver`. Builds the call graph once, computes SCCs via Tarjan's algorithm, and traverses in topological order (callees first). Runs one or more summary passes per function:
+Bottom-up LLM summarization via `BottomUpDriver`. Builds the call graph once, computes SCCs via Tarjan's algorithm, and traverses in topological order (callees first).
+
+**Code-contract pipeline (primary):** A single `CodeContractPass` produces Hoare-style contracts per function, per in-scope property:
+
+| Property | What it captures |
+|----------|------------------|
+| `memsafe` | Null deref, buffer overflow, use-after-free, uninitialized use |
+| `memleak` | Resource leaks (alloc without matching free) |
+| `overflow` | Integer overflow, division-by-zero, shift UB |
+
+For each function, the pass: (1) computes in-scope properties via static feature gating, (2) makes one LLM call per property to produce requires/ensures/modifies, (3) runs an interleaved verification call to check callee discharge, (4) stores the merged `CodeContractSummary`. Small functions (body shorter than the contract would be) are inlined as raw body at callsites instead of being summarized.
+
+Functions with existing contracts (stdlib, deps, prior runs) are cache hits. Only new/dirty functions get LLM calls. Parallel execution across SCC levels with `-j N`.
+
+**Output:** `code_contract_summaries` in `functions.db`
+
+<details>
+<summary>Legacy multi-pass pipeline (being phased out)</summary>
 
 | Pass | Type | Direction | What it captures |
 |------|------|-----------|------------------|
@@ -340,15 +379,22 @@ Bottom-up LLM summarization via `BottomUpDriver`. Builds the call graph once, co
 | 4 | `memsafe` | Pre-condition | Safety contracts (not-null, buffer-size, etc.) |
 | 5 | `verify` | Cross-pass | Issues + simplified contracts |
 
-Passes 1–4 are independent and can run together. Pass 5 requires passes 1–4 to exist. Optional `--vsnap` provides alias context for passes 4–5 (see [vsnapshot-alias-context.md](vsnapshot-alias-context.md)).
-
-Functions with existing summaries (stdlib, deps, prior runs) are cache hits. Only new/dirty functions get LLM calls. Parallel execution across SCC levels with `-j N`.
+Passes 1–4 are independent and can run together. Pass 5 requires passes 1–4 to exist. Optional `--vsnap` provides alias context for passes 4–5.
 
 **Output:** `allocation_summaries`, `free_summaries`, `init_summaries`, `memsafe_summaries`, `verification_summaries` in `functions.db`
+</details>
 
-### Phase 7: Issue Triage (`show-issues`, `review-issue`)
+### Phase 7: Entry-Point Check (`check`)
 
-After verification, analysts review flagged issues. `show-issues` lists all `SafetyIssue` records from `verification_summaries` with their current review status. `review-issue` updates the `issue_reviews` table for a specific issue:
+After code-contract summarization, the checker walks the call graph from entry functions (functions with no callers) and surfaces every non-trivial `requires` clause as an `Obligation`. Each obligation includes a witness chain built by following `origin` links back through the callees that propagated the clause, terminating at `local` leaves where the requirement originates from a concrete operation.
+
+No LLM is needed — this is a pure-Python graph traversal over stored contracts.
+
+**Output:** `check_report.json` with obligations per entry function
+
+### Phase 8 (optional): Issue Triage (`show-issues`, `review-issue`)
+
+After verification (legacy pipeline), analysts review flagged issues. `show-issues` lists all `SafetyIssue` records from `verification_summaries` with their current review status. `review-issue` updates the `issue_reviews` table for a specific issue:
 
 - **confirmed** — real bug, ready for downstream use
 - **false_positive** — LLM hallucination or infeasible path
@@ -356,7 +402,7 @@ After verification, analysts review flagged issues. `show-issues` lists all `Saf
 
 **Output:** `issue_reviews` records in `functions.db`
 
-### Phase 8 (optional): Harness Generation (`gen-harness`)
+### Phase 9 (optional): Harness Generation (`gen-harness`)
 
 For issues of interest, generate a C shim harness to drive contract-guided concolic execution with SymSan/ucsan. The harness wraps the target function's contracts and can be used with the Thoroupy policy scheduler for path exploration.
 
@@ -373,12 +419,13 @@ Batch scripts under `scripts/` orchestrate the pipeline across multiple projects
 | `batch_build_learn.py` | 0 | Runs `build-learn` for each project sequentially |
 | `batch_scan_targets.py` | 2 | Extracts functions, address-taken, indirect callsites (`-j` parallel) |
 | `batch_call_graph_gen.py` | 3–4 | Runs KAMain (compositional CFL) + imports call graph per target |
-| `batch_summarize.py` | 5–6 | Seeds stdlib/dep summaries, runs passes 1–3 then pass 4 separately |
-| `batch_verify.py` | 6 | Runs pass 5 (verification) after passes 1–4 complete |
+| `batch_code_contract.py` | 5–7 | Seeds stdlib/dep contracts, runs code-contract summarization, optional entry-point check |
+| `batch_summarize.py` | 5–6 | (Legacy) Seeds stdlib/dep summaries, runs passes 1–3 then pass 4 separately |
+| `batch_verify.py` | 6 | (Legacy) Runs pass 5 (verification) after passes 1–4 complete |
 | `batch_container_detect.py` | aux | Detects container functions (heuristic + LLM) |
 | `cgc_run.sh` | benchmark | Full CGC benchmark: extract GT, scan, verify, evaluate |
 
-All link-unit-aware scripts read `link_units.json` and toposort targets by `link_deps`. `batch_summarize.py` runs `import-dep-summaries` from intra-project dep DBs before each target's summarization. Cross-project dependencies are tracked in `project_deps.json`.
+All link-unit-aware scripts read `link_units.json` and toposort targets by `link_deps`. `batch_code_contract.py` runs `import-dep` and `import-dep-summaries` before each target's summarization. Cross-project dependencies are tracked in `project_deps.json`.
 
 See [cgc-benchmark.md](cgc-benchmark.md) for the CGC benchmark pipeline.
 
@@ -394,29 +441,27 @@ See [cgc-benchmark.md](cgc-benchmark.md) for the CGC benchmark pipeline.
 
 ```
 Step 1: Analyze zlib (no deps)
-  build-learn              → compile_commands.json, .bc files
-  discover-link-units      → zlib/link_units.json
-  scan --target zlibstatic → zlib/zlibstatic/functions.db
-  KAMain phase 1           → zlib/zlibstatic/zlibstatic.cflcg
-  KAMain phase 2           → zlib/zlibstatic/callgraph.json, .vsnap
-  import-callgraph         → call_edges in functions.db
-  init-stdlib              → stdlib stubs
-  summarize alloc+free+init → post-condition summaries
-  summarize memsafe         → pre-condition contracts
-  summarize verify          → cross-pass verification
+  build-learn                     → compile_commands.json, .bc files
+  discover-link-units             → zlib/link_units.json
+  scan --target zlibstatic        → zlib/zlibstatic/functions.db
+  KAMain phase 1                  → zlib/zlibstatic/zlibstatic.cflcg
+  KAMain phase 2                  → zlib/zlibstatic/callgraph.json, .vsnap
+  import-callgraph                → call_edges in functions.db
+  init-stdlib                     → stdlib contracts
+  summarize --type code-contract  → per-function Hoare-style contracts
+  check                           → entry-point obligations
 
 Step 2: Analyze libpng (depends on zlib)
-  build-learn              → compile_commands.json, .bc files
-  discover-link-units      → libpng/link_units.json
-  scan --target libpng16   → libpng/libpng16/functions.db
-  KAMain phase 1           → libpng/libpng16/libpng16.cflcg
-  KAMain phase 2 (+zlib)   → libpng/libpng16/callgraph.json, .vsnap
-  import-callgraph         → call_edges
-  import-dep-summaries     → zlib summaries copied in
-  init-stdlib              → stdlib stubs
-  summarize alloc+free+init → post-condition summaries (zlib → cache hit)
-  summarize memsafe         → pre-condition contracts
-  summarize verify          → cross-pass verification
+  build-learn                     → compile_commands.json, .bc files
+  discover-link-units             → libpng/link_units.json
+  scan --target libpng16          → libpng/libpng16/functions.db
+  KAMain phase 1                  → libpng/libpng16/libpng16.cflcg
+  KAMain phase 2 (+zlib)          → libpng/libpng16/callgraph.json, .vsnap
+  import-callgraph                → call_edges
+  import-dep + import-dep-summaries → zlib contracts copied in
+  init-stdlib                     → stdlib contracts
+  summarize --type code-contract  → per-function contracts (zlib → cache hit)
+  check                           → entry-point obligations
 ```
 
 ### Directory Layout
@@ -454,82 +499,43 @@ When source files change:
    - Cascade invalidation to all callers (transitive)
 4. Re-analyze only invalidated functions (dirty set + reverse-edge closure)
 
-## Memory Safety Analysis Framework
+## Safety Analysis Framework
 
-The system uses a multi-pass, Hoare-logic-inspired approach to check memory safety. Post-condition passes (1-3) summarize what each function *produces*. The pre-condition pass (4) summarizes what each function *requires*. The verification pass (5) checks that post-conditions satisfy pre-conditions at each call site.
+### Code-Contract Pipeline (primary)
 
-All passes are bottom-up (callees before callers) and independent of each other except where noted.
+The system uses a Hoare-logic approach: each function gets a contract of **requires** (preconditions callers must satisfy) and **ensures** (postconditions the function guarantees), scoped per safety property. Analysis is bottom-up — callee contracts are available when analyzing callers.
 
-### Pass 1: Allocation Summary (post-condition) — existing
+**Per-property contracts:**
 
-Captures memory allocations and buffer-size pairs produced by each function.
+| Property | Requires (preconditions) | Ensures (postconditions) |
+|----------|-------------------------|--------------------------|
+| `memsafe` | not-null, valid-buffer-size, initialized, not-freed | null-check guarantees, initialization, deallocation |
+| `memleak` | (rare) | allocations returned/stored, frees performed |
+| `overflow` | value-range bounds, non-zero divisor | output-range bounds |
 
-- What gets allocated (heap/stack/static), via which allocator, size expression
-- Which parameters affect allocation size
-- Buffer-size pairs established: `(buffer, size)` relationships produced by the function
-- Supports project-specific allocators via `--allocator-file`
+**Contract composition rules:**
+- **Callee discharge is mandatory**: at each callsite, the caller must either satisfy the callee's `requires` locally or propagate it as its own `requires`
+- **No verdict field**: the contract is pre/post only — bug-finding happens in the separate entry-point check (Phase 7), which surfaces any `requires` clause that reaches an entry function undischarged
+- **Origin tracking**: each `requires` clause records whether it was derived locally or propagated from a callee (with index), enabling witness chains from entry functions back to the leaf operation
 
-**Summarizer:** `AllocationSummarizer`
+**Adaptive property scoping:** Not every function needs every property. Static feature gating (regex over source, or KAMain IR sidecar data) determines which of {memsafe, memleak, overflow} are in scope. LLVM function attributes can drop properties entirely (`readnone` → skip memsafe+memleak). Clang `-Wall` warnings bump feature bits back when constant-folding deletes the IR evidence.
 
-### Pass 2: Free Summary (post-condition) — implemented
+**Inline-body shortcut:** Functions whose body is shorter than the contract would be are not summarized — their raw body is pasted at every callsite instead, giving callers full visibility.
 
-Captures which buffers get freed by each function.
+### Legacy Multi-Pass Pipeline (being phased out)
 
-- **Target**: what gets freed (`ptr`, `info_ptr->palette`, `row_buf`)
-- **Target kind**: `parameter`, `field`, `local`, or `return_value`
-- **Deallocator**: `free`, `png_free`, `g_free`, or project-specific
-- **Conditional**: whether the free is inside an if/error path
-- **Nulled after**: whether the pointer is set to NULL after free
-- Supports project-specific deallocators via `--deallocator-file`
+<details>
+<summary>Five separate passes with different JSON schemas</summary>
 
-Feeds temporal safety checks (use-after-free, double-free).
+The legacy pipeline uses five passes. Post-condition passes (1-3) summarize what each function *produces*. The pre-condition pass (4) summarizes what each function *requires*. The verification pass (5) checks that post-conditions satisfy pre-conditions at each call site.
 
-**Summarizer:** `FreeSummarizer` (`free_summarizer.py`)
-**DB table:** `free_summaries`
-**CLI:** `llm-summary summarize --type free`
-
-### Pass 3: Initialization Summary (post-condition) — implemented
-
-Captures what each function **always** initializes on all non-error exit paths (caller-visible only).
-
-- **Target**: what gets initialized (`*out`, `ctx->data`, `return value`)
-- **Target kind**: `parameter` (output param), `field` (struct field via param), or `return_value`
-- **Initializer**: how it's initialized (`memset`, `assignment`, `calloc`, `callee:func_name`)
-- **Byte count**: how many bytes (`n`, `sizeof(T)`, `full`, or null)
-
-Only unconditional, guaranteed initializations visible to the caller. Local variables are excluded (not a post-condition). Feeds uninitialized-use checks (Pass 5).
-
-**Summarizer:** `InitSummarizer` (`init_summarizer.py`)
-**DB table:** `init_summaries`
-**CLI:** `llm-summary summarize --type init`
-
-### Pass 4: Safety Contracts (pre-condition) — implemented
-
-Captures what contracts must hold for safe execution of each function. This is the *requirement* side — what callers must guarantee.
-
-- **Not-null contracts** (`not_null`): pointer parameters that are dereferenced must not be NULL
-- **Not-freed contracts** (`not_freed`): pointers passed to free/dealloc must point to live memory
-- **Buffer-size contracts** (`buffer_size`): pointers used in memcpy/indexing must have sufficient capacity (includes `size_expr` and `relationship`)
-- **Initialized contracts** (`initialized`): variables/fields used in deref, branch, or index must be initialized
-
-Callee contracts that a function does NOT satisfy internally are propagated as the function's own contracts.
-
-Note: uninitialized *read* into a variable is benign; uninitialized *use* (dereference, branch, index) is the safety issue.
-
-**Summarizer:** `MemsafeSummarizer` (`memsafe_summarizer.py`)
-**DB table:** `memsafe_summaries`
-**CLI:** `llm-summary summarize --type memsafe`
-
-### Pass 5: Verification & Contract Simplification — implemented
-
-Cross-pass verification that checks post-conditions against pre-conditions at each call site. For each function, the verifier:
-
-1. **Internal safety check** — does the function itself perform unsafe operations?
-2. **Callee pre-condition satisfaction** — at each call site, are the callee's memsafe contracts satisfied?
-3. **Contract simplification** — removes Pass 4 contracts that the function satisfies internally, keeping only contracts that must propagate to callers.
-4. **Issue reporting** — unsatisfied pre-conditions become `SafetyIssue` findings with severity levels.
-
-The verifier queries the DB directly for Passes 1-3 callee post-conditions and Pass 4 raw contracts (cross-pass data), while receiving `VerificationSummary` callee summaries from the driver for already-verified callees (simplified contracts).
+| Pass | Type | Direction | What it captures |
+|------|------|-----------|------------------|
+| 1 | `allocation` | Post-condition | Allocations, buffer-size pairs, may-be-null |
+| 2 | `free` | Post-condition | Deallocations, conditional frees, nulled-after |
+| 3 | `init` | Post-condition | Guaranteed initializations (caller-visible) |
+| 4 | `memsafe` | Pre-condition | Safety contracts (not-null, buffer-size, etc.) |
+| 5 | `verify` | Cross-pass | Issues + simplified contracts |
 
 | Safety class | Post-condition passes | Pre-condition (pass 4) |
 |---|---|---|
@@ -539,13 +545,8 @@ The verifier queries the DB directly for Passes 1-3 callee post-conditions and P
 | Double free | 2 (what's freed) | not-freed contracts |
 | Uninitialized use | 3 (what's initialized) | must-be-initialized contracts |
 
-Issue severity: **high** (definite violation), **medium** (depends on caller), **low** (unlikely/defensive).
-
-**Summarizer:** `VerificationSummarizer` (`verification_summarizer.py`)
-**DB table:** `verification_summaries`
-**CLI:** `llm-summary summarize --type verify`
-
-**Dependencies:** Passes 1-4 are independent and run together in a single `BottomUpDriver` traversal when multiple `--type` flags are given. Pass 5 requires all four prior passes to exist (prerequisite check in CLI).
+**CLI:** `llm-summary summarize --type allocation|free|init|memsafe|verify`
+</details>
 
 ## Design Decisions
 
