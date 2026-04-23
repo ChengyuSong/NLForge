@@ -32,11 +32,7 @@ from .db import SummaryDB
 from .git_tools import GIT_TOOL_DEFINITIONS as _GIT_TOOL_DEFS
 from .git_tools import GitTools
 from .llm.base import LLMBackend
-from .models import (
-    Function,
-    SafetyIssue,
-    VerificationSummary,
-)
+from .models import Function, SafetyIssue
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -96,8 +92,8 @@ _DB_TOOLS = {
     "read_function_source",
     "get_callers",
     "get_callees",
-    "get_summaries",
-    "get_verification_summary",
+    "get_contracts",
+    "get_issues",
 }
 
 PHASE_TOOLS: dict[str, set[str]] = {
@@ -129,9 +125,14 @@ You are a memory safety bug triage agent for C/C++ code.
 
 ## Task
 
-You are given a potential memory safety issue found by static verification.
-Your job is to produce a PROOF — either proving the issue is safe (cannot
-manifest) or proving it is feasible (can be triggered).
+You are given a potential safety issue found by verification. Each function
+has a code-contract summary with Hoare-style requires/ensures per property
+(memsafe, memleak, overflow). Your job is to produce a PROOF — either
+proving the issue is safe (cannot manifest) or proving it is feasible (can
+be triggered).
+
+Use get_contracts to read any function's requires (preconditions) and
+ensures (postconditions). Use get_issues to see verification issues.
 
 ## Two Outcomes
 
@@ -139,9 +140,9 @@ manifest) or proving it is feasible (can be triggered).
 
 Prove the issue cannot manifest by showing that caller constraints prevent
 the triggering condition. You MUST provide:
-- **updated_contracts**: New or strengthened pre/post-conditions that
-  eliminate the issue. These get written back to the DB so the verifier
-  won't report this false positive again.
+- **updated_contracts**: New or strengthened requires/ensures clauses
+  that prove the issue away. Specify the function, property, clause_type
+  (requires or ensures), and predicate (C expression).
 - **assumptions**: What caller constraints make this safe.
   E.g., "all callers validate `size <= BUF_MAX` before calling this function"
 - **assertions**: The violation condition that cannot be reached.
@@ -159,9 +160,9 @@ execution path. You MUST provide:
 
 ## Key Principle
 
-The verifier checks each function in isolation, assuming its pre-conditions
-hold. But callers may constrain arguments more tightly than the declared
-contracts. Your job is to check the CALLER CONTEXT:
+The verifier checks each function in isolation, assuming its requires
+clauses hold. But callers may constrain arguments more tightly than the
+declared contracts. Your job is to check the CALLER CONTEXT:
 
 - An integer overflow in `alloc(width * height)` is real only if callers
   can pass values large enough to overflow
@@ -179,9 +180,10 @@ deprecated APIs. Treat deprecated functions as reachable entry points.
 
 ### ANALYZE phase
 1. Read the flagged function's source code
-2. Read caller functions — understand how the function is invoked
-3. Check callee contracts — understand what guarantees callees provide
-4. Trace the data flow: where do the problematic parameters come from?
+2. Read its contracts (get_contracts) — understand its requires/ensures
+3. Read caller functions — understand how the function is invoked
+4. Check callee contracts — understand what guarantees callees provide
+5. Trace the data flow: where do the problematic parameters come from?
 
 ### HYPOTHESIZE phase
 1. Formulate your hypothesis: safe or feasible
@@ -298,7 +300,6 @@ class TriageAgent:
         func: Function,
         issue: SafetyIssue,
         issue_index: int,
-        vsummary: VerificationSummary,
     ) -> TriageResult:
         """Triage a single issue via LLM ReAct loop."""
         git = (
@@ -307,7 +308,7 @@ class TriageAgent:
         executor = TriageToolExecutor(
             self.db, verbose=self.verbose, git_tools=git,
         )
-        user_prompt = self._build_issue_prompt(func, issue, issue_index, vsummary)
+        user_prompt = self._build_issue_prompt(func, issue, issue_index)
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_prompt},
         ]
@@ -413,15 +414,15 @@ class TriageAgent:
         if func.id is None:
             return []
 
-        vsummary = self.db.get_verification_summary_by_function_id(func.id)
-        if vsummary is None or not vsummary.issues:
+        vs = self.db.get_verification_summary_by_function_id(func.id)
+        if vs is None or not vs.issues:
             return []
 
         results = []
-        for i, issue in enumerate(vsummary.issues):
+        for i, issue in enumerate(vs.issues):
             if severity_filter and issue.severity not in severity_filter:
                 continue
-            result = self.triage_issue(func, issue, i, vsummary)
+            result = self.triage_issue(func, issue, i)
             results.append(result)
         return results
 
@@ -430,7 +431,6 @@ class TriageAgent:
         func: Function,
         issue: SafetyIssue,
         issue_index: int,
-        vsummary: VerificationSummary,
     ) -> str:
         lines = [
             "## Issue to Triage",
@@ -447,27 +447,13 @@ class TriageAgent:
         ]
         if issue.callee:
             lines.append(f"- **Callee involved**: {issue.callee}")
-        if issue.contract_kind:
-            lines.append(f"- **Contract violated**: {issue.contract_kind}")
-
-        if vsummary.description:
-            lines.extend(["", "### Verifier Assessment", vsummary.description])
-
-        if len(vsummary.issues) > 1:
-            lines.extend(["", "### Other Issues in This Function"])
-            for j, other in enumerate(vsummary.issues):
-                if j == issue_index:
-                    continue
-                lines.append(
-                    f"- #{j}: [{other.severity}] {other.issue_kind} "
-                    f"at {other.location} — {other.description}"
-                )
 
         lines.extend([
             "",
             "### Instructions",
             "Follow the workflow: ANALYZE -> HYPOTHESIZE -> VERDICT.",
-            "Start by reading the function source, then check its callers.",
+            "Start by reading the function source and its contracts "
+            "(get_contracts), then check its callers.",
             "Produce either a safety proof or a feasibility proof.",
         ])
         return "\n".join(lines)

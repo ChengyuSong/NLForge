@@ -1834,6 +1834,8 @@ echo "Built: $OUT"
             return None
 
         source_path = Path(source_file)
+        if not source_path.is_absolute() and self.project_path:
+            source_path = self.project_path / source_path
         if not source_path.exists():
             if self.verbose:
                 print(f"    Source file not found: {source_file}")
@@ -1925,6 +1927,10 @@ echo "Built: $OUT"
         shim_file = out_dir / f"shim_{func_name}.c"
         cfg_dump = out_dir / f"cfg_{func_name}.txt"
 
+        # Resolve file_path against project root
+        if file_path and not Path(file_path).is_absolute() and self.project_path:
+            file_path = str(self.project_path / file_path)
+
         # Build include flags from compile_commands
         include_flags_str = ""
         if self.compile_commands and file_path:
@@ -1951,8 +1957,14 @@ echo "Built: $OUT"
                     f'"{f}"' for f in cflags
                 ) + " \\\n    "
 
-        # Determine source files to compile
-        srcs = source_files or ([file_path] if file_path else [])
+        # Determine source files to compile (resolve relative paths)
+        raw_srcs = source_files or ([file_path] if file_path else [])
+        srcs = []
+        for s in raw_srcs:
+            p = Path(s)
+            if not p.is_absolute() and self.project_path:
+                p = self.project_path / p
+            srcs.append(str(p))
 
         if srcs:
             # Compile from source — enables BB tracing

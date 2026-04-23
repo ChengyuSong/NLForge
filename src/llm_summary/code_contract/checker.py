@@ -11,6 +11,7 @@ Used by `llm-summary check --db ... [--entry FUNC]`.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +60,10 @@ class Obligation:
                 for s in self.witness_chain
             ],
         }
+
+    def fingerprint(self) -> str:
+        key = f"{self.property}|{self.entry_function}|{self.predicate[:80]}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def _build_witness_chain(

@@ -4619,7 +4619,7 @@ def triage(
                     )
                     sys.exit(1)
                 issue = vs.issues[issue_index]
-                result = agent.triage_issue(func, issue, issue_index, vs)
+                result = agent.triage_issue(func, issue, issue_index)
                 all_results.append(result)
             else:
                 results = agent.triage_function(
@@ -4929,8 +4929,11 @@ def gen_harness(
                                 link_err = (
                                     build_result.stderr + build_result.stdout
                                 ).strip()
+                                shim_name = f"shim_{harness_name}.c"
+                                shim_mentioned = shim_name in link_err
                                 if (
-                                    generator._can_use_fix_agent()
+                                    shim_mentioned
+                                    and generator._can_use_fix_agent()
                                     and build_attempt < 2
                                 ):
                                     console.print(
@@ -4938,7 +4941,7 @@ def gen_harness(
                                         f"(attempt {build_attempt + 1}), "
                                         f"retrying with fix agent...[/yellow]"
                                     )
-                                    shim_path = out / f"shim_{harness_name}.c"
+                                    shim_path = out / shim_name
                                     cfg_yaml = out / f"config_{harness_name}.yaml"
                                     if shim_path.exists() and cfg_yaml.exists():
                                         fixed = generator._fix_with_agent(

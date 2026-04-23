@@ -2,8 +2,8 @@
 
 Tools are defined once and exposed to different agents via allow-lists.
 Read-only tools: read_function_source, get_callers, get_callees,
-                 get_summaries, get_verification_summary
-Write tools:     upsert_review, update_summary, submit_verdict
+                 get_contracts
+Write tools:     update_contracts, submit_verdict
 """
 
 from __future__ import annotations
@@ -11,24 +11,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .code_contract.models import CodeContractSummary
 from .db import SummaryDB
 from .git_tools import GitTools
-from .models import (
-    Allocation,
-    AllocationSummary,
-    AllocationType,
-    BufferSizePair,
-    FreeOp,
-    FreeSummary,
-    Function,
-    InitOp,
-    InitSummary,
-    MemsafeContract,
-    MemsafeSummary,
-    ParameterInfo,
-    SafetyIssue,
-    VerificationSummary,
-)
+from .models import Function
 
 # ---------------------------------------------------------------------------
 # Tool definitions (Anthropic tool-use schema)
@@ -93,13 +79,12 @@ READ_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "get_summaries",
+        "name": "get_contracts",
         "description": (
-            "Get all analysis summaries for any function: memory safety "
-            "pre-conditions, simplified contracts from verification, "
-            "post-conditions (allocations, frees, initializations), and "
-            "verification issues. Works for the target function, its "
-            "callers, or its callees."
+            "Get the code-contract summary for a function: Hoare-style "
+            "requires (preconditions), ensures (postconditions), and "
+            "modifies per safety property (memsafe, memleak, overflow). "
+            "Works for the target function, its callers, or its callees."
         ),
         "input_schema": {
             "type": "object",
@@ -113,12 +98,11 @@ READ_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "get_verification_summary",
+        "name": "get_issues",
         "description": (
-            "Get the full verification summary for a function, including "
-            "all issues found and simplified contracts. Use this to see "
-            "what the verifier reported for any function (callers, callees, "
-            "or the target itself)."
+            "Get the safety issues found for a function during "
+            "verification. Returns issue kind, location, severity, and "
+            "description for each issue."
         ),
         "input_schema": {
             "type": "object",
@@ -139,7 +123,7 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Mark a verification issue as false_positive or confirmed. "
             "This updates the issue_reviews table so the issue is skipped "
-            "in future validation runs."
+            "in future triage runs."
         ),
         "input_schema": {
             "type": "object",
@@ -166,40 +150,35 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "update_summary",
+        "name": "update_contracts",
         "description": (
-            "Update a function's summary for a specific pass. Use this to "
-            "correct wrong summaries that cause false positives in callers. "
-            "For example, if a callee's allocation summary says may_be_null=true "
-            "but the function never returns NULL (it calls an error handler), "
-            "update the allocation summary to set may_be_null=false. "
-            "After updating, all callers become dirty and will be re-verified "
-            "on the next incremental run.\n\n"
-            "The summary_json must match the schema of the target pass."
+            "Update a function's code-contract summary. Use this to correct "
+            "wrong contracts that cause false positives in callers. For "
+            "example, if a callee's requires says 'ptr != NULL' but the "
+            "callee actually handles NULL gracefully, remove the requires "
+            "clause. After updating, all callers become dirty and will be "
+            "re-verified on the next incremental run.\n\n"
+            "The contracts object must have the code-contract schema: "
+            "properties, requires, ensures, modifies, notes per property."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "function_name": {
                     "type": "string",
-                    "description": "Name of the function whose summary to update.",
+                    "description": "Name of the function whose contracts to update.",
                 },
-                "pass_name": {
-                    "type": "string",
-                    "enum": [
-                        "allocation", "free", "init", "memsafe", "verification",
-                    ],
-                    "description": "Which summary pass to update.",
-                },
-                "summary_json": {
+                "contracts": {
                     "type": "object",
                     "description": (
-                        "The corrected summary object. Must match the schema "
-                        "for the target pass (same format as get_summaries output)."
+                        "The corrected contract object. Must have "
+                        "'properties' (list of property names), and per-property "
+                        "'requires', 'ensures', 'modifies' (each a dict mapping "
+                        "property name to list of C-expression strings)."
                     ),
                 },
             },
-            "required": ["function_name", "pass_name", "summary_json"],
+            "required": ["function_name", "contracts"],
         },
     },
 ]
@@ -239,8 +218,8 @@ TRIAGE_ONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["safe", "feasible"],
                     "description": (
-                        "safe: the issue cannot manifest given caller constraints. "
-                        "feasible: the violation condition is reachable."
+                        "safe: the obligation cannot manifest given caller "
+                        "constraints. feasible: the violation is reachable."
                     ),
                 },
                 "reasoning": {
@@ -256,23 +235,35 @@ TRIAGE_ONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "target": {"type": "string"},
-                            "contract_kind": {
+                            "function": {
                                 "type": "string",
-                                "enum": [
-                                    "disallow_null", "allow_null", "not_freed",
-                                    "initialized", "buffer_size",
-                                ],
+                                "description": "Function whose contract to update.",
                             },
-                            "description": {"type": "string"},
-                            "size_expr": {"type": "string"},
+                            "property": {
+                                "type": "string",
+                                "enum": ["memsafe", "memleak", "overflow"],
+                                "description": "Which safety property.",
+                            },
+                            "clause_type": {
+                                "type": "string",
+                                "enum": ["requires", "ensures"],
+                                "description": "Add/update a requires or ensures clause.",
+                            },
+                            "predicate": {
+                                "type": "string",
+                                "description": (
+                                    "C-expression predicate. E.g. "
+                                    "'ptr != NULL', 'size <= 1024'."
+                                ),
+                            },
                         },
-                        "required": ["target", "contract_kind", "description"],
+                        "required": [
+                            "function", "property", "clause_type", "predicate",
+                        ],
                     },
                     "description": (
-                        "For 'safe' hypothesis: updated/additional contracts "
-                        "that prove the issue away. These will be written back "
-                        "to the DB so the verifier won't flag this again."
+                        "For 'safe' hypothesis: updated/additional contract "
+                        "clauses that prove the obligation away."
                     ),
                 },
                 "feasible_path": {
@@ -353,7 +344,7 @@ REFLECTION_VERDICT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Submit your final reflection verdict. Call this after you have "
             "analyzed the validation outcome, reviewed/updated any wrong "
-            "summaries, and marked issues as FP or confirmed."
+            "contracts, and marked issues as FP or confirmed."
         ),
         "input_schema": {
             "type": "object",
@@ -384,20 +375,12 @@ REFLECTION_VERDICT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "original_correct": {"type": "boolean"},
                 "practically_triggerable": {"type": "boolean"},
-                "summaries_updated": {
+                "contracts_updated": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "List of 'function_name:pass_name' entries for "
-                        "summaries that were corrected during reflection."
-                    ),
-                },
-                "issues_reviewed": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "List of 'function_name#index:status' entries for "
-                        "issues that were reviewed during reflection."
+                        "List of function names whose contracts "
+                        "were corrected during reflection."
                     ),
                 },
             },
@@ -575,9 +558,9 @@ class ToolExecutor:
             "callees": callees,
         }
 
-    # -- get_summaries --
+    # -- get_contracts --
 
-    def _tool_get_summaries(self, inp: dict[str, Any]) -> dict[str, Any]:
+    def _tool_get_contracts(self, inp: dict[str, Any]) -> dict[str, Any]:
         name = inp["function_name"]
         func = self._get_func(name)
         if func is None:
@@ -585,110 +568,33 @@ class ToolExecutor:
         if func.id is None:
             return {"error": f"Function '{name}' has no ID."}
 
-        result: dict[str, Any] = {
-            "function": func.name,
-            "signature": func.signature,
-        }
-
-        memsafe = self.db.get_memsafe_summary_by_function_id(func.id)
-        if memsafe and memsafe.contracts:
-            result["pre_conditions"] = [
-                {
-                    "target": c.target,
-                    "kind": c.contract_kind,
-                    "description": c.description,
-                    **({"size_expr": c.size_expr} if c.size_expr else {}),
-                }
-                for c in memsafe.contracts
-            ]
-        else:
-            result["pre_conditions"] = []
-
-        vsummary = self.db.get_verification_summary_by_function_id(func.id)
-        if vsummary:
-            if vsummary.simplified_contracts is not None:
-                result["simplified_contracts"] = [
-                    {
-                        "target": c.target,
-                        "kind": c.contract_kind,
-                        "description": c.description,
-                        **({"size_expr": c.size_expr} if c.size_expr else {}),
-                    }
-                    for c in vsummary.simplified_contracts
-                ]
-            result["issues_count"] = len(vsummary.issues)
-
-        alloc = self.db.get_summary_by_function_id(func.id)
-        if alloc and alloc.allocations:
-            result["allocations"] = [
-                {
-                    "source": a.source,
-                    **({"size_expr": a.size_expr} if a.size_expr else {}),
-                    "may_be_null": a.may_be_null,
-                    "returned": a.returned,
-                }
-                for a in alloc.allocations
-            ]
-
-        free_summary = self.db.get_free_summary_by_function_id(func.id)
-        if free_summary and free_summary.frees:
-            result["frees"] = [
-                {
-                    "deallocator": f.deallocator,
-                    "target": f.target,
-                    "conditional": f.conditional,
-                    **({"condition": f.condition} if f.condition else {}),
-                    "nulled_after": f.nulled_after,
-                }
-                for f in free_summary.frees
-            ]
-
-        init_summary = self.db.get_init_summary_by_function_id(func.id)
-        if init_summary and init_summary.inits:
-            result["initializations"] = [
-                {
-                    "initializer": i.initializer,
-                    "target": i.target,
-                    **({"byte_count": i.byte_count} if i.byte_count else {}),
-                }
-                for i in init_summary.inits
-            ]
-
-        return result
-
-    # -- get_verification_summary --
-
-    def _tool_get_verification_summary(
-        self, inp: dict[str, Any],
-    ) -> dict[str, Any]:
-        name = inp["function_name"]
-        func = self._get_func(name)
-        if func is None:
-            return {"error": f"Function '{name}' not found in database."}
-        if func.id is None:
-            return {"error": f"Function '{name}' has no ID."}
-
-        vsummary = self.db.get_verification_summary_by_function_id(func.id)
-        if vsummary is None:
-            return {"function": name, "status": "not_verified"}
+        cc = self.db.get_code_contract_summary(func.id)
+        if cc is None:
+            return {"function": name, "status": "no_contract"}
 
         return {
             "function": name,
-            "description": vsummary.description,
-            "simplified_contracts": (
-                [
-                    {
-                        "target": c.target,
-                        "kind": c.contract_kind,
-                        "description": c.description,
-                        **({"size_expr": c.size_expr} if c.size_expr else {}),
-                    }
-                    for c in vsummary.simplified_contracts
-                ]
-                if vsummary.simplified_contracts is not None
-                else None
-            ),
-            "issues": [i.to_dict() for i in vsummary.issues],
+            "signature": func.signature or "",
+            **cc.to_dict(),
+        }
+
+    # -- get_issues --
+
+    def _tool_get_issues(self, inp: dict[str, Any]) -> dict[str, Any]:
+        name = inp["function_name"]
+        func = self._get_func(name)
+        if func is None:
+            return {"error": f"Function '{name}' not found in database."}
+        if func.id is None:
+            return {"error": f"Function '{name}' has no ID."}
+
+        vs = self.db.get_verification_summary_by_function_id(func.id)
+        if vs is None or not vs.issues:
+            return {"function": name, "issues": []}
+
+        return {
+            "function": name,
+            "issues": [i.to_dict() for i in vs.issues],
         }
 
     # -- upsert_review --
@@ -734,9 +640,9 @@ class ToolExecutor:
             "fingerprint": fp,
         }
 
-    # -- update_summary --
+    # -- update_contracts --
 
-    def _tool_update_summary(self, inp: dict[str, Any]) -> dict[str, Any]:
+    def _tool_update_contracts(self, inp: dict[str, Any]) -> dict[str, Any]:
         name = inp["function_name"]
         func = self._get_func(name)
         if func is None:
@@ -744,40 +650,19 @@ class ToolExecutor:
         if func.id is None:
             return {"error": f"Function '{name}' has no ID."}
 
-        pass_name = inp["pass_name"]
-        data = inp["summary_json"]
-        model_used = f"reflection:{self.model_used}" if self.model_used else "reflection"
+        data = inp["contracts"]
+        model_used = f"triage:{self.model_used}" if self.model_used else "triage"
 
         try:
-            if pass_name == "allocation":
-                summary = _parse_allocation_summary(data, func.name)
-                self.db.upsert_summary(func, summary, model_used=model_used)
-            elif pass_name == "free":
-                summary_f = _parse_free_summary(data, func.name)
-                self.db.upsert_free_summary(func, summary_f, model_used=model_used)
-            elif pass_name == "init":
-                summary_i = _parse_init_summary(data, func.name)
-                self.db.upsert_init_summary(func, summary_i, model_used=model_used)
-            elif pass_name == "memsafe":
-                summary_m = _parse_memsafe_summary(data, func.name)
-                self.db.upsert_memsafe_summary(
-                    func, summary_m, model_used=model_used,
-                )
-            elif pass_name == "verification":
-                summary_v = _parse_verification_summary(data, func.name)
-                self.db.upsert_verification_summary(
-                    func, summary_v, model_used=model_used,
-                )
-            else:
-                return {"error": f"Unknown pass: {pass_name}"}
+            data["function"] = name
+            summary = CodeContractSummary.from_dict(data)
+            self.db.store_code_contract_summary(
+                func, summary, model_used=model_used,
+            )
         except Exception as e:
-            return {"error": f"Failed to update {pass_name}: {e}"}
+            return {"error": f"Failed to update contracts: {e}"}
 
-        return {
-            "function": name,
-            "pass_name": pass_name,
-            "updated": True,
-        }
+        return {"function": name, "updated": True}
 
     # -- submit_verdict (triage) --
 
@@ -792,153 +677,4 @@ class ToolExecutor:
     # -- transition_phase (triage) --
 
     def _tool_transition_phase(self, inp: dict[str, Any]) -> dict[str, Any]:
-        # Phase state is managed externally by the triage agent wrapper.
-        # This is a passthrough that returns the requested transition.
         return {"next_phase": inp["next_phase"]}
-
-
-# ---------------------------------------------------------------------------
-# Summary parsers (JSON dict → model objects)
-# ---------------------------------------------------------------------------
-
-
-def _parse_allocation_summary(
-    data: dict[str, Any], func_name: str,
-) -> AllocationSummary:
-    allocations = []
-    for a in data.get("allocations", []):
-        allocations.append(Allocation(
-            alloc_type=AllocationType(a.get("type", "heap")),
-            source=a.get("source", ""),
-            size_expr=a.get("size_expr"),
-            size_params=a.get("size_params", []),
-            returned=a.get("returned", False),
-            stored_to=a.get("stored_to"),
-            may_be_null=a.get("may_be_null", True),
-        ))
-    parameters = {}
-    for k, v in data.get("parameters", {}).items():
-        parameters[k] = ParameterInfo(
-            role=v.get("role", ""),
-            used_in_allocation=v.get("used_in_allocation", False),
-        )
-    bsps = []
-    for p in data.get("buffer_size_pairs", []):
-        bsps.append(BufferSizePair(
-            buffer=p.get("buffer", ""),
-            size=p.get("size", ""),
-            kind=p.get("kind", "param_pair"),
-            relationship=p.get("relationship", "byte_count"),
-        ))
-    return AllocationSummary(
-        function_name=data.get("function", func_name),
-        allocations=allocations,
-        parameters=parameters,
-        buffer_size_pairs=bsps,
-        description=data.get("description", ""),
-    )
-
-
-def _parse_free_summary(
-    data: dict[str, Any], func_name: str,
-) -> FreeSummary:
-    frees = []
-    for f in data.get("frees", []):
-        frees.append(FreeOp(
-            target=f.get("target", ""),
-            target_kind=f.get("target_kind", "parameter"),
-            deallocator=f.get("deallocator", "free"),
-            conditional=f.get("conditional", False),
-            nulled_after=f.get("nulled_after", False),
-            condition=f.get("condition"),
-        ))
-    releases = []
-    for r in data.get("resource_releases", []):
-        releases.append(FreeOp(
-            target=r.get("target", ""),
-            target_kind=r.get("target_kind", "parameter"),
-            deallocator=r.get("deallocator", ""),
-            conditional=r.get("conditional", False),
-            nulled_after=r.get("nulled_after", False),
-            condition=r.get("condition"),
-        ))
-    return FreeSummary(
-        function_name=data.get("function", func_name),
-        frees=frees,
-        resource_releases=releases,
-        description=data.get("description", ""),
-    )
-
-
-def _parse_init_summary(
-    data: dict[str, Any], func_name: str,
-) -> InitSummary:
-    inits = []
-    for i in data.get("inits", []):
-        inits.append(InitOp(
-            target=i.get("target", ""),
-            target_kind=i.get("target_kind", "parameter"),
-            initializer=i.get("initializer", ""),
-            byte_count=i.get("byte_count"),
-            conditional=i.get("conditional", False),
-            condition=i.get("condition"),
-        ))
-    return InitSummary(
-        function_name=data.get("function", func_name),
-        inits=inits,
-        description=data.get("description", ""),
-    )
-
-
-def _parse_memsafe_summary(
-    data: dict[str, Any], func_name: str,
-) -> MemsafeSummary:
-    contracts = []
-    for c in data.get("contracts", []):
-        contracts.append(MemsafeContract(
-            target=c.get("target", ""),
-            contract_kind=c.get("contract_kind", ""),
-            description=c.get("description", ""),
-            size_expr=c.get("size_expr"),
-            relationship=c.get("relationship"),
-            condition=c.get("condition"),
-        ))
-    return MemsafeSummary(
-        function_name=data.get("function", func_name),
-        contracts=contracts,
-        description=data.get("description", ""),
-    )
-
-
-def _parse_verification_summary(
-    data: dict[str, Any], func_name: str,
-) -> VerificationSummary:
-    contracts = None
-    raw_contracts = data.get("simplified_contracts")
-    if raw_contracts is not None:
-        contracts = []
-        for c in raw_contracts:
-            contracts.append(MemsafeContract(
-                target=c.get("target", ""),
-                contract_kind=c.get("contract_kind", ""),
-                description=c.get("description", ""),
-                size_expr=c.get("size_expr"),
-                relationship=c.get("relationship"),
-                condition=c.get("condition"),
-            ))
-    issues = []
-    for i in data.get("issues", []):
-        issues.append(SafetyIssue(
-            location=i.get("location", ""),
-            issue_kind=i.get("issue_kind", ""),
-            description=i.get("description", ""),
-            severity=i.get("severity", "medium"),
-            callee=i.get("callee"),
-            contract_kind=i.get("contract_kind"),
-        ))
-    return VerificationSummary(
-        function_name=data.get("function", func_name),
-        simplified_contracts=contracts,
-        issues=issues,
-        description=data.get("description", ""),
-    )
