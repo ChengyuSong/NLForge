@@ -70,14 +70,17 @@ clamp-locals — none of these may appear in `requires` or `ensures`.
 terms, drop it and rely on the verify pass instead of forwarding a \
 malformed clause upward.
 
-3. **Callee discharge is VERBATIM.** When a callee K's contract says \
-`requires[P]: phi`, you may either:
+3. **Callee discharge is VERBATIM and MANDATORY.** When a callee K's \
+contract says `requires[P]: phi`, you MUST do exactly one of:
    (a) DISCHARGE phi at the callsite — cite a fact already on the path \
        (e.g., "p was just assigned `malloc(n)` whose `ensures` includes \
        `result != NULL`");
    (b) PROPAGATE phi as your own `requires[P]` — verbatim (after the \
        caller-name substitution required by rule 2), optionally with the \
        callsite's path-condition prepended (e.g., `cond ==> phi`).
+   Silently dropping a callee `requires` is NOT allowed — every clause \
+must be either discharged or propagated. If you cannot discharge phi, \
+you MUST propagate it. \
    You MAY NOT INVENT preconditions a callee did not declare. If callee K's \
 contract is `requires[P]: true`, you must NOT add a precondition on K's \
 arguments "because K probably needs them valid". If K's contract has no \
@@ -99,8 +102,9 @@ not your concern here. Never write "this function is safe/unsafe".
    - `ensures`: WEAKEN (over-approximate the post-state; e.g., replace
      `result == c1 || ... || result == c20` with `result >= -2147483648 &&
      result <= 259`). Never strengthen.
-   - `requires`: STRENGTHEN (under-approximate the pre-state; demand more of
-     the caller to keep sound). Never weaken.
+   - `requires`: STRENGTHEN (over-approximate the requirements on the caller —
+     a stronger precondition is always sound; a weaker one misses bugs).
+     Never weaken.
    You decide when to approximate; flag in `notes` when you do.
 
 7. **`modifies` scope — stack + heap, not globals.** C zero-initializes
