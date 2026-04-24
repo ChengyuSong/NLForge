@@ -171,10 +171,11 @@ the obligation in `requires`. Walk the body and check:
   `memcpy(buf + expr, ..., len)`, or `memset(buf + expr, ..., len)` in
   the body, decompose `expr` into its constituent variables and emit
   the bound as a C expression in `requires`.
+  Use `malloc_size(ptr)` to express allocation size of a buffer pointer.
   Procedure: (1) identify the buffer pointer and its allocation size
   (parameter, struct field, or callee ensures); (2) identify the
-  maximum index expression used; (3) emit `max_index < alloc_size`
-  (or `offset + len <= alloc_size` for memcpy/memset).
+  maximum index expression used; (3) emit `malloc_size(ptr) >= max_index`
+  (or `malloc_size(ptr) >= offset + len` for memcpy/memset).
   When the pointer, index, and size are struct fields of the same
   parameter, the bound is a relational invariant — e.g. if the body
   accesses `ctx->buf[ctx->pos + ctx->len]` and the buffer has
@@ -203,13 +204,13 @@ body and publish in `ensures` every concrete fact the body establishes
 about returned, out-parameter, or otherwise caller-visible state:
 
 - **Allocation size pairing**: when you `malloc(N)` (or any allocator) and
-  return / store the pointer, pair the pointer with N by name in `ensures`:
-  `result allocated for N bytes`, or `result points to N elements of T`.
+  return / store the pointer, publish `malloc_size(result) == N` (or
+  `malloc_size(ctx->buf) == N` for a struct field) in `ensures`.
   Always cite N. Bare "result is heap-allocated" is too weak — the
   consumer can't bound any index.
-- **Element count vs byte count**: `malloc(N * sizeof(T))` cast to `T*` →
-  `N elements`; `malloc(N)` cast to `T*` → `N / sizeof(T)` elements (often
-  a bug). Publish the unit you actually have.
+- **Element count vs byte count**: `malloc_size` is always in BYTES.
+  `malloc(N * sizeof(T))` → `malloc_size(result) == N * sizeof(T)`;
+  `malloc(N)` → `malloc_size(result) == N`.
 - **Non-null result from null-check-then-noreturn**: when the body has
   `p = malloc(n); if (!p) abort();` (or any noreturn callee on the null
   path — `exit`, `__assert_fail`, summarized `noreturn: true`), publish
@@ -235,7 +236,7 @@ about returned, out-parameter, or otherwise caller-visible state:
 - **Out-parameter / struct-field writes**: writes via a parameter
   (`*out = v`, `ctx->data = malloc(n)`, `s->len = n`) are caller-visible
   state changes — treat them the same as writes to `result`. Publish the
-  post-condition (`*out initialized`, `ctx->data allocated for n bytes`,
+  post-condition (`*out initialized`, `malloc_size(ctx->data) == n`,
   `s->len == n`). The size-pairing / null-terminator / init-range
   bullets above all apply when the target is `*out` or a struct field
   reachable from a parameter.
@@ -298,8 +299,8 @@ allocation pairing), but prefer C expressions when possible:
 
 Guidance:
 - `requires` examples: `ctx != NULL`, `n > 0`,
-  `ctx->pos + ctx->len <= ctx->capacity`.
-- `ensures` examples: `result allocated for n * sizeof(T) bytes`,
+  `malloc_size(buf) >= n`, `ctx->pos + ctx->len <= ctx->capacity`.
+- `ensures` examples: `malloc_size(result) == n * sizeof(T)`,
   `result != NULL`, `s->buf[0..n-1] initialized`, `freed(p)`.
 - `modifies`: list stack locals and heap regions written here (out-params,
   *p where p was malloc'd in this function, etc.). SKIP globals/statics
