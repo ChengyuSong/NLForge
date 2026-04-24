@@ -14,6 +14,7 @@ from typing import Any
 from .code_contract.models import CodeContractSummary
 from .db import SummaryDB
 from .git_tools import GitTools
+from .llm.base import LLMBackend
 from .models import Function
 
 # ---------------------------------------------------------------------------
@@ -205,21 +206,58 @@ TRIAGE_ONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "verify_contract",
+        "description": (
+            "Trial-verify a function against a proposed contract WITHOUT "
+            "writing to the database. Use this in HYPOTHESIZE phase to test "
+            "whether a strengthened contract resolves the issue before "
+            "submitting your verdict. You must provide the FULL contract "
+            "(not just changed clauses) — use get_contracts to read the "
+            "current contract first, then modify and pass the complete "
+            "replacement."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "function_name": {
+                    "type": "string",
+                    "description": "Name of the function to verify.",
+                },
+                "contract": {
+                    "type": "object",
+                    "description": (
+                        "The complete trial contract. Must have "
+                        "'properties' (list of property names), and "
+                        "per-property 'requires', 'ensures', 'modifies' "
+                        "(each a dict mapping property name to list of "
+                        "C-expression strings), and 'notes' (dict mapping "
+                        "property name to string)."
+                    ),
+                },
+            },
+            "required": ["function_name", "contract"],
+        },
+    },
+    {
         "name": "submit_verdict",
         "description": (
             "Submit the final triage verdict. Only callable in VERDICT phase. "
-            "You must provide either a safety proof (with updated_contracts) "
-            "or a feasibility proof (with feasible_path)."
+            "You must provide either a safety proof (with updated_contracts), "
+            "a contract gap (with updated_contracts verified via "
+            "verify_contract), or a feasibility proof (with feasible_path)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "hypothesis": {
                     "type": "string",
-                    "enum": ["safe", "feasible"],
+                    "enum": ["safe", "contract_gap", "feasible"],
                     "description": (
                         "safe: the obligation cannot manifest given caller "
-                        "constraints. feasible: the violation is reachable."
+                        "constraints. contract_gap: the function's requires "
+                        "is too weak for callee requires — propose "
+                        "strengthened contracts. feasible: the violation "
+                        "is reachable."
                     ),
                 },
                 "reasoning": {
@@ -421,11 +459,13 @@ class ToolExecutor:
         git_tools: GitTools | None = None,
         model_used: str = "",
         project_path: Path | None = None,
+        llm: LLMBackend | None = None,
     ) -> None:
         self.db = db
         self.verbose = verbose
         self.git_tools = git_tools
         self.model_used = model_used
+        self.llm = llm
         self._project_path = (
             project_path.resolve() if project_path
             else (git_tools.repo if git_tools else None)
@@ -663,6 +703,74 @@ class ToolExecutor:
             return {"error": f"Failed to update contracts: {e}"}
 
         return {"function": name, "updated": True}
+
+    # -- verify_contract (triage) --
+
+    def _tool_verify_contract(self, inp: dict[str, Any]) -> dict[str, Any]:
+        if self.llm is None:
+            return {"error": "verify_contract requires an LLM backend"}
+
+        name = inp["function_name"]
+        func = self._get_func(name)
+        if func is None:
+            return {"error": f"Function '{name}' not found in database."}
+        if func.id is None:
+            return {"error": f"Function '{name}' has no ID."}
+
+        contract_data = dict(inp["contract"])
+        contract_data["function"] = name
+        try:
+            trial_summary = CodeContractSummary.from_dict(contract_data)
+        except Exception as e:
+            return {"error": f"Invalid contract: {e}"}
+
+        from .code_contract.pass_ import CodeContractPass, seed_stdlib_summaries
+
+        summaries: dict[str, CodeContractSummary] = dict(
+            seed_stdlib_summaries(svcomp=False),
+        )
+        callee_ids = self.db.get_callees(func.id)
+        for cid in callee_ids:
+            callee_func = self.db.get_function(cid)
+            if callee_func and callee_func.id is not None:
+                cc = self.db.get_code_contract_summary(callee_func.id)
+                if cc:
+                    summaries[callee_func.name] = cc
+        summaries[name] = trial_summary
+
+        funcs_by_id = {
+            f.id: f.name
+            for f in self.db.get_all_functions() if f.id is not None
+        }
+        edges: dict[str, set[str]] = {}
+        for edge in self.db.get_all_call_edges():
+            caller = funcs_by_id.get(edge.caller_id)
+            callee = funcs_by_id.get(edge.callee_id)
+            if caller and callee:
+                edges.setdefault(caller, set()).add(callee)
+
+        trial_pass = CodeContractPass(
+            self.db,
+            model=self.model_used or "triage",
+            llm=self.llm,
+        )
+        new_issues = trial_pass._verify_one(
+            func, trial_summary, summaries, edges,
+        )
+
+        vs = self.db.get_verification_summary_by_function_id(func.id)
+        orig = [i.to_dict() for i in (vs.issues if vs else [])]
+        flat_new: list[dict[str, Any]] = []
+        for prop, issues in new_issues.items():
+            for it in issues:
+                flat_new.append({"property": prop, **it})
+
+        return {
+            "function": name,
+            "original_issues": orig,
+            "trial_issues": flat_new,
+            "resolved": len(flat_new) == 0,
+        }
 
     # -- submit_verdict (triage) --
 

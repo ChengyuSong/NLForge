@@ -4638,14 +4638,20 @@ def triage(
         else:
             # Print summary table
             safe_count = sum(1 for r in all_results if r.hypothesis == "safe")
+            gap_count = sum(1 for r in all_results if r.hypothesis == "contract_gap")
             feasible_count = sum(1 for r in all_results if r.hypothesis == "feasible")
             console.print(
                 f"\n[bold]Triage Results[/bold]: {len(all_results)} issues — "
                 f"[green]{safe_count} safe[/green], "
+                f"[yellow]{gap_count} contract_gap[/yellow], "
                 f"[red]{feasible_count} feasible[/red]"
             )
             for r in all_results:
-                style = "green" if r.hypothesis == "safe" else "red"
+                style = (
+                    "green" if r.hypothesis == "safe"
+                    else "yellow" if r.hypothesis == "contract_gap"
+                    else "red"
+                )
                 console.print(
                     f"  [{style}]{r.hypothesis}[/{style}] "
                     f"{r.function_name}#{r.issue_index}: "

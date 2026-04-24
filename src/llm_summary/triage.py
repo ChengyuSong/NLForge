@@ -1,13 +1,17 @@
-"""Bug triage agent: prove safety or feasibility of verification issues.
+"""Bug triage agent: prove safety, identify contract gaps, or prove feasibility.
 
 The agent analyzes each SafetyIssue from the verification pass by tracing
-caller/callee context through the DB. It produces one of two proofs:
+caller/callee context through the DB. It produces one of three outcomes:
 
 1. **Safety proof**: Updated pre/post-conditions showing the issue cannot
    manifest. Key output: updated contracts for the DB so the verifier
    won't flag the same false positive again.
 
-2. **Feasibility proof**: A concrete execution path showing the violation
+2. **Contract gap**: The function's requires is too weak for callee
+   requires. The agent proposes strengthened contracts, trial-verifies
+   them in memory via verify_contract, and submits only if verified.
+
+3. **Feasibility proof**: A concrete execution path showing the violation
    is reachable. Includes assumptions and assertions for future symbolic
    validation via ucsan.
 
@@ -46,7 +50,7 @@ class TriageResult:
     function_name: str
     issue_index: int
     issue: SafetyIssue
-    hypothesis: str  # "safe" or "feasible"
+    hypothesis: str  # "safe", "contract_gap", or "feasible"
     reasoning: str  # natural language proof
 
     # Safety proof: updated contracts that eliminate the issue
@@ -98,7 +102,7 @@ _DB_TOOLS = {
 
 PHASE_TOOLS: dict[str, set[str]] = {
     "ANALYZE": _DB_TOOLS | GIT_TOOL_NAMES | {"transition_phase"},
-    "HYPOTHESIZE": _DB_TOOLS | GIT_TOOL_NAMES | {"transition_phase"},
+    "HYPOTHESIZE": _DB_TOOLS | GIT_TOOL_NAMES | {"transition_phase", "verify_contract"},
     "VERDICT": {
         "submit_verdict",
     },
@@ -134,7 +138,7 @@ be triggered).
 Use get_contracts to read any function's requires (preconditions) and
 ensures (postconditions). Use get_issues to see verification issues.
 
-## Two Outcomes
+## Three Outcomes
 
 ### 1. Safety Proof (hypothesis: "safe")
 
@@ -148,7 +152,31 @@ the triggering condition. You MUST provide:
 - **assertions**: The violation condition that cannot be reached.
   E.g., "size * elem_size cannot overflow because size <= 1024 and elem_size <= 8"
 
-### 2. Feasibility Proof (hypothesis: "feasible")
+### 2. Contract Gap (hypothesis: "contract_gap")
+
+The function's own requires is too weak to guarantee safety — the
+preconditions are not conservative enough for its callee's requires.
+This is a CONTRACT bug, not a CODE bug. The requires should be
+propagated upwards: strengthen this function's requires so it can
+discharge callee preconditions, then propagate until the code or an
+ensures postcondition fails to satisfy the strengthened requires.
+
+Before submitting a contract_gap verdict, you MUST use the
+verify_contract tool to trial-verify the function against your
+proposed contract. Only submit the verdict if verify_contract
+reports resolved=true.
+
+You MUST provide:
+- **updated_contracts**: The strengthened requires clause(s) that close
+  the gap. Specify the function, property, clause_type ("requires"),
+  and the new predicate (C expression).
+- **assumptions**: Why the current requires is insufficient.
+  E.g., "requires says `offset + header_len <= buf_size` but callee
+  writes up to `offset + header_len + padding` bytes in the worst case"
+- **assertions**: The callee precondition that cannot be discharged
+  under the current requires.
+
+### 3. Feasibility Proof (hypothesis: "feasible")
 
 Prove the violation condition IS reachable by identifying a concrete
 execution path. You MUST provide:
@@ -186,7 +214,7 @@ deprecated APIs. Treat deprecated functions as reachable entry points.
 5. Trace the data flow: where do the problematic parameters come from?
 
 ### HYPOTHESIZE phase
-1. Formulate your hypothesis: safe or feasible
+1. Formulate your hypothesis: safe, contract_gap, or feasible
 2. Gather remaining evidence (you can still read functions/contracts)
 3. Build your proof: identify specific constraints or paths
 
@@ -205,6 +233,8 @@ deprecated APIs. Treat deprecated functions as reachable entry points.
 ## Rules
 - Always read the function source and at least its direct callers
 - For safety proofs: you MUST show which callers constrain the parameters
+- For contract gaps: you MUST show which callee requires cannot be
+  discharged and propose a strengthened requires
 - For feasibility proofs: you MUST show a concrete call chain
 - Include assumptions and assertions — these will be used for symbolic validation
 - Do not guess — if caller constraints are ambiguous, lean toward "feasible"
@@ -222,9 +252,10 @@ class TriageToolExecutor:
     def __init__(
         self, db: SummaryDB, verbose: bool = False,
         git_tools: GitTools | None = None,
+        llm: LLMBackend | None = None,
     ) -> None:
         self._executor = ToolExecutor(
-            db, verbose=verbose, git_tools=git_tools,
+            db, verbose=verbose, git_tools=git_tools, llm=llm,
         )
         self._current_phase = "ANALYZE"
 
@@ -306,7 +337,7 @@ class TriageAgent:
             GitTools(self.project_path) if self.project_path else None
         )
         executor = TriageToolExecutor(
-            self.db, verbose=self.verbose, git_tools=git,
+            self.db, verbose=self.verbose, git_tools=git, llm=self.llm,
         )
         user_prompt = self._build_issue_prompt(func, issue, issue_index)
         messages: list[dict[str, Any]] = [
@@ -454,7 +485,7 @@ class TriageAgent:
             "Follow the workflow: ANALYZE -> HYPOTHESIZE -> VERDICT.",
             "Start by reading the function source and its contracts "
             "(get_contracts), then check its callers.",
-            "Produce either a safety proof or a feasibility proof.",
+            "Produce a safety proof, contract gap, or feasibility proof.",
         ])
         return "\n".join(lines)
 
@@ -467,7 +498,7 @@ class TriageAgent:
     ) -> TriageResult:
         if verdict is not None:
             hyp = verdict.get("hypothesis", "feasible")
-            if hyp not in ("safe", "feasible"):
+            if hyp not in ("safe", "contract_gap", "feasible"):
                 hyp = "feasible"
             return TriageResult(
                 function_name=func.name,
