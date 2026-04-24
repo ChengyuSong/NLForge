@@ -155,6 +155,7 @@ def run_import_dep(
     link_units_path: Path | None = None,
     target_name: str | None = None,
     scan_dir: str = "func-scans",
+    force: bool = False,
     verbose: bool = False,
 ) -> tuple[bool, str]:
     """Invoke `llm-summary import-dep` (cross-project)."""
@@ -164,6 +165,8 @@ def run_import_dep(
         cmd += ["--link-units", str(link_units_path)]
     if target_name:
         cmd += ["--target", target_name]
+    if force:
+        cmd.append("--force")
     if verbose:
         cmd.append("--verbose")
     try:
@@ -187,6 +190,7 @@ def run_import_dep(
 def run_import_dep_summaries(
     db_path: Path,
     dep_db_paths: list[Path],
+    force: bool = False,
     verbose: bool = False,
 ) -> tuple[bool, str]:
     """Invoke `llm-summary import-dep-summaries` (intra-project)."""
@@ -195,6 +199,8 @@ def run_import_dep_summaries(
     cmd = ["llm-summary", "import-dep-summaries", "--db", str(db_path)]
     for dep in dep_db_paths:
         cmd += ["--dep-db", str(dep)]
+    if force:
+        cmd.append("--force")
     if verbose:
         cmd.append("--verbose")
     try:
@@ -421,6 +427,7 @@ def process_project_link_units(
             link_units_path=link_units_path,
             target_name=target,
             scan_dir=str(func_scans_dir),
+            force=force,
             verbose=verbose,
         )
         if not ok and verbose:
@@ -436,6 +443,7 @@ def process_project_link_units(
             ok, err = run_import_dep_summaries(
                 db_path=db_path,
                 dep_db_paths=dep_db_paths,
+                force=force,
                 verbose=verbose,
             )
             if not ok:
