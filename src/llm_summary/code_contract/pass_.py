@@ -61,6 +61,7 @@ from .source_prep import (
     prepare_source,
 )
 from .stdlib import STDLIB_CONTRACTS
+from .struggle import compute as compute_struggle
 from .svcomp_stdlib import SVCOMP_CONTRACTS, svcomp_malloc_overrides
 
 log = logging.getLogger("code_contract.pass")
@@ -70,6 +71,12 @@ _MALFORMED_JSON_MSG = (
     "Please output only a valid JSON object matching the required schema, "
     "with no markdown fences or extra text."
 )
+
+# Composite struggle score above which we re-run the property with the
+# Claude default model. Calibrated against zlib (302 pairs): the worst
+# orchestrators (deflate_slow, inflate_fast, gz_*) land at ~6+ while clean
+# leaves stay <2.
+_RETRY_THRESHOLD: float = 5.0
 
 
 def _format_scan_issues(
@@ -185,6 +192,18 @@ class CodeContractPass:
         self.calls: int = 0
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        # Per-function struggle metadata, populated in `_summarize_one` and
+        # consumed by `store()` so it can land on the DB row. Schema:
+        # {func_name: {"scores": {prop: float}, "max": float,
+        #              "retried": bool, "retry_model": str | None}}
+        self.struggle: dict[str, dict[str, Any]] = {}
+        # Lazy-initialized Claude backend used to re-run properties whose
+        # primary score crosses `_RETRY_THRESHOLD`. `_disabled` short-circuits
+        # repeated attempts after the first failure (no creds, same backend
+        # as primary, etc.).
+        self._retry_llm: LLMBackend | None = None
+        self._retry_llm_disabled: bool = False
+        self.struggle_retries: int = 0
 
     def _log(self, text: str) -> None:
         """Append `text` to the log file, no-op if logging disabled.
@@ -265,8 +284,13 @@ class CodeContractPass:
         return summary
 
     def store(self, func: Function, summary: CodeContractSummary) -> None:
+        sd = self.struggle.get(func.name, {})
         self.db.store_code_contract_summary(
             func, summary, model_used=self.model,
+            struggle_scores=sd.get("scores"),
+            struggle_max=float(sd.get("max", 0.0)),
+            retried=bool(sd.get("retried", False)),
+            retry_model=sd.get("retry_model"),
         )
         func_issues = self.issues.get(func.name, {})
         safety_issues: list[SafetyIssue] = []
@@ -379,6 +403,9 @@ class CodeContractPass:
         )
         globals_section = build_globals_section(ir_facts)
 
+        scores_by_prop: dict[str, float] = {}
+        retry_model_used: str | None = None
+
         for prop in props:
             callee_block = build_callee_block(
                 func, summaries, prop, callee_names,
@@ -410,72 +437,231 @@ class CodeContractPass:
             if prop == "overflow":
                 fmt_kwargs["data_model_note"] = self.data_model_note
             prompt = PROPERTY_PROMPT[prop].format(**fmt_kwargs)
+            # Struggle denominator: only the project-specific context the
+            # model has to engage with. Excludes the static PROPERTY_PROMPT
+            # template (~10K chars for memsafe/overflow) and SYSTEM_PROMPT
+            # — otherwise every leaf scores `under * 4 ≈ 4` baseline before
+            # any real signal. Calibrated against zlib body+callees.
+            ctx_chars = len(callee_block) + len(source_inlined)
 
             self._log(f"\n--- USER ({prop}) ---\n{prompt}\n")
 
             # Driver-level parallelism uses LLMPool.submit at the function
             # level; per-property calls within one function are serial and
             # share `self.llm`. Backends are expected to be thread-safe.
-            resp = self.llm.complete_with_metadata(
+            data = self._call_property_llm(
+                self.llm, func.name, prop, prompt, response_format,
+            )
+            if data is None:
+                continue
+
+            chosen_data = data
+            chosen_score = self._struggle_for(data, prop, ctx_chars)
+
+            if chosen_score > _RETRY_THRESHOLD:
+                retry_data, retry_score = self._maybe_retry(
+                    func.name, prop, prompt, response_format,
+                    ctx_chars, chosen_score,
+                )
+                if retry_data is not None and retry_score < chosen_score:
+                    chosen_data = retry_data
+                    chosen_score = retry_score
+                    retry_llm = self._retry_llm
+                    if retry_llm is not None:
+                        retry_model_used = retry_llm.model
+                    self.struggle_retries += 1
+
+            scores_by_prop[prop] = chosen_score
+
+            reqs = list(chosen_data.get("requires") or [])
+            summary.analysis[prop] = str(chosen_data.get("analysis") or "")
+            summary.requires[prop] = reqs
+            summary.ensures[prop] = list(chosen_data.get("ensures") or [])
+            summary.modifies[prop] = list(chosen_data.get("modifies") or [])
+            summary.notes[prop] = str(chosen_data.get("notes") or "")
+            # Default origin: each requires entry is "local". Future work:
+            # detect verbatim callee discharge and set origin = "<callee>:<idx>".
+            summary.origin[prop] = ["local"] * len(reqs)
+            conf = str(chosen_data.get("confidence") or "").strip().lower()
+            summary.confidence[prop] = (
+                conf if conf in ("high", "medium", "low") else ""
+            )
+            if bool(chosen_data.get("noreturn", False)):
+                summary.noreturn = True
+
+        if scores_by_prop:
+            self.struggle[func.name] = {
+                "scores": scores_by_prop,
+                "max": max(scores_by_prop.values()),
+                "retried": retry_model_used is not None,
+                "retry_model": retry_model_used,
+            }
+
+        return summary
+
+    def _call_property_llm(
+        self,
+        llm: LLMBackend,
+        func_name: str,
+        prop: str,
+        prompt: str,
+        response_format: dict[str, Any],
+        *,
+        label: str = "",
+    ) -> dict[str, Any] | None:
+        """One per-property LLM call with one malformed-JSON retry.
+
+        Returns the parsed JSON dict, or `None` if the response was
+        malformed both times. Tokens accumulate into `self.{calls,
+        input_tokens, output_tokens}`. `label` distinguishes retry
+        attempts in the log.
+        """
+        tag = f"{prop}{label}" if label else prop
+        try:
+            resp = llm.complete_with_metadata(
                 prompt,
                 system=SYSTEM_PROMPT,
                 cache_system=self.cache_system,
                 response_format=response_format,
             )
-            self.calls += 1
-            self.input_tokens += resp.input_tokens
-            self.output_tokens += resp.output_tokens
+        except Exception as e:
+            log.warning("%s/%s: LLM call failed: %s", func_name, tag, e)
+            return None
+        self.calls += 1
+        self.input_tokens += resp.input_tokens
+        self.output_tokens += resp.output_tokens
+        self._log(f"--- RESPONSE ({tag}) ---\n{resp.content}\n")
 
-            self._log(f"--- RESPONSE ({prop}) ---\n{resp.content}\n")
+        try:
+            return extract_json(resp.content)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("%s/%s: malformed JSON, retrying", func_name, tag)
 
-            try:
-                data = extract_json(resp.content)
-            except (json.JSONDecodeError, ValueError):
-                log.warning("%s/%s: malformed JSON, retrying", func.name, prop)
-                retry_messages = [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": resp.content},
-                    {"role": "user", "content": _MALFORMED_JSON_MSG},
-                ]
-                resp = self.llm.complete_messages_with_metadata(
-                    retry_messages,
-                    system=SYSTEM_PROMPT,
-                    cache_system=self.cache_system,
-                    response_format=response_format,
-                )
-                self.calls += 1
-                self.input_tokens += resp.input_tokens
-                self.output_tokens += resp.output_tokens
-                self._log(
-                    f"--- RETRY RESPONSE ({prop}) ---\n{resp.content}\n"
-                )
-                try:
-                    data = extract_json(resp.content)
-                except (json.JSONDecodeError, ValueError):
-                    log.warning(
-                        "%s/%s: malformed JSON after retry, skipping property",
-                        func.name, prop,
-                    )
-                    continue
-
-            reqs = list(data.get("requires") or [])
-            summary.analysis[prop] = str(data.get("analysis") or "")
-            summary.requires[prop] = reqs
-            summary.ensures[prop] = list(data.get("ensures") or [])
-            summary.modifies[prop] = list(data.get("modifies") or [])
-            summary.notes[prop] = str(data.get("notes") or "")
-            # Default origin: each requires entry is "local". Future work:
-            # detect verbatim callee discharge and set origin = "<callee>:<idx>".
-            summary.origin[prop] = ["local"] * len(reqs)
-            conf = str(data.get("confidence") or "").strip().lower()
-            summary.confidence[prop] = (
-                conf if conf in ("high", "medium", "low") else ""
+        retry_messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": resp.content},
+            {"role": "user", "content": _MALFORMED_JSON_MSG},
+        ]
+        try:
+            resp2 = llm.complete_messages_with_metadata(
+                retry_messages,
+                system=SYSTEM_PROMPT,
+                cache_system=self.cache_system,
+                response_format=response_format,
             )
-            if bool(data.get("noreturn", False)):
-                summary.noreturn = True
+        except Exception as e:
+            log.warning(
+                "%s/%s: retry LLM call failed: %s", func_name, tag, e,
+            )
+            return None
+        self.calls += 1
+        self.input_tokens += resp2.input_tokens
+        self.output_tokens += resp2.output_tokens
+        self._log(f"--- RETRY RESPONSE ({tag}) ---\n{resp2.content}\n")
+        try:
+            return extract_json(resp2.content)
+        except (json.JSONDecodeError, ValueError):
+            log.warning(
+                "%s/%s: malformed JSON after retry, skipping property",
+                func_name, tag,
+            )
+            return None
 
-        return summary
+    def _struggle_for(
+        self, data: dict[str, Any], prop: str, ctx_chars: int,
+    ) -> float:
+        """Compute the composite struggle score for one parsed response."""
+        reqs = [
+            r for r in (data.get("requires") or []) if isinstance(r, str)
+        ]
+        return compute_struggle(
+            str(data.get("analysis") or ""), reqs, prop, ctx_chars,
+        ).score
 
+    def _get_retry_llm(self) -> LLMBackend | None:
+        """Lazily construct the Claude default backend used for retries.
+
+        Returns `None` if retry is disabled (already tried, no creds, or
+        primary already uses the same Claude default).
+        """
+        if self._retry_llm is not None:
+            return self._retry_llm
+        if self._retry_llm_disabled:
+            return None
+        try:
+            from ..llm.claude import ClaudeBackend
+            candidate = ClaudeBackend()
+        except Exception as e:
+            log.warning("retry: failed to construct Claude backend: %s", e)
+            self._retry_llm_disabled = True
+            return None
+        if (
+            isinstance(self.llm, ClaudeBackend)
+            and self.llm.model == candidate.model
+        ):
+            log.info(
+                "retry: primary already uses %s; disabling retry",
+                candidate.model,
+            )
+            self._retry_llm_disabled = True
+            return None
+        self._retry_llm = candidate
+        return self._retry_llm
+
+    def _maybe_retry(
+        self,
+        func_name: str,
+        prop: str,
+        prompt: str,
+        response_format: dict[str, Any],
+        ctx_chars: int,
+        primary_score: float,
+    ) -> tuple[dict[str, Any] | None, float]:
+        """Retry one property with Claude default; return (data, score) or
+        (None, +inf) if retry is unavailable / failed.
+
+        Caller compares the returned score with `primary_score` and decides
+        whether to swap. We score the retry on the same prompt so the
+        comparison is apples-to-apples.
+        """
+        retry_llm = self._get_retry_llm()
+        if retry_llm is None:
+            return None, float("inf")
+        log.info(
+            "%s/%s: struggle=%.2f, retrying with %s",
+            func_name, prop, primary_score, retry_llm.model,
+        )
+        self._log(
+            f"\n--- STRUGGLE RETRY ({prop}) ---\n"
+            f"primary={primary_score:.2f} > {_RETRY_THRESHOLD}; "
+            f"retrying with {retry_llm.model}\n"
+        )
+        retry_data = self._call_property_llm(
+            retry_llm, func_name, prop, prompt, response_format,
+            label=":retry",
+        )
+        if retry_data is None:
+            return None, float("inf")
+        retry_score = self._struggle_for(retry_data, prop, ctx_chars)
+        if retry_score < primary_score:
+            log.info(
+                "%s/%s: retry improved %.2f -> %.2f",
+                func_name, prop, primary_score, retry_score,
+            )
+            self._log(
+                f"--- RETRY ACCEPTED ({prop}) ---\n"
+                f"score: {primary_score:.2f} -> {retry_score:.2f}\n"
+            )
+        else:
+            log.info(
+                "%s/%s: retry didn't improve (%.2f); keeping primary",
+                func_name, prop, retry_score,
+            )
+            self._log(
+                f"--- RETRY REJECTED ({prop}) ---\n"
+                f"score: {primary_score:.2f} -> {retry_score:.2f}\n"
+            )
+        return retry_data, retry_score
 
     def _format_own_contract(
         self, summary: CodeContractSummary, prop: str,

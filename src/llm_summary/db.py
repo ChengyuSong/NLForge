@@ -151,6 +151,10 @@ CREATE TABLE IF NOT EXISTS code_contract_summaries (
     tokens_output INTEGER NOT NULL DEFAULT 0,
     tokens_cache_read INTEGER NOT NULL DEFAULT 0,
     tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    struggle_max REAL NOT NULL DEFAULT 0.0,
+    struggle_scores TEXT NOT NULL DEFAULT '{}',
+    retried INTEGER NOT NULL DEFAULT 0,
+    retry_model TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1536,6 +1540,10 @@ class SummaryDB:
         tokens_cache_read: int = 0,
         tokens_cache_write: int = 0,
         body_annotated: str | None = None,
+        struggle_scores: dict[str, float] | None = None,
+        struggle_max: float = 0.0,
+        retried: bool = False,
+        retry_model: str | None = None,
     ) -> None:
         """Insert or replace a code-contract summary for `func`.
 
@@ -1547,14 +1555,16 @@ class SummaryDB:
         if func.id is None:
             raise ValueError("Function must have an ID")
         summary_json = json.dumps(summary.to_dict())
+        scores_json = json.dumps(struggle_scores or {})
         self.conn.execute(
             """
             INSERT INTO code_contract_summaries (
                 function_id, summary_json, noreturn, body_annotated,
                 model, tokens_input, tokens_output,
-                tokens_cache_read, tokens_cache_write
+                tokens_cache_read, tokens_cache_write,
+                struggle_max, struggle_scores, retried, retry_model
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(function_id) DO UPDATE SET
                 summary_json = excluded.summary_json,
                 noreturn = excluded.noreturn,
@@ -1564,6 +1574,10 @@ class SummaryDB:
                 tokens_output = excluded.tokens_output,
                 tokens_cache_read = excluded.tokens_cache_read,
                 tokens_cache_write = excluded.tokens_cache_write,
+                struggle_max = excluded.struggle_max,
+                struggle_scores = excluded.struggle_scores,
+                retried = excluded.retried,
+                retry_model = excluded.retry_model,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -1571,6 +1585,8 @@ class SummaryDB:
                 body_annotated, model_used,
                 tokens_input, tokens_output,
                 tokens_cache_read, tokens_cache_write,
+                struggle_max, scores_json,
+                1 if retried else 0, retry_model,
             ),
         )
         self.conn.commit()

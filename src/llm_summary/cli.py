@@ -753,6 +753,11 @@ def summarize(
             noret = sum(1 for sm in cc_results.values() if sm.noreturn)
             if noret:
                 console.print(f"  Functions marked noreturn: {noret}")
+            if code_contract_pass.struggle_retries:
+                console.print(
+                    f"  Struggle retries accepted: "
+                    f"{code_contract_pass.struggle_retries}"
+                )
 
     finally:
         db.close()
