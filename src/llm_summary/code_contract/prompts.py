@@ -85,6 +85,16 @@ you MUST propagate it. \
 contract is `requires[P]: true`, you must NOT add a precondition on K's \
 arguments "because K probably needs them valid". If K's contract has no \
 preconditions, K's arguments are unconstrained from K's perspective.
+   **Constant-arg discharge worked example.** If callee \
+`cleanup(p, int do_free)` publishes `requires[memleak]: do_free != 0 ==> \
+caller releases p`, then a callsite `cleanup(p, /*do_free=*/0)` discharges \
+the clause: `do_free` is the literal `0`, the antecedent is false, the \
+implication is vacuously true — drop the clause, do not propagate. \
+Conversely, `cleanup(p, /*do_free=*/1)` makes the antecedent true — you must \
+either show the body releases `p` on every continuation or propagate \
+`caller releases p` upward. Same pattern for `requires[memsafe]: nonnull != \
+0 ==> p != NULL`, etc. — when the gating arg is a path-constant, do the \
+substitution at the callsite instead of forwarding the conditional clause.
 
 4. **NO VERDICT.** You output only `requires` / `ensures` / `modifies`. \
 Whether the body satisfies its own contract is checked separately and is \
@@ -132,6 +142,31 @@ runs only when the call did not happen — so subsequent code may assume \
 `!G`. If the function's body unconditionally aborts/exits/longjmps on every \
 path, set `noreturn: true` in your output (it is a property-independent \
 signal — emit the same value in every per-property call).
+
+10. **Caller-visible abstraction — collapse, don't enumerate.** Your \
+contract is what the CALLER sees, not a transcript of body operations. If \
+this function calls `cleanup(ctx)` which (per its published contract) \
+frees three sub-fields, you publish ONE clause about the cleanup call \
+(e.g., `modifies: *ctx`, or `ensures: ctx-fields released`), not three \
+separate clauses naming each sub-field — the caller doesn't know `ctx` \
+has those fields, and propagating callee internals leaks abstraction. \
+Same rule for `modifies`: collapse "wrote ctx->a, then ctx->b, then \
+ctx->c" into `*ctx` (or the smallest caller-visible region that covers \
+them). Propagate the callee's published clauses verbatim per rule 3; do \
+NOT expand them into the callee's internals.
+
+11. **C++: `this` is an implicit pointer parameter.** In a non-static \
+method `T::f(...)`, `this` is an additional parameter of type `T *` (or \
+`const T *`) preceding the declared ones. Member-field access (`m_buf`, \
+`size`) is shorthand for `this->m_buf`, `this->size` and implicitly \
+dereferences `this`. Treat `this` like any other pointer parameter: \
+publish `this != NULL` in `requires[memsafe]` only when the body actually \
+needs it (a non-virtual call through a constructed object guarantees \
+`this != NULL`; a virtual dispatch through a possibly-null base pointer \
+may not — but that's the caller's bug, not yours). For `delete this` or \
+`delete m_data`, treat as a free of `this` / `this->m_data` and emit the \
+appropriate `modifies`/`ensures[memleak]` clauses (`freed(this)`, \
+`freed(this->m_data)`); subsequent member access on the same path is UAF.
 """
 
 
@@ -270,9 +305,6 @@ of:
 NEVER fabricate a body-local name in the condition just to keep the
 clause. The verify pass has the body and reasons about paths directly.
 
-The header block lists each callee's published pre/post for memsafe. Use them \
-verbatim; do NOT invent preconditions a callee did not declare.
-
 {callee_block}
 {alias_context}
 === SOURCE ===
@@ -317,9 +349,8 @@ Guidance:
   `malloc_size(buf) >= n`, `ctx->pos + ctx->len <= ctx->capacity`.
 - `ensures` examples: `malloc_size(result) == n * sizeof(T)`,
   `result != NULL`, `s->buf[0..n-1] initialized`, `freed(p)`.
-- `modifies`: list stack locals and heap regions written here (out-params,
-  *p where p was malloc'd in this function, etc.). SKIP globals/statics
-  (zero-init at startup → no use-before-init obligation).
+- `modifies` examples: out-params (`*out`), `*p` where `p` was malloc'd
+  here, `ctx->buf` written here. (See SYSTEM rule 7 for scope.)
 - If function has no memsafe obligations and no memsafe-relevant ensures,
   output empty arrays. Empty is the right answer for many simple functions.
 """
@@ -481,9 +512,7 @@ the input file uses (C or C++); use that language's expression syntax.
   UB case (`x != INT_MIN`, `denom != 0`, `0 <= s < 32`).
 - **No tautologies.** `x: [INT_MIN, INT_MAX]` for an `int` is the full
   range — it excludes nothing. Drop it.
-- **No memsafe concerns.** Do not emit pointer-validity, buffer-size, or
-  availability constraints here (e.g. `avail_in >= 5`). Those belong to
-  the memsafe pass.
+- **No memsafe concerns** (e.g. `avail_in >= 5` belongs to memsafe).
 - **Overapproximate complex expressions.** If the exact safe range depends
   on runtime state (array lookups, loop variables, multi-field invariants),
   widen to a simpler bound on the entry-visible inputs. For example, if
@@ -506,6 +535,26 @@ The source may be preceded by a `## Type definitions` block listing
 variable's signedness or bit-width, resolve its declared type through
 those typedefs to the underlying primitive. An op on an unsigned type
 is NOT signed overflow.
+
+## IR-prover annotations on source lines
+
+Source lines may carry trailing `// safe`, `// check overflow`,
+`// check shift`, `// check divisor`, or `// check cast` comments. These
+come from the LLVM IR for this function:
+
+- `// safe` — the IR has the `nsw` / `nuw` / known-constant evidence
+  that proves this op cannot overflow. **Trust it.** Do NOT emit a
+  `requires` constraining the operands of a `// safe` op, and do NOT
+  flag it as an issue. The annotation is per-op, so a `// safe` add on
+  one line says nothing about a different add on another line.
+- `// check ...` — IR could not discharge the op; treat as a hazard
+  candidate and decide based on operand ranges (publish a `requires`
+  if external inputs admit UB; otherwise omit).
+
+When several ops collapse onto one source line, the comment shows the
+strongest concern (any `// check ...` overrides `// safe`). Lines
+without an annotation carry no IR signal — fall back to your usual
+range analysis.
 
 ## C-semantics reminders (apply BEFORE flagging an op as UB)
 
@@ -535,9 +584,6 @@ is NOT signed overflow.
 ## Data model
 
 {data_model_note}
-
-The header block lists each callee's published pre/post for overflow. Use
-them verbatim; do NOT invent preconditions a callee did not declare.
 
 {callee_block}
 {alias_context}
@@ -687,6 +733,46 @@ treat each warning as a candidate issue. Decide if it is feasible at runtime \
 entry. Skip warnings that are clearly dead code or already discharged by the \
 contract.
 
+## Commonly-missed patterns — sweep the body for these before concluding safe
+
+These are bug shapes that pass cursory review and need a deliberate pass:
+
+- **Off-by-one in bounds checks.** `i <= len` (should be `i < len`), \
+  `if (n > MAX)` (allows `n == MAX` when `MAX` is exclusive), loops \
+  `for (i=0; i<=n; i++) buf[i]` writing `buf[n]` past the last valid index.
+- **Wrong size variable in copy/compare.** `memcpy(dst, src, sizeof(src))` \
+  where `src` is a pointer (gives pointer width, not buffer size); \
+  `strncpy(dst, src, sizeof(dst))` followed by deref of `dst[sizeof(dst)-1]` \
+  with no explicit NUL-terminate; `memcmp(a, b, strlen(a))` when `b` may be \
+  shorter.
+- **Struct-field bound vs. allocation.** Buffer allocated `malloc(struct_size)` \
+  but a field is `len`-typed and the code indexes `field[i]` assuming \
+  `i < struct_size` — the field's own bound is what matters.
+- **Integer-derived index used past bounds-check refinement.** Path narrows \
+  `i < n`, then code computes `j = i + k` and uses `j` as an index without \
+  re-checking `j < n`. Same for `i*stride`, `i + offset` with attacker-derived \
+  offset.
+- **Type confusion / sign-extended index.** `int i` (possibly negative) used \
+  as `arr[i]`; or `(size_t)signed_var` where `signed_var` was negative \
+  becomes a huge unsigned index. Even with a later `i < len` check, the \
+  array access on a negative `i` is already UB.
+- **Format-string misuse.** `printf(user_string)` (untrusted format), or \
+  `%s` paired with a non-NUL-terminated buffer — flag as `buffer_overflow` \
+  when the format reads past the buffer.
+- **NUL-termination not established.** A buffer filled by `read(fd, buf, n)` \
+  / `recv` / `memcpy` has no terminator; subsequent `strlen(buf)` / `strcmp` \
+  / `printf("%s", buf)` reads past `buf[n-1]`.
+- **Realloc shrink-then-access.** `p = realloc(p, smaller)`; subsequent \
+  access to the now-discarded tail. Also: `realloc` returns NULL on failure \
+  and the original `p` remains valid — code that does `p = realloc(p, n); \
+  *p = ...` without checking introduces a NULL deref AND leaks the old `p`.
+- **Aliased writes invalidating a cached length.** `len = strlen(buf); \
+  callee(buf); buf[len-1] = '\\0';` — `callee` may have shortened `buf`.
+
+These are not exhaustive and not in priority order — the checklist exists to \
+make sure your sweep covers each shape at least once. Cite the specific \
+operation and the path facts when you flag (or discharge) one.
+
 {callee_block}
 {alias_context}
 === SOURCE (callsites annotated with `// >>> callee contract for memsafe`) ===
@@ -788,6 +874,25 @@ inside that branch. Unreachable UB is not UB.
 
 For each callsite: do the path facts imply every clause of
 callee.requires[overflow]? If not, emit `callee_requires`.
+
+## IR-prover annotations on source lines
+
+Source lines may carry trailing `// safe`, `// check overflow`,
+`// check shift`, `// check divisor`, or `// check cast` comments from
+the LLVM IR for this function:
+
+- `// safe` — the IR has the `nsw` / `nuw` / known-constant evidence
+  that proves this op is well-defined. **Trust it: do NOT emit an
+  `integer_overflow` / `shift_ub` / `division_by_zero` / `callee_requires`
+  issue for an op annotated `// safe`.** The annotation is per-op, so a
+  `// safe` on one line says nothing about a different op on another line.
+- `// check ...` — the IR could not discharge the op; verify by hand
+  using operand ranges from the published contract and path facts. Flag
+  only when the dangerous range is actually reachable.
+
+Lines without an annotation carry no IR signal; fall back to ordinary
+range analysis. When several ops share a line the comment shows the
+strongest concern (any `// check ...` overrides `// safe`).
 
 ## C-semantics reminders (apply BEFORE flagging an op as UB)
 
