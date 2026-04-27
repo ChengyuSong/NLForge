@@ -5,6 +5,7 @@ function symbols, then parses the .s/.S source to extract source text
 for each function (label to next label).
 """
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -142,7 +143,7 @@ def extract_asm_functions(
 
         functions.append(Function(
             name=label_name,
-            file_path=str(source_path),
+            file_path=os.path.normpath(str(source_path)),
             line_start=block_start,
             line_end=line_end,
             source=func_source,

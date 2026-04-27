@@ -188,7 +188,7 @@ def get_canonical_type_spelling(cursor: Cursor) -> str:
 
 def get_function_source(cursor: Cursor, file_contents: dict[str, str]) -> str:
     """Extract source code for a function from file contents."""
-    file_path = str(cursor.location.file)
+    file_path = os.path.normpath(str(cursor.location.file))
     if file_path not in file_contents:
         try:
             with open(file_path, encoding="utf-8", errors="replace") as f:
@@ -503,7 +503,7 @@ class FunctionExtractor:
 
         func = Function(
             name=name,
-            file_path=str(cursor.location.file),
+            file_path=os.path.normpath(str(cursor.location.file)),
             line_start=int(cursor.extent.start.line),
             line_end=int(cursor.extent.end.line),
             source=source,
