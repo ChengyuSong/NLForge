@@ -3386,8 +3386,18 @@ def triage(
     help="Build target / link unit (defaults to derived from --db).",
 )
 @click.option(
-    "--max-turns", default=80, type=int,
-    help="Max ReAct turns for the agent (default 80).",
+    "--max-hypothesis-turns", default=80, type=int,
+    help="Max ReAct turns for the hypothesis stage (default 80).",
+)
+@click.option(
+    "--max-audit-turns", default=60, type=int,
+    help="Max ReAct turns per audit (default 60). Each candidate gets "
+         "its own fresh-context audit with this budget.",
+)
+@click.option(
+    "--limit", "audit_limit", default=None, type=int,
+    help="Audit only the first N candidates from the hypothesis stage "
+         "(testing/cost control). Default: audit all.",
 )
 @click.option(
     "--backend",
@@ -3406,18 +3416,22 @@ def triage(
 def contract_check(
     db_path: str, project_path: str,
     library: str | None, target: str | None,
-    max_turns: int,
+    max_hypothesis_turns: int, max_audit_turns: int,
+    audit_limit: int | None,
     backend: str, model: str | None,
     llm_host: str, llm_port: int | None, disable_thinking: bool,
     output: str | None, verbose: bool,
 ) -> None:
-    """Audit a library's public-API code contracts vs its documented behavior.
+    """Hunt for hazardous behaviors not warned about in the library's docs.
 
-    Runs an LLM ReAct agent over a single library's git repo + contract DB to
-    find caveats the manual / headers / examples document but the contracts
-    miss. The agent discovers the header / manual / example via git_ls_tree.
-    Output is a JSON catalog of gaps with exact quotes and suggested contract
-    clauses.
+    Two-stage pipeline: a HYPOTHESIS agent walks the public API and emits
+    a list of candidate hazards (null inputs, ordering, lifecycle,
+    noreturn, error returns, ...). Then a fresh AUDIT agent runs PER
+    candidate to check whether the manual / public header / example
+    program warns about it (lean strict — vague mentions count as
+    undocumented). Documented hazards are dropped; the rest become the
+    final catalog. Hypothesis flags incomplete contract-DB rows too,
+    driving both upstream doc patches and DB seeding.
 
     \b
     Example:
@@ -3449,7 +3463,9 @@ def contract_check(
         )
         result = agent.check_library(
             library=library, target=target,
-            max_turns=max_turns,
+            max_hypothesis_turns=max_hypothesis_turns,
+            max_audit_turns=max_audit_turns,
+            audit_limit=audit_limit,
         )
 
         result_json = result.to_dict()
@@ -3472,10 +3488,18 @@ def contract_check(
                 f"{len(result.gaps)} gap(s)"
             )
             by_cat: dict[str, int] = {}
+            by_kind: dict[str, int] = {}
             for g in result.gaps:
-                by_cat[g.category] = by_cat.get(g.category, 0) + 1
+                for cat in g.categories:
+                    by_cat[cat] = by_cat.get(cat, 0) + 1
+                if g.hazard_kind:
+                    by_kind[g.hazard_kind] = by_kind.get(g.hazard_kind, 0) + 1
             for cat, n in sorted(by_cat.items(), key=lambda kv: -kv[1]):
                 console.print(f"  {cat}: {n}")
+            if by_kind:
+                console.print("[dim]by hazard:[/dim]")
+                for kind, n in sorted(by_kind.items(), key=lambda kv: -kv[1]):
+                    console.print(f"  {kind}: {n}")
             if verbose:
                 console.print("\n[dim]Full JSON:[/dim]")
                 console.print(json.dumps(result_json, indent=2))

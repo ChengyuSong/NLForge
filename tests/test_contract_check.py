@@ -1,4 +1,4 @@
-"""Tests for the contract-check agent (phase gating, tools, parsing)."""
+"""Tests for the contract-check pipeline (two-stage agent)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,10 @@ import pytest
 from llm_summary.agent_tools import ToolExecutor
 from llm_summary.code_contract.models import CodeContractSummary
 from llm_summary.contract_check import (
-    ALLOWED_TRANSITIONS,
-    PHASE_TOOLS,
+    AuditVerdict,
     ContractCheckResult,
-    ContractCheckToolExecutor,
     ContractGap,
+    HazardCandidate,
     parse_public_apis,
 )
 from llm_summary.db import SummaryDB
@@ -56,9 +55,6 @@ class TestParsePublicApis:
         names = parse_public_apis(text)
         assert "do_thing" in names
         assert "other_thing" in names
-        # The naive regex uses the last identifier before `(` as the name,
-        # which in C declarations IS the function name, but for `typedef`
-        # there is no `(` so it should be skipped.
         assert "my_t" not in names
 
     def test_empty_header(self) -> None:
@@ -67,7 +63,7 @@ class TestParsePublicApis:
 
 
 # ---------------------------------------------------------------------------
-# Phase gating in ContractCheckToolExecutor
+# Fixtures and helpers
 # ---------------------------------------------------------------------------
 
 
@@ -76,85 +72,6 @@ def empty_db() -> SummaryDB:
     db = SummaryDB(":memory:")
     yield db
     db.close()
-
-
-class TestPhaseGating:
-    def test_initial_phase_is_search(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        assert ex.phase == "SEARCH"
-
-    def test_search_blocks_db_tools(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        result = ex.execute("get_contracts", {"function_name": "foo"})
-        assert "error" in result
-        assert "SEARCH" in result["error"]
-
-    def test_search_blocks_submit_gaps(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        result = ex.execute(
-            "submit_gaps",
-            {"library": "x", "target": "y", "summary": "", "gaps": []},
-        )
-        assert "error" in result
-
-    def test_check_allows_db_tools(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        ex.execute("transition_phase", {"next_phase": "CHECK"})
-        # Tool runs even though function is missing — we just want to see
-        # it isn't rejected by phase gating.
-        result = ex.execute("get_contracts", {"function_name": "nonexistent"})
-        assert "error" in result
-        assert "not found" in result["error"]
-
-    def test_check_blocks_submit_gaps(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        ex.execute("transition_phase", {"next_phase": "CHECK"})
-        result = ex.execute(
-            "submit_gaps",
-            {"library": "x", "target": "y", "summary": "", "gaps": []},
-        )
-        assert "error" in result
-
-    def test_report_only_allows_submit_gaps(self, empty_db: SummaryDB) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        ex.execute("transition_phase", {"next_phase": "CHECK"})
-        ex.execute("transition_phase", {"next_phase": "REPORT"})
-        # DB tool should be blocked
-        result = ex.execute("get_contracts", {"function_name": "foo"})
-        assert "error" in result
-        # submit_gaps should be allowed (and accepted)
-        result = ex.execute(
-            "submit_gaps",
-            {
-                "library": "lib", "target": "tgt",
-                "summary": "test", "gaps": [],
-            },
-        )
-        assert result.get("accepted") is True
-
-    def test_invalid_transition_rejected(
-        self, empty_db: SummaryDB,
-    ) -> None:
-        ex = ContractCheckToolExecutor(empty_db)
-        # SEARCH -> REPORT is not allowed
-        result = ex.execute("transition_phase", {"next_phase": "REPORT"})
-        assert "error" in result
-        assert ex.phase == "SEARCH"
-
-    def test_allowed_transitions_are_linear(self) -> None:
-        assert ALLOWED_TRANSITIONS == {
-            "SEARCH": ["CHECK"],
-            "CHECK": ["REPORT"],
-        }
-
-    def test_phase_tools_are_disjoint_for_report(self) -> None:
-        # REPORT is terminal: only submit_gaps
-        assert PHASE_TOOLS["REPORT"] == {"submit_gaps"}
-
-
-# ---------------------------------------------------------------------------
-# list_apis_without_contracts handler
-# ---------------------------------------------------------------------------
 
 
 def _insert_func_with_contract(db: SummaryDB, name: str) -> None:
@@ -177,6 +94,11 @@ def _insert_func_no_contract(db: SummaryDB, name: str) -> None:
         signature=f"void {name}(void)",
     )
     db.insert_function(f)
+
+
+# ---------------------------------------------------------------------------
+# list_apis_without_contracts handler
+# ---------------------------------------------------------------------------
 
 
 class TestListApisWithoutContracts:
@@ -258,54 +180,155 @@ class TestListPublicApisHandler:
 
 
 # ---------------------------------------------------------------------------
-# submit_gaps handler echoes input with accepted=True
+# submit_hazards / submit_audit_verdict handlers
 # ---------------------------------------------------------------------------
 
 
-class TestSubmitGaps:
+class TestSubmitHazards:
     def test_echoes_input(self, empty_db: SummaryDB) -> None:
         ex = ToolExecutor(empty_db)
         payload = {
-            "library": "libpng", "target": "png_static",
-            "summary": "audit complete",
-            "gaps": [{
-                "function": "png_init_io",
-                "category": "missing_requires",
-                "evidence_source": "png.h:42",
-                "evidence_quote": "fp must be a writeable FILE*",
-                "suggested_clause": "fp != NULL",
-            }],
+            "summary": "scanned 30 APIs",
+            "candidates": [
+                {
+                    "function": "png_init_io",
+                    "hazard_kind": "null_input",
+                    "description": (
+                        "fp == NULL crashes inside fread()"
+                    ),
+                    "source_evidence": (
+                        "pngwio.c:42 / contract.requires[memsafe]: "
+                        "fp != NULL"
+                    ),
+                    "contract_clause": "fp != NULL",
+                    "contract_property": "memsafe",
+                },
+            ],
         }
-        result = ex._tool_submit_gaps(payload)
+        result = ex._tool_submit_hazards(payload)
         assert result["accepted"] is True
-        assert result["library"] == "libpng"
-        assert result["gaps"] == payload["gaps"]
+        assert result["summary"] == "scanned 30 APIs"
+        assert result["candidates"] == payload["candidates"]
+
+
+class TestSubmitAuditVerdict:
+    def test_echoes_input(self, empty_db: SummaryDB) -> None:
+        ex = ToolExecutor(empty_db)
+        payload = {
+            "documented": False,
+            "doc_searched": (
+                "libpng-manual.txt §IV.3 (no warning); "
+                "png.h:1023 (decl only)"
+            ),
+            "doc_quote": "",
+            "recommendation": "Document that fp must be non-NULL.",
+        }
+        result = ex._tool_submit_audit_verdict(payload)
+        assert result["accepted"] is True
+        assert result["documented"] is False
+        assert "manual" in result["doc_searched"]
 
 
 # ---------------------------------------------------------------------------
-# ContractGap / ContractCheckResult dataclasses
+# Dataclasses
 # ---------------------------------------------------------------------------
 
 
-class TestDataclasses:
-    def test_gap_roundtrip(self) -> None:
+class TestHazardCandidate:
+    def test_roundtrip_with_contract_clause(self) -> None:
         d = {
-            "function": "f", "category": "ordering",
-            "property": "memsafe",
-            "evidence_source": "manual.txt:12",
-            "evidence_quote": "must call setup() first",
-            "suggested_clause": "state == INITIALIZED",
-            "explanation": "ordering w/ setup",
+            "function": "png_init_io",
+            "hazard_kind": "null_input",
+            "description": "fp NULL crashes",
+            "source_evidence": "pngwio.c:42",
+            "contract_clause": "fp != NULL",
+            "contract_property": "memsafe",
+        }
+        c = HazardCandidate.from_dict(d)
+        assert c.to_dict() == d
+
+    def test_roundtrip_without_contract_clause(self) -> None:
+        d = {
+            "function": "png_set_IHDR",
+            "hazard_kind": "ordering",
+            "description": "must follow png_create_write_struct",
+            "source_evidence": "pngset.c:15",
+            "contract_clause": "",
+            "contract_property": "",
+        }
+        c = HazardCandidate.from_dict(d)
+        assert c.to_dict() == d
+
+
+class TestAuditVerdict:
+    def test_roundtrip_undocumented(self) -> None:
+        d = {
+            "documented": False,
+            "doc_searched": "manual.txt (no mention)",
+            "doc_quote": "",
+            "recommendation": "Document the NULL handling.",
+        }
+        v = AuditVerdict.from_dict(d)
+        assert v.to_dict() == d
+        assert v.documented is False
+
+    def test_roundtrip_documented(self) -> None:
+        d = {
+            "documented": True,
+            "doc_searched": "manual.txt:42 (clear warning)",
+            "doc_quote": "fp must be non-NULL",
+            "recommendation": "",
+        }
+        v = AuditVerdict.from_dict(d)
+        assert v.to_dict() == d
+        assert v.documented is True
+
+
+class TestContractGap:
+    def test_roundtrip_doc_and_db_gap(self) -> None:
+        d = {
+            "function": "f",
+            "categories": ["missing_contract", "incomplete_contract"],
+            "hazard_kind": "ordering",
+            "description": "must call setup() before f()",
+            "source_evidence": "f.c:42 / contract.requires[memsafe]: state",
+            "doc_searched": "manual.txt §3 (no mention)",
+            "doc_quote": "",
+            "recommendation": "Document the setup() ordering rule.",
+            "contract_clause": "state == INITIALIZED",
+            "contract_property": "memsafe",
         }
         g = ContractGap.from_dict(d)
         assert g.to_dict() == d
 
-    def test_result_to_dict(self) -> None:
+    def test_roundtrip_doc_only(self) -> None:
+        # missing_contract alone (no DB gap) — contract_clause/property empty.
+        g = ContractGap(
+            function="f",
+            categories=["missing_contract"],
+            hazard_kind="lifecycle",
+            description="caller must free returned ptr",
+            source_evidence="f.c:10 (returns malloc)",
+            doc_searched="manual.txt §2 (no free mention)",
+            recommendation="Document that the caller must free the result.",
+        )
+        d = g.to_dict()
+        assert d["categories"] == ["missing_contract"]
+        assert d["contract_clause"] == ""
+        assert d["contract_property"] == ""
+
+
+class TestContractCheckResult:
+    def test_to_dict(self) -> None:
         gaps = [
             ContractGap(
-                function="f", category="missing_contract",
-                evidence_source="png.h:1", evidence_quote="...",
-                suggested_clause="...",
+                function="f",
+                categories=["missing_contract"],
+                hazard_kind="null_input",
+                description="...",
+                source_evidence="png.h:1",
+                doc_searched="manual (no mention)",
+                recommendation="document NULL handling",
             ),
         ]
         r = ContractCheckResult(

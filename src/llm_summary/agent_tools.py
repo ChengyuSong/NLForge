@@ -421,34 +421,26 @@ CONTRACT_CHECK_ONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "submit_gaps",
+        "name": "submit_hazards",
         "description": (
-            "Submit the final catalog of contract gaps for this library. "
-            "Only callable in REPORT phase. Each gap must include an exact "
-            "quote from a doc/source location AND a suggested contract "
-            "clause. If you cannot quote it, do not include it."
+            "Submit the candidate hazard list for this library. This is "
+            "the terminal call of the HYPOTHESIS stage. A separate AUDIT "
+            "agent will check each candidate against the docs. Aim for "
+            "20-50 high-signal candidates — skip plainly safe APIs, "
+            "focus on null inputs, ordering, lifecycle, noreturn, error "
+            "returns, hidden state preconditions, and callback context."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "library": {
-                    "type": "string",
-                    "description": "Library name (e.g. 'libpng').",
-                },
-                "target": {
-                    "type": "string",
-                    "description": (
-                        "Build target / link unit (e.g. 'png_static')."
-                    ),
-                },
                 "summary": {
                     "type": "string",
                     "description": (
-                        "1-3 paragraph overview of what was audited and the "
-                        "main themes of the gaps found."
+                        "1-2 sentence overview of what API surface was "
+                        "scanned and the main themes of the hazards found."
                     ),
                 },
-                "gaps": {
+                "candidates": {
                     "type": "array",
                     "items": {
                         "type": "object",
@@ -456,73 +448,126 @@ CONTRACT_CHECK_ONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                             "function": {
                                 "type": "string",
                                 "description": (
-                                    "Public API function the gap concerns."
+                                    "Public API function the hazard concerns."
                                 ),
                             },
-                            "category": {
+                            "hazard_kind": {
                                 "type": "string",
                                 "enum": [
-                                    "missing_contract",
-                                    "missing_requires",
-                                    "missing_ensures",
-                                    "missing_modifies",
                                     "ordering",
                                     "lifecycle",
-                                    "error_path",
-                                    "inconsistency",
+                                    "null_input",
+                                    "noreturn",
+                                    "error_return",
+                                    "state_dependent",
+                                    "callback_context",
+                                    "numeric_hazard",
+                                    "other",
                                 ],
-                                "description": "Gap category.",
-                            },
-                            "property": {
-                                "type": "string",
-                                "enum": ["memsafe", "memleak", "overflow"],
                                 "description": (
-                                    "Safety property the missing clause "
-                                    "belongs to. Omit for missing_contract."
+                                    "Kind of hazardous behavior."
                                 ),
                             },
-                            "evidence_source": {
+                            "description": {
                                 "type": "string",
                                 "description": (
-                                    "Where the evidence came from (e.g. "
-                                    "'libpng-manual.txt:1234', 'png.h:567', "
-                                    "'example.c:89')."
+                                    "One-paragraph plain-English description "
+                                    "of the hazard: what goes wrong, when, "
+                                    "and why the docs should warn about it. "
+                                    "The audit agent will use this verbatim "
+                                    "to drive its doc search."
                                 ),
                             },
-                            "evidence_quote": {
+                            "source_evidence": {
                                 "type": "string",
                                 "description": (
-                                    "Exact verbatim quote from the source "
-                                    "supporting this gap."
+                                    "Where in the code/contracts the hazard "
+                                    "is observable (e.g. "
+                                    "'pngwio.c:42 / contract.requires"
+                                    "[memsafe]: fp != NULL')."
                                 ),
                             },
-                            "suggested_clause": {
+                            "contract_clause": {
                                 "type": "string",
                                 "description": (
-                                    "Proposed contract clause in C-expression "
-                                    "form (e.g. 'png_ptr->io_ptr != NULL') or "
-                                    "english predicate. Should be directly "
-                                    "addable to requires/ensures/modifies."
+                                    "Set iff our code-contract DB is ALSO "
+                                    "missing this clause (FP source for the "
+                                    "verifier). Directly-addable C predicate "
+                                    "(e.g. 'fp != NULL'). Empty string "
+                                    "otherwise."
                                 ),
                             },
-                            "explanation": {
+                            "contract_property": {
                                 "type": "string",
+                                "enum": [
+                                    "", "memsafe", "memleak", "overflow",
+                                ],
                                 "description": (
-                                    "Why the existing contract misses this. "
-                                    "For inconsistency, what the contract "
-                                    "says vs what the source/doc shows."
+                                    "Required iff contract_clause is set. "
+                                    "Which safety property the clause belongs "
+                                    "to. Empty string otherwise."
                                 ),
                             },
                         },
                         "required": [
-                            "function", "category", "evidence_source",
-                            "evidence_quote", "suggested_clause",
+                            "function", "hazard_kind", "description",
+                            "source_evidence",
                         ],
                     },
-                    "description": "List of contract gaps.",
+                    "description": "List of candidate hazards to audit.",
                 },
             },
-            "required": ["library", "target", "summary", "gaps"],
+            "required": ["summary", "candidates"],
+        },
+    },
+    {
+        "name": "submit_audit_verdict",
+        "description": (
+            "Submit the AUDIT verdict for ONE hazard candidate. Terminal "
+            "call of the audit stage. Set documented=true ONLY when the "
+            "docs CLEARLY warn about this exact hazard. Vague or partial "
+            "mentions count as undocumented (lean strict). Always record "
+            "what you searched in doc_searched."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "documented": {
+                    "type": "boolean",
+                    "description": (
+                        "True iff the docs clearly warn about this hazard. "
+                        "Vague or partial mentions are NOT enough — set "
+                        "false and quote the partial mention in doc_quote."
+                    ),
+                },
+                "doc_searched": {
+                    "type": "string",
+                    "description": (
+                        "What you searched in the docs and the result, "
+                        "e.g. 'libpng-manual.txt §IV.3 (no warning); "
+                        "png.h:1023 (decl only); example.c:55 (uses "
+                        "without comment)'."
+                    ),
+                },
+                "doc_quote": {
+                    "type": "string",
+                    "description": (
+                        "Verbatim quote from the docs if a vague/partial "
+                        "mention exists. Empty string if docs are silent "
+                        "or if the hazard is fully documented (in the "
+                        "documented=true case, quote the warning)."
+                    ),
+                },
+                "recommendation": {
+                    "type": "string",
+                    "description": (
+                        "One-sentence change to propose to the upstream "
+                        "maintainer. Required when documented=false; "
+                        "empty string when documented=true."
+                    ),
+                },
+            },
+            "required": ["documented", "doc_searched"],
         },
     },
 ]
@@ -990,9 +1035,16 @@ class ToolExecutor:
             "missing": missing,
         }
 
-    # -- submit_gaps (contract-check) --
+    # -- submit_hazards (contract-check, hypothesis stage) --
 
-    def _tool_submit_gaps(self, inp: dict[str, Any]) -> dict[str, Any]:
+    def _tool_submit_hazards(self, inp: dict[str, Any]) -> dict[str, Any]:
+        return {"accepted": True, **inp}
+
+    # -- submit_audit_verdict (contract-check, audit stage) --
+
+    def _tool_submit_audit_verdict(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
         return {"accepted": True, **inp}
 
     # -- submit_reflection --
