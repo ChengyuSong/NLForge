@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -227,13 +228,26 @@ class ContractGap:
 
 @dataclass
 class ContractCheckResult:
-    """The output of one library audit."""
+    """The output of one library audit.
+
+    Carries both the final catalog (``gaps``) and the raw hypothesis +
+    per-audit progress so that an in-progress run can be saved
+    incrementally and inspected (or resumed/retried) after a crash.
+    """
 
     library: str
     target: str
     summary: str = ""
     gaps: list[ContractGap] = field(default_factory=list)
     completed: bool = False  # True iff hypothesis returned candidates
+
+    # Incremental-save fields. Populated as the orchestrator runs.
+    candidates: list[HazardCandidate] = field(default_factory=list)
+    audited: int = 0
+    # Documented-and-dropped hazards. Each entry is
+    # {"candidate": HazardCandidate.to_dict(),
+    #  "verdict":   AuditVerdict.to_dict()}.
+    dropped: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -243,6 +257,11 @@ class ContractCheckResult:
             "gap_count": len(self.gaps),
             "gaps": [g.to_dict() for g in self.gaps],
             "completed": self.completed,
+            "candidate_count": len(self.candidates),
+            "audited": self.audited,
+            "candidates": [c.to_dict() for c in self.candidates],
+            "dropped_count": len(self.dropped),
+            "dropped": list(self.dropped),
         }
 
 
@@ -762,17 +781,23 @@ class AuditAgent(_ReActLoop):
 
 
 class ContractCheckAgent:
-    """Two-stage orchestrator: hypothesis → per-candidate audits → catalog."""
+    """Two-stage orchestrator: hypothesis → per-candidate audits → catalog.
+
+    Each stage gets a fresh LLM backend instance constructed via
+    ``llm_factory`` so prompt caches, conversation IDs, KV-cache hints,
+    or any other client-side state from one audit cannot bleed into the
+    next. Hypothesis gets one fresh client; each audit gets its own.
+    """
 
     def __init__(
         self,
         db: SummaryDB,
-        llm: LLMBackend,
+        llm_factory: Callable[[], LLMBackend],
         verbose: bool = False,
         project_path: Path | None = None,
     ) -> None:
         self.db = db
-        self.llm = llm
+        self.llm_factory = llm_factory
         self.verbose = verbose
         self.project_path = project_path
 
@@ -784,15 +809,16 @@ class ContractCheckAgent:
         max_hypothesis_turns: int = DEFAULT_HYPOTHESIS_TURNS,
         max_audit_turns: int = DEFAULT_AUDIT_TURNS,
         audit_limit: int | None = None,
+        output_path: Path | None = None,
     ) -> ContractCheckResult:
         if self.project_path is None:
             raise ValueError(
                 "ContractCheckAgent requires project_path (the git repo).",
             )
 
-        # Stage 1: hypothesis
+        # Stage 1: hypothesis (fresh LLM client)
         hyp = HypothesisAgent(
-            self.db, self.llm,
+            self.db, self.llm_factory(),
             verbose=self.verbose, project_path=self.project_path,
         )
         hyp_summary, candidates = hyp.enumerate_hazards(
@@ -800,7 +826,7 @@ class ContractCheckAgent:
         )
 
         if not candidates:
-            return ContractCheckResult(
+            result = ContractCheckResult(
                 library=library, target=target,
                 summary=(
                     "Hypothesis stage produced no candidates. "
@@ -808,6 +834,8 @@ class ContractCheckAgent:
                 ),
                 gaps=[], completed=False,
             )
+            self._write_progress(result, output_path)
+            return result
 
         total_candidates = len(candidates)
         if audit_limit is not None and audit_limit < total_candidates:
@@ -818,60 +846,89 @@ class ContractCheckAgent:
                 )
             candidates = candidates[:audit_limit]
 
-        # Stage 2: audit each candidate (sequential)
-        audit = AuditAgent(
-            self.db, self.llm,
-            verbose=self.verbose, project_path=self.project_path,
+        # Build a working result. After hypothesis we know the candidate
+        # list; gaps/audited/dropped grow as each audit completes.
+        result = ContractCheckResult(
+            library=library, target=target,
+            summary=(
+                f"{hyp_summary} Hypothesis produced {len(candidates)} "
+                f"candidates; audit in progress."
+            ),
+            gaps=[], completed=False,
+            candidates=list(candidates),
+            audited=0, dropped=[],
         )
-        verdicts: list[AuditVerdict] = []
+        self._write_progress(result, output_path)
+
+        # Stage 2: audit each candidate (fresh LLM client per audit).
+        # Aggregation happens inline so the progress file always
+        # reflects the gaps/dropped seen so far.
         for i, cand in enumerate(candidates, start=1):
             if self.verbose:
                 print(
                     f"\n[Orchestrator] Auditing {i}/{len(candidates)}: "
                     f"{cand.function}",
                 )
-            verdicts.append(
-                audit.audit_candidate(
-                    cand, library, target,
-                    max_turns=max_audit_turns,
-                ),
+            audit = AuditAgent(
+                self.db, self.llm_factory(),
+                verbose=self.verbose, project_path=self.project_path,
             )
-
-        # Stage 3: aggregate
-        gaps: list[ContractGap] = []
-        for cand, verdict in zip(candidates, verdicts, strict=True):
+            verdict = audit.audit_candidate(
+                cand, library, target,
+                max_turns=max_audit_turns,
+            )
+            result.audited = i
             if verdict.documented:
-                continue
-            categories = ["missing_contract"]
-            if cand.contract_clause:
-                categories.append("incomplete_contract")
-            gaps.append(
-                ContractGap(
-                    function=cand.function,
-                    categories=categories,
-                    hazard_kind=cand.hazard_kind,
-                    description=cand.description,
-                    source_evidence=cand.source_evidence,
-                    doc_searched=verdict.doc_searched,
-                    doc_quote=verdict.doc_quote,
-                    recommendation=verdict.recommendation,
-                    contract_clause=cand.contract_clause,
-                    contract_property=cand.contract_property,
-                ),
-            )
+                result.dropped.append({
+                    "candidate": cand.to_dict(),
+                    "verdict": verdict.to_dict(),
+                })
+            else:
+                categories = ["missing_contract"]
+                if cand.contract_clause:
+                    categories.append("incomplete_contract")
+                result.gaps.append(
+                    ContractGap(
+                        function=cand.function,
+                        categories=categories,
+                        hazard_kind=cand.hazard_kind,
+                        description=cand.description,
+                        source_evidence=cand.source_evidence,
+                        doc_searched=verdict.doc_searched,
+                        doc_quote=verdict.doc_quote,
+                        recommendation=verdict.recommendation,
+                        contract_clause=cand.contract_clause,
+                        contract_property=cand.contract_property,
+                    ),
+                )
+            self._write_progress(result, output_path)
 
-        documented = len(candidates) - len(gaps)
+        # Stage 3: finalize
+        documented = len(result.dropped)
         skipped = total_candidates - len(candidates)
         skipped_note = (
             f" ({skipped} skipped due to --limit)" if skipped else ""
         )
-        summary = (
+        result.summary = (
             f"{hyp_summary} "
             f"Audited {len(candidates)} of {total_candidates} candidates: "
-            f"{len(gaps)} undocumented, {documented} documented"
+            f"{len(result.gaps)} undocumented, {documented} documented"
             f"{skipped_note}."
         )
-        return ContractCheckResult(
-            library=library, target=target,
-            summary=summary, gaps=gaps, completed=True,
-        )
+        result.completed = True
+        self._write_progress(result, output_path)
+        return result
+
+    def _write_progress(
+        self, result: ContractCheckResult, output_path: Path | None,
+    ) -> None:
+        """Atomically rewrite the output file with the current state.
+
+        Writes via a temp file + rename so a crash mid-write can't leave
+        a half-written JSON behind.
+        """
+        if output_path is None:
+            return
+        tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(result.to_dict(), indent=2) + "\n")
+        tmp.replace(output_path)

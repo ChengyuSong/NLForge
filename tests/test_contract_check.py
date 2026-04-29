@@ -340,3 +340,39 @@ class TestContractCheckResult:
         assert d["gap_count"] == 1
         assert d["completed"] is True
         assert len(d["gaps"]) == 1
+        # Default-empty incremental-save fields are still serialized.
+        assert d["candidate_count"] == 0
+        assert d["audited"] == 0
+        assert d["candidates"] == []
+        assert d["dropped_count"] == 0
+        assert d["dropped"] == []
+
+    def test_to_dict_with_progress(self) -> None:
+        cand = HazardCandidate(
+            function="png_init_io",
+            hazard_kind="null_input",
+            description="fp NULL crashes",
+            source_evidence="pngwio.c:42",
+        )
+        verdict = AuditVerdict(
+            documented=True,
+            doc_searched="manual.txt:42",
+            doc_quote="fp must be non-NULL",
+        )
+        r = ContractCheckResult(
+            library="libpng", target="png_static",
+            summary="in progress",
+            gaps=[], completed=False,
+            candidates=[cand],
+            audited=1,
+            dropped=[{
+                "candidate": cand.to_dict(),
+                "verdict": verdict.to_dict(),
+            }],
+        )
+        d = r.to_dict()
+        assert d["candidate_count"] == 1
+        assert d["audited"] == 1
+        assert d["candidates"][0]["function"] == "png_init_io"
+        assert d["dropped_count"] == 1
+        assert d["dropped"][0]["verdict"]["documented"] is True

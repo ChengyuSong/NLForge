@@ -3454,26 +3454,30 @@ def contract_check(
             target = target or "default"
 
     kwargs = _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)
-    llm = create_backend(backend, model=model, **kwargs)
+
+    def _llm_factory() -> Any:
+        return create_backend(backend, model=model, **kwargs)
+
     db = SummaryDB(db_path)
 
     try:
         agent = ContractCheckAgent(
-            db, llm, verbose=verbose, project_path=Path(project_path),
+            db, _llm_factory, verbose=verbose,
+            project_path=Path(project_path),
         )
         result = agent.check_library(
             library=library, target=target,
             max_hypothesis_turns=max_hypothesis_turns,
             max_audit_turns=max_audit_turns,
             audit_limit=audit_limit,
+            output_path=Path(output) if output else None,
         )
 
         result_json = result.to_dict()
 
         if output:
-            with open(output, "w") as f:
-                json.dump(result_json, f, indent=2)
-                f.write("\n")
+            # check_library already wrote the final JSON to `output`
+            # incrementally; just confirm to the user.
             console.print(
                 f"[green]Wrote {len(result.gaps)} gaps to {output}[/green]",
             )
