@@ -593,6 +593,14 @@ def lookup(name, db_path, signature):
     help="Overwrite existing stdlib cache entries when seeding with --seed-from",
 )
 @click.option(
+    "--extra-aliases",
+    "extra_alias_files",
+    multiple=True,
+    type=click.Path(exists=True),
+    help="Additional libc-alias JSON file(s) to merge with the bundled map "
+         "(repeatable). User entries override built-ins.",
+)
+@click.option(
     "--backend",
     type=click.Choice(["claude", "openai", "ollama", "llamacpp", "gemini"]),
     default=None,
@@ -607,8 +615,8 @@ def lookup(name, db_path, signature):
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def init_stdlib(
-    db_path, extra_abilists, stdlib_db, seed_from_paths, force, backend, model,
-    llm_host, llm_port, log_llm, verbose,
+    db_path, extra_abilists, stdlib_db, seed_from_paths, force, extra_alias_files,
+    backend, model, llm_host, llm_port, log_llm, verbose,
 ):
     """Populate external-function summaries using a persistent global cache.
 
@@ -632,7 +640,7 @@ def init_stdlib(
     """
     from .external_summarizer import ExternalFunctionSummarizer
     from .models import Function, VerificationSummary
-    from .stdlib_cache import StdlibCache, load_known_externals
+    from .stdlib_cache import StdlibCache, load_known_externals, load_libc_aliases
 
     if not db_path and not seed_from_paths:
         console.print("[red]Error: provide --db and/or --seed-from.[/red]")
@@ -641,6 +649,34 @@ def init_stdlib(
     # 1. Load known-externals — needed both for filtering seed-from and for apply
     known_externals = load_known_externals(list(extra_abilists) if extra_abilists else None)
     console.print(f"Known-externals registry: {len(known_externals):,} function names")
+
+    # 1b. Load libc alias map (glibc abilist names -> musl source names).
+    #     Validate orphans (musl=null) up front: every such entry must have a
+    #     hand-crafted code-contract in code_contract/stdlib.py.
+    libc_aliases = load_libc_aliases(
+        list(extra_alias_files) if extra_alias_files else None
+    )
+    if libc_aliases:
+        from .code_contract.stdlib import STDLIB_CONTRACTS as _CC_BUILTINS
+        orphans = sorted(
+            n for n, musl in libc_aliases.items()
+            if musl is None and n not in _CC_BUILTINS
+        )
+        if orphans:
+            console.print(
+                f"\n[red]Error: {len(orphans)} libc-alias orphan(s) "
+                f"(musl=null) have no builtin contract in "
+                f"code_contract/stdlib.py:[/red]"
+            )
+            for n in orphans:
+                console.print(f"  {n}")
+            sys.exit(1)
+        n_resolvable = sum(1 for v in libc_aliases.values() if v is not None)
+        n_orphan = len(libc_aliases) - n_resolvable
+        console.print(
+            f"Libc-alias map: {len(libc_aliases):,} entries "
+            f"({n_resolvable} mapped to musl, {n_orphan} orphan-with-builtin)"
+        )
 
     # 2. Open the stdlib cache
     cache = StdlibCache(stdlib_db)
@@ -725,12 +761,53 @@ def init_stdlib(
                     cc_added += 1
                 if verbose:
                     console.print(f"  [seed] {src_func.name} ({tag})")
+
+            # Second pass: libc alias map. For each (glibc_name, musl_name)
+            # entry, copy the musl source's contracts under the glibc name
+            # so abilist-driven lookups hit the cache.
+            via_alias_map = 0
+            via_alias_cc = 0
+            for glibc_name, musl_name in libc_aliases.items():
+                if musl_name is None:
+                    continue  # orphan; handled by seed_builtins
+                if glibc_name not in known_externals:
+                    continue
+                if not force and cache.has(glibc_name):
+                    continue
+                fids = name_to_ids.get(musl_name)
+                if not fids:
+                    continue
+                blobs = _fetch_blobs(fids[0])
+                if not any(blobs.values()):
+                    continue
+                cache.put(
+                    name=glibc_name,
+                    allocation_json=blobs["allocation_json"],
+                    free_json=blobs["free_json"],
+                    init_json=blobs["init_json"],
+                    memsafe_json=blobs["memsafe_json"],
+                    model_used=tag,
+                    code_contract_json=blobs["code_contract_json"],
+                    code_contract_model=tag if blobs["code_contract_json"] else None,
+                )
+                via_alias_map += 1
+                if blobs["code_contract_json"]:
+                    via_alias_cc += 1
+                if verbose:
+                    console.print(
+                        f"  [libc-alias] {glibc_name} -> {musl_name} ({tag})"
+                    )
         finally:
             src_db.close()
         console.print(
             f"Seeded from {src_path}: {added} exported symbols added"
             + (f" ({cc_added} with code-contract)" if cc_added else "")
             + (f" ({alias_fallbacks} via weak_alias)" if alias_fallbacks else "")
+            + (
+                f", {via_alias_map} via libc-alias"
+                + (f" ({via_alias_cc} with code-contract)" if via_alias_cc else "")
+                if via_alias_map else ""
+            )
             + (f", {skipped_cached} already cached" if skipped_cached else "")
             + (f", {skipped_internal} internal symbols skipped" if skipped_internal else "")
         )

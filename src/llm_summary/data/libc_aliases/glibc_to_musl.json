@@ -1,0 +1,862 @@
+{
+  "_IO_getc": {
+    "musl": "getc",
+    "via": "weak_alias"
+  },
+  "_IO_putc": {
+    "musl": "putc",
+    "via": "weak_alias"
+  },
+  "__freelocale": {
+    "musl": "freelocale",
+    "via": "weak_alias"
+  },
+  "__getdelim": {
+    "musl": "getdelim",
+    "via": "weak_alias"
+  },
+  "__isoc23_fscanf": {
+    "musl": "fscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_fwscanf": {
+    "musl": "fwscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_scanf": {
+    "musl": "scanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_sscanf": {
+    "musl": "sscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoimax": {
+    "musl": "strtoimax",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtol": {
+    "musl": "strtol",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoll": {
+    "musl": "strtoll",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoul": {
+    "musl": "strtoul",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoull": {
+    "musl": "strtoull",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoumax": {
+    "musl": "strtoumax",
+    "via": "c23-variant"
+  },
+  "__isoc23_swscanf": {
+    "musl": "swscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vfscanf": {
+    "musl": "vfscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vfwscanf": {
+    "musl": "vfwscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vscanf": {
+    "musl": "vscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vsscanf": {
+    "musl": "vsscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vswscanf": {
+    "musl": "vswscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_vwscanf": {
+    "musl": "vwscanf",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstoimax": {
+    "musl": "wcstoimax",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstol": {
+    "musl": "wcstol",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstoll": {
+    "musl": "wcstoll",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstoul": {
+    "musl": "wcstoul",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstoull": {
+    "musl": "wcstoull",
+    "via": "c23-variant"
+  },
+  "__isoc23_wcstoumax": {
+    "musl": "wcstoumax",
+    "via": "c23-variant"
+  },
+  "__isoc23_wscanf": {
+    "musl": "wscanf",
+    "via": "c23-variant"
+  },
+  "__isoc99_fscanf": {
+    "musl": "fscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_fwscanf": {
+    "musl": "fwscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_scanf": {
+    "musl": "scanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_sscanf": {
+    "musl": "sscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_swscanf": {
+    "musl": "swscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vfscanf": {
+    "musl": "vfscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vfwscanf": {
+    "musl": "vfwscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vscanf": {
+    "musl": "vscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vsscanf": {
+    "musl": "vsscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vswscanf": {
+    "musl": "vswscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_vwscanf": {
+    "musl": "vwscanf",
+    "via": "weak_alias"
+  },
+  "__isoc99_wscanf": {
+    "musl": "wscanf",
+    "via": "weak_alias"
+  },
+  "__posix_getopt": {
+    "musl": "getopt",
+    "via": "weak_alias"
+  },
+  "__stack_chk_fail_local": {
+    "musl": "__stack_chk_fail",
+    "via": "weak_alias"
+  },
+  "__strtod_l": {
+    "musl": "strtod_l",
+    "via": "weak_alias"
+  },
+  "__strtof_l": {
+    "musl": "strtof_l",
+    "via": "weak_alias"
+  },
+  "__strtol_internal": {
+    "musl": "strtol",
+    "via": "weak_alias"
+  },
+  "__strtold_l": {
+    "musl": "strtold_l",
+    "via": "weak_alias"
+  },
+  "__strtoll_internal": {
+    "musl": "strtoll",
+    "via": "weak_alias"
+  },
+  "__strtoul_internal": {
+    "musl": "strtoul",
+    "via": "weak_alias"
+  },
+  "__strtoull_internal": {
+    "musl": "strtoull",
+    "via": "weak_alias"
+  },
+  "__sysv_signal": {
+    "musl": "signal",
+    "via": "weak_alias"
+  },
+  "__xpg_basename": {
+    "musl": "basename",
+    "via": "weak_alias"
+  },
+  "__xpg_strerror_r": {
+    "musl": "strerror_r",
+    "via": "weak_alias"
+  },
+  "asctime_r": {
+    "musl": "__asctime_r",
+    "via": "weak_alias"
+  },
+  "bsd_signal": {
+    "musl": "signal",
+    "via": "weak_alias"
+  },
+  "clearerr_unlocked": {
+    "musl": "clearerr",
+    "via": "weak_alias"
+  },
+  "clock_gettime": {
+    "musl": "__clock_gettime",
+    "via": "weak_alias"
+  },
+  "clock_nanosleep": {
+    "musl": "__clock_nanosleep",
+    "via": "weak_alias"
+  },
+  "crypt_r": {
+    "musl": "__crypt_r",
+    "via": "weak_alias"
+  },
+  "dl_iterate_phdr": {
+    "musl": "static_dl_iterate_phdr",
+    "via": "weak_alias"
+  },
+  "dladdr": {
+    "musl": "stub_dladdr",
+    "via": "weak_alias"
+  },
+  "dlopen": {
+    "musl": "stub_dlopen",
+    "via": "weak_alias"
+  },
+  "dn_expand": {
+    "musl": "__dn_expand",
+    "via": "weak_alias"
+  },
+  "drem": {
+    "musl": "remainder",
+    "via": "weak_alias"
+  },
+  "dremf": {
+    "musl": "remainderf",
+    "via": "weak_alias"
+  },
+  "dup3": {
+    "musl": "__dup3",
+    "via": "weak_alias"
+  },
+  "duplocale": {
+    "musl": "__duplocale",
+    "via": "weak_alias"
+  },
+  "eaccess": {
+    "musl": "euidaccess",
+    "via": "weak_alias"
+  },
+  "endgrent": {
+    "musl": "setgrent",
+    "via": "weak_alias"
+  },
+  "endnetent": {
+    "musl": "endhostent",
+    "via": "weak_alias"
+  },
+  "endpwent": {
+    "musl": "setpwent",
+    "via": "weak_alias"
+  },
+  "endutent": {
+    "musl": "endutxent",
+    "via": "weak_alias"
+  },
+  "execvpe": {
+    "musl": "__execvpe",
+    "via": "weak_alias"
+  },
+  "fdopen": {
+    "musl": "__fdopen",
+    "via": "weak_alias"
+  },
+  "feof_unlocked": {
+    "musl": "feof",
+    "via": "weak_alias"
+  },
+  "ferror_unlocked": {
+    "musl": "ferror",
+    "via": "weak_alias"
+  },
+  "fflush_unlocked": {
+    "musl": "fflush",
+    "via": "weak_alias"
+  },
+  "fgets_unlocked": {
+    "musl": "fgets",
+    "via": "weak_alias"
+  },
+  "fgetwc_unlocked": {
+    "musl": "__fgetwc_unlocked",
+    "via": "weak_alias"
+  },
+  "fgetws_unlocked": {
+    "musl": "fgetws",
+    "via": "weak_alias"
+  },
+  "fileno_unlocked": {
+    "musl": "fileno",
+    "via": "weak_alias"
+  },
+  "fputc_unlocked": {
+    "musl": "putc_unlocked",
+    "via": "weak_alias"
+  },
+  "fputs_unlocked": {
+    "musl": "fputs",
+    "via": "weak_alias"
+  },
+  "fputwc_unlocked": {
+    "musl": "__fputwc_unlocked",
+    "via": "weak_alias"
+  },
+  "fputws_unlocked": {
+    "musl": "fputws",
+    "via": "weak_alias"
+  },
+  "fread_unlocked": {
+    "musl": "fread",
+    "via": "weak_alias"
+  },
+  "fseeko": {
+    "musl": "__fseeko",
+    "via": "weak_alias"
+  },
+  "fstat": {
+    "musl": "__fstat",
+    "via": "weak_alias"
+  },
+  "fstatat": {
+    "musl": "__fstatat",
+    "via": "weak_alias"
+  },
+  "fstatfs": {
+    "musl": "__fstatfs",
+    "via": "weak_alias"
+  },
+  "ftello": {
+    "musl": "__ftello",
+    "via": "weak_alias"
+  },
+  "futimesat": {
+    "musl": "__futimesat",
+    "via": "weak_alias"
+  },
+  "fwrite_unlocked": {
+    "musl": "fwrite",
+    "via": "weak_alias"
+  },
+  "getauxval": {
+    "musl": "__getauxval",
+    "via": "weak_alias"
+  },
+  "getutent": {
+    "musl": "getutxent",
+    "via": "weak_alias"
+  },
+  "getutid": {
+    "musl": "getutxid",
+    "via": "weak_alias"
+  },
+  "getutline": {
+    "musl": "getutxline",
+    "via": "weak_alias"
+  },
+  "getwc_unlocked": {
+    "musl": "__fgetwc_unlocked",
+    "via": "weak_alias"
+  },
+  "getwchar_unlocked": {
+    "musl": "getwchar",
+    "via": "weak_alias"
+  },
+  "gmtime_r": {
+    "musl": "__gmtime_r",
+    "via": "weak_alias"
+  },
+  "hcreate_r": {
+    "musl": "__hcreate_r",
+    "via": "weak_alias"
+  },
+  "hdestroy_r": {
+    "musl": "__hdestroy_r",
+    "via": "weak_alias"
+  },
+  "hsearch_r": {
+    "musl": "__hsearch_r",
+    "via": "weak_alias"
+  },
+  "inet_aton": {
+    "musl": "__inet_aton",
+    "via": "weak_alias"
+  },
+  "isalnum_l": {
+    "musl": "__isalnum_l",
+    "via": "weak_alias"
+  },
+  "isalpha_l": {
+    "musl": "__isalpha_l",
+    "via": "weak_alias"
+  },
+  "isblank_l": {
+    "musl": "__isblank_l",
+    "via": "weak_alias"
+  },
+  "iscntrl_l": {
+    "musl": "__iscntrl_l",
+    "via": "weak_alias"
+  },
+  "isdigit_l": {
+    "musl": "__isdigit_l",
+    "via": "weak_alias"
+  },
+  "isgraph_l": {
+    "musl": "__isgraph_l",
+    "via": "weak_alias"
+  },
+  "islower_l": {
+    "musl": "__islower_l",
+    "via": "weak_alias"
+  },
+  "isprint_l": {
+    "musl": "__isprint_l",
+    "via": "weak_alias"
+  },
+  "ispunct_l": {
+    "musl": "__ispunct_l",
+    "via": "weak_alias"
+  },
+  "isspace_l": {
+    "musl": "__isspace_l",
+    "via": "weak_alias"
+  },
+  "isupper_l": {
+    "musl": "__isupper_l",
+    "via": "weak_alias"
+  },
+  "iswalnum_l": {
+    "musl": "__iswalnum_l",
+    "via": "weak_alias"
+  },
+  "iswalpha_l": {
+    "musl": "__iswalpha_l",
+    "via": "weak_alias"
+  },
+  "iswblank_l": {
+    "musl": "__iswblank_l",
+    "via": "weak_alias"
+  },
+  "iswcntrl_l": {
+    "musl": "__iswcntrl_l",
+    "via": "weak_alias"
+  },
+  "iswctype_l": {
+    "musl": "__iswctype_l",
+    "via": "weak_alias"
+  },
+  "iswdigit_l": {
+    "musl": "__iswdigit_l",
+    "via": "weak_alias"
+  },
+  "iswgraph_l": {
+    "musl": "__iswgraph_l",
+    "via": "weak_alias"
+  },
+  "iswlower_l": {
+    "musl": "__iswlower_l",
+    "via": "weak_alias"
+  },
+  "iswprint_l": {
+    "musl": "__iswprint_l",
+    "via": "weak_alias"
+  },
+  "iswpunct_l": {
+    "musl": "__iswpunct_l",
+    "via": "weak_alias"
+  },
+  "iswspace_l": {
+    "musl": "__iswspace_l",
+    "via": "weak_alias"
+  },
+  "iswupper_l": {
+    "musl": "__iswupper_l",
+    "via": "weak_alias"
+  },
+  "iswxdigit_l": {
+    "musl": "__iswxdigit_l",
+    "via": "weak_alias"
+  },
+  "isxdigit_l": {
+    "musl": "__isxdigit_l",
+    "via": "weak_alias"
+  },
+  "lgamma_r": {
+    "musl": "__lgamma_r",
+    "via": "weak_alias"
+  },
+  "lgammaf_r": {
+    "musl": "__lgammaf_r",
+    "via": "weak_alias"
+  },
+  "lgammal_r": {
+    "musl": "__lgammal_r",
+    "via": "weak_alias"
+  },
+  "localtime_r": {
+    "musl": "__localtime_r",
+    "via": "weak_alias"
+  },
+  "lseek": {
+    "musl": "__lseek",
+    "via": "weak_alias"
+  },
+  "madvise": {
+    "musl": "__madvise",
+    "via": "weak_alias"
+  },
+  "malloc": {
+    "musl": "default_malloc",
+    "via": "weak_alias"
+  },
+  "memrchr": {
+    "musl": "__memrchr",
+    "via": "weak_alias"
+  },
+  "mkostemps": {
+    "musl": "__mkostemps",
+    "via": "weak_alias"
+  },
+  "mmap": {
+    "musl": "__mmap",
+    "via": "weak_alias"
+  },
+  "mprotect": {
+    "musl": "__mprotect",
+    "via": "weak_alias"
+  },
+  "mremap": {
+    "musl": "__mremap",
+    "via": "weak_alias"
+  },
+  "munmap": {
+    "musl": "__munmap",
+    "via": "weak_alias"
+  },
+  "newlocale": {
+    "musl": "__newlocale",
+    "via": "weak_alias"
+  },
+  "nl_langinfo": {
+    "musl": "__nl_langinfo",
+    "via": "weak_alias"
+  },
+  "nl_langinfo_l": {
+    "musl": "__nl_langinfo_l",
+    "via": "weak_alias"
+  },
+  "pow10": {
+    "musl": "exp10",
+    "via": "weak_alias"
+  },
+  "pow10f": {
+    "musl": "exp10f",
+    "via": "weak_alias"
+  },
+  "pow10l": {
+    "musl": "exp10l",
+    "via": "weak_alias"
+  },
+  "pthread_cond_timedwait": {
+    "musl": "__pthread_cond_timedwait",
+    "via": "weak_alias"
+  },
+  "pthread_create": {
+    "musl": "__pthread_create",
+    "via": "weak_alias"
+  },
+  "pthread_detach": {
+    "musl": "__pthread_detach",
+    "via": "weak_alias"
+  },
+  "pthread_equal": {
+    "musl": "__pthread_equal",
+    "via": "weak_alias"
+  },
+  "pthread_exit": {
+    "musl": "__pthread_exit",
+    "via": "weak_alias"
+  },
+  "pthread_getspecific": {
+    "musl": "__pthread_getspecific",
+    "via": "weak_alias"
+  },
+  "pthread_join": {
+    "musl": "__pthread_join",
+    "via": "weak_alias"
+  },
+  "pthread_key_create": {
+    "musl": "__pthread_key_create",
+    "via": "weak_alias"
+  },
+  "pthread_key_delete": {
+    "musl": "__pthread_key_delete",
+    "via": "weak_alias"
+  },
+  "pthread_mutex_lock": {
+    "musl": "__pthread_mutex_lock",
+    "via": "weak_alias"
+  },
+  "pthread_mutex_timedlock": {
+    "musl": "__pthread_mutex_timedlock",
+    "via": "weak_alias"
+  },
+  "pthread_mutex_trylock": {
+    "musl": "__pthread_mutex_trylock",
+    "via": "weak_alias"
+  },
+  "pthread_mutex_unlock": {
+    "musl": "__pthread_mutex_unlock",
+    "via": "weak_alias"
+  },
+  "pthread_once": {
+    "musl": "__pthread_once",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_rdlock": {
+    "musl": "__pthread_rwlock_rdlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_timedrdlock": {
+    "musl": "__pthread_rwlock_timedrdlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_timedwrlock": {
+    "musl": "__pthread_rwlock_timedwrlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_tryrdlock": {
+    "musl": "__pthread_rwlock_tryrdlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_trywrlock": {
+    "musl": "__pthread_rwlock_trywrlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_unlock": {
+    "musl": "__pthread_rwlock_unlock",
+    "via": "weak_alias"
+  },
+  "pthread_rwlock_wrlock": {
+    "musl": "__pthread_rwlock_wrlock",
+    "via": "weak_alias"
+  },
+  "pthread_self": {
+    "musl": "__pthread_self_internal",
+    "via": "weak_alias"
+  },
+  "pthread_setcancelstate": {
+    "musl": "__pthread_setcancelstate",
+    "via": "weak_alias"
+  },
+  "pthread_testcancel": {
+    "musl": "__pthread_testcancel",
+    "via": "weak_alias"
+  },
+  "pthread_timedjoin_np": {
+    "musl": "__pthread_timedjoin_np",
+    "via": "weak_alias"
+  },
+  "pthread_tryjoin_np": {
+    "musl": "__pthread_tryjoin_np",
+    "via": "weak_alias"
+  },
+  "ptsname_r": {
+    "musl": "__ptsname_r",
+    "via": "weak_alias"
+  },
+  "pututline": {
+    "musl": "pututxline",
+    "via": "weak_alias"
+  },
+  "putwc_unlocked": {
+    "musl": "__fputwc_unlocked",
+    "via": "weak_alias"
+  },
+  "putwchar_unlocked": {
+    "musl": "putwchar",
+    "via": "weak_alias"
+  },
+  "qsort_r": {
+    "musl": "__qsort_r",
+    "via": "weak_alias"
+  },
+  "res_mkquery": {
+    "musl": "__res_mkquery",
+    "via": "weak_alias"
+  },
+  "res_search": {
+    "musl": "res_query",
+    "via": "weak_alias"
+  },
+  "res_send": {
+    "musl": "__res_send",
+    "via": "weak_alias"
+  },
+  "setnetent": {
+    "musl": "sethostent",
+    "via": "weak_alias"
+  },
+  "setutent": {
+    "musl": "setutxent",
+    "via": "weak_alias"
+  },
+  "sigaction": {
+    "musl": "__sigaction",
+    "via": "weak_alias"
+  },
+  "statfs": {
+    "musl": "__statfs",
+    "via": "weak_alias"
+  },
+  "stpcpy": {
+    "musl": "__stpcpy",
+    "via": "weak_alias"
+  },
+  "stpncpy": {
+    "musl": "__stpncpy",
+    "via": "weak_alias"
+  },
+  "strcasecmp_l": {
+    "musl": "__strcasecmp_l",
+    "via": "weak_alias"
+  },
+  "strchrnul": {
+    "musl": "__strchrnul",
+    "via": "weak_alias"
+  },
+  "strcoll_l": {
+    "musl": "__strcoll_l",
+    "via": "weak_alias"
+  },
+  "strerror_l": {
+    "musl": "__strerror_l",
+    "via": "weak_alias"
+  },
+  "strftime_l": {
+    "musl": "__strftime_l",
+    "via": "weak_alias"
+  },
+  "strncasecmp_l": {
+    "musl": "__strncasecmp_l",
+    "via": "weak_alias"
+  },
+  "strxfrm_l": {
+    "musl": "__strxfrm_l",
+    "via": "weak_alias"
+  },
+  "sysinfo": {
+    "musl": "__lsysinfo",
+    "via": "weak_alias"
+  },
+  "thrd_current": {
+    "musl": "__pthread_self_internal",
+    "via": "weak_alias"
+  },
+  "thrd_detach": {
+    "musl": "__pthread_detach",
+    "via": "weak_alias"
+  },
+  "thrd_equal": {
+    "musl": "__pthread_equal",
+    "via": "weak_alias"
+  },
+  "tolower_l": {
+    "musl": "__tolower_l",
+    "via": "weak_alias"
+  },
+  "toupper_l": {
+    "musl": "__toupper_l",
+    "via": "weak_alias"
+  },
+  "towctrans_l": {
+    "musl": "__towctrans_l",
+    "via": "weak_alias"
+  },
+  "towlower_l": {
+    "musl": "__towlower_l",
+    "via": "weak_alias"
+  },
+  "towupper_l": {
+    "musl": "__towupper_l",
+    "via": "weak_alias"
+  },
+  "tss_get": {
+    "musl": "__pthread_getspecific",
+    "via": "weak_alias"
+  },
+  "tzset": {
+    "musl": "__tzset",
+    "via": "weak_alias"
+  },
+  "updwtmp": {
+    "musl": "updwtmpx",
+    "via": "weak_alias"
+  },
+  "uselocale": {
+    "musl": "__uselocale",
+    "via": "weak_alias"
+  },
+  "utmpname": {
+    "musl": "__utmpxname",
+    "via": "weak_alias"
+  },
+  "utmpxname": {
+    "musl": "__utmpxname",
+    "via": "weak_alias"
+  },
+  "vsyslog": {
+    "musl": "__vsyslog",
+    "via": "weak_alias"
+  },
+  "wcscoll_l": {
+    "musl": "__wcscoll_l",
+    "via": "weak_alias"
+  },
+  "wcsftime_l": {
+    "musl": "__wcsftime_l",
+    "via": "weak_alias"
+  },
+  "wcsxfrm_l": {
+    "musl": "__wcsxfrm_l",
+    "via": "weak_alias"
+  },
+  "wctrans_l": {
+    "musl": "__wctrans_l",
+    "via": "weak_alias"
+  },
+  "wctype_l": {
+    "musl": "__wctype_l",
+    "via": "weak_alias"
+  }
+}

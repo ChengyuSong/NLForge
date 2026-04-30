@@ -52,6 +52,63 @@ def _parse_abilist(text: str, out: set[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-libc alias map (glibc abilist names -> musl source names)
+# ---------------------------------------------------------------------------
+
+def load_libc_aliases(
+    extra_paths: list[str | Path] | None = None,
+) -> dict[str, str | None]:
+    """Return ``{abilist_name: source_name_or_None}``.
+
+    Loads the bundled JSON files under ``data/libc_aliases/`` and merges in
+    any caller-supplied paths.  Later files override earlier ones so users
+    can patch vendor-specific differences without editing the bundled data.
+
+    A ``None`` source name marks a glibc-only orphan that has no musl
+    equivalent — a builtin contract is required for these (validated at
+    ``init-stdlib`` startup).
+    """
+    aliases: dict[str, str | None] = {}
+
+    try:
+        pkg_data = importlib.resources.files("llm_summary").joinpath(
+            "data/libc_aliases"
+        )
+        for entry in pkg_data.iterdir():
+            if entry.name.endswith(".json"):
+                _merge_alias_file(entry.read_text(encoding="utf-8"), aliases)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+
+    for p in (extra_paths or []):
+        _merge_alias_file(Path(p).read_text(encoding="utf-8"), aliases)
+
+    return aliases
+
+
+def _merge_alias_file(text: str, out: dict[str, str | None]) -> None:
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("libc-alias file must be a JSON object")
+    for glibc_name, entry in data.items():
+        if isinstance(entry, dict):
+            musl = entry.get("musl")
+        elif isinstance(entry, str) or entry is None:
+            musl = entry  # shorthand: name -> "musl_name" or null
+        else:
+            raise ValueError(
+                f"libc-alias entry for {glibc_name!r} must be a string, "
+                "null, or an object with a 'musl' key"
+            )
+        if musl is not None and not isinstance(musl, str):
+            raise ValueError(
+                f"libc-alias entry for {glibc_name!r}: 'musl' must be a "
+                "string or null"
+            )
+        out[glibc_name] = musl
+
+
+# ---------------------------------------------------------------------------
 # Cache entry
 # ---------------------------------------------------------------------------
 
