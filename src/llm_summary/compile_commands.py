@@ -1,6 +1,7 @@
 """Parser for compile_commands.json to extract per-file compile flags."""
 
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ class CompileCommandsDB:
         """
         self._commands: dict[str, list[str]] = {}
         self._directory_map: dict[str, str] = {}
+        self._aggregator_cache: dict[str, str | None] = {}
 
         if compile_commands_path:
             self._load(compile_commands_path)
@@ -158,8 +160,10 @@ class CompileCommandsDB:
         """
         Get compile flags for a specific source file.
 
-        Falls back to basename matching when exact path lookup fails
-        (e.g. docker container paths vs host paths).
+        Lookup order: exact path → basename match (handles docker/host
+        path discrepancies) → amalgamation aggregator (a .c file in the
+        same directory that ``#include``s this one, e.g. freetype's
+        ``src/bdf/bdf.c`` includes ``bdfdrivr.c``).
 
         Args:
             file_path: Path to the source file
@@ -175,7 +179,49 @@ class CompileCommandsDB:
         for key, flags in self._commands.items():
             if Path(key).name == basename:
                 return flags
+        agg = self.find_aggregator(file_path)
+        if agg:
+            return self._commands.get(agg, [])
         return []
+
+    def find_aggregator(self, file_path: str | Path) -> str | None:
+        """Find a same-directory ``.c`` file that ``#include``s this one.
+
+        Some projects use an amalgamation pattern where a single
+        translation unit textually includes several ``.c`` files (e.g.
+        freetype's ``src/bdf/bdf.c`` does ``#include "bdfdrivr.c"``).
+        Such included files do not appear in ``compile_commands.json``.
+        This helper returns the aggregator's absolute path so callers
+        can fall back to its compile flags. Results are cached.
+        """
+        resolved = str(Path(file_path).resolve())
+        if resolved in self._aggregator_cache:
+            return self._aggregator_cache[resolved]
+        if resolved in self._commands:
+            self._aggregator_cache[resolved] = None
+            return None
+
+        file_dir = str(Path(resolved).parent)
+        file_name = Path(resolved).name
+        pattern = re.compile(
+            rf'^\s*#\s*include\s+["<][^">]*\b{re.escape(file_name)}[">]',
+            re.MULTILINE,
+        )
+
+        for candidate in self._commands:
+            if str(Path(candidate).parent) != file_dir:
+                continue
+            try:
+                with open(candidate, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            if pattern.search(content):
+                self._aggregator_cache[resolved] = candidate
+                return candidate
+
+        self._aggregator_cache[resolved] = None
+        return None
 
     def get_directory(self, file_path: str | Path) -> str | None:
         """
