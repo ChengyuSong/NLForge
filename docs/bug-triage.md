@@ -66,9 +66,16 @@ TriageResult[]
   | Per-issue: hypothesis, reasoning, entry_function,
   | reachability_chain, path_constraints, data_flow_trace,
   | doc_audit_searched, feasible_path, relevant_functions
+  |
+  | hypothesis=safe/contract_gap → update contracts, mark FP
+  | hypothesis=feasible → Stage 4 (if --build-script-dir set)
   v
-gen-harness --validate (existing, enhanced)
-  | Reads verdict, generates ucsan harness per ENTRY function
+Stage 4: WITNESS (optional, fresh LLM)
+  | Generate self-contained ASan/UBSan unit test
+  | Calls ENTRY function with bug-triggering inputs
+  | Compile with clang -fsanitize=address,undefined in Docker
+  v
+witness_<func>_<idx>.c + build_witness_<func>_<idx>.sh
 ```
 
 ## Three Stages
@@ -114,6 +121,21 @@ Only runs if not mitigated. Produces the final proof:
 Key difference from prior design: `relevant_functions` = full call chain
 from entry to bug site. `validation_plan` uses the entry function as
 test entry point. Harness tests real-world triggering paths.
+
+### Stage 4: WITNESS (optional)
+
+Only runs for feasible verdicts when `--build-script-dir` is set.
+Generates a self-contained C unit test that reproduces the bug:
+
+- **Target**: Entry/interface function (from Stage 1), not the internal
+  buggy function
+- **Output**: `witness_<func>_<idx>.c` — standalone C program with `main()`
+- **Build**: Docker-based, same container as project build, compiled with
+  `clang -fsanitize=address,undefined`
+- **Detection**: ASan/UBSan catches the memory safety violation at runtime
+- **LLM-generated setup**: The LLM writes all state initialization
+  (struct allocation, file creation, etc.) from the feasibility context
+- **Compile-fix loop**: Up to 3 LLM attempts to fix compilation errors
 
 ### Three Outcomes
 
@@ -217,22 +239,29 @@ class DocAuditVerdict:
 | `git_show` / `git_grep` / `git_ls_tree` | Source inspection |
 | `submit_verdict` | Terminal: submit final verdict |
 
-## Validation Pipeline
+## Witness Generation (Stage 4)
 
-Triage results feed into `gen-harness --validate` for symbolic confirmation:
+When `--build-script-dir` is provided, triage automatically generates
+ASan/UBSan witnesses for feasible verdicts:
 
 ```
-llm-summary triage --db <db> -f func -o verdict.json
+llm-summary triage --db <db> -f func --build-script-dir build-scripts/zlib/ -v
   ↓
-llm-summary gen-harness --db <db> --validate verdict.json
+Stages 1-3 produce TriageResult with hypothesis="feasible"
   ↓
-For each verdict:
-  1. Extract relevant_functions, validation_plan
-  2. Find entry functions (no callers within relevant set)
-  3. Generate C harness via TRIAGE_VALIDATE_PROMPT
-  4. Compile with ko-clang → .ucsan binary
-  5. Run ucsan for symbolic validation
+Stage 4: _stage_witness()
+  1. Read entry function + feasible path source from DB
+  2. LLM generates standalone C test calling ENTRY function
+  3. Write witness_<func>_<idx>.c + build script
+  4. Compile in Docker with clang -fsanitize=address,undefined
+  5. If compile fails, feed errors to LLM for fix (up to 3 attempts)
 ```
+
+### Legacy: ucsan symbolic validation
+
+`gen-harness --validate` is still available for ucsan-based symbolic
+validation with ko-clang. The witness approach (Stage 4) is simpler
+and doesn't require ucsan infrastructure.
 
 ## Git Tools Integration
 
@@ -271,7 +300,12 @@ llm-summary triage --db func-scans/libpng/functions.db \
 llm-summary triage --db func-scans/zlib/functions.db \
   -f deflate -o verdict.json --backend gemini
 
-# Validate triage results with ucsan harness
+# Triage with witness generation (Stage 4)
+llm-summary triage --db func-scans/zlib/functions.db \
+  -f deflate --build-script-dir build-scripts/zlib/ \
+  -d harnesses/zlib/ -v
+
+# Legacy: ucsan symbolic validation
 llm-summary gen-harness --db func-scans/zlib/functions.db \
   --validate verdict.json --ko-clang-path ~/fuzzing/ucsan/ko-clang \
   --compile-commands /data/csong/build-artifacts/zlib/compile_commands.json
@@ -296,13 +330,15 @@ Optional:
   -v, --verbose                  Print detailed logs
   --disable-thinking             Disable extended thinking
   --llm-host, --llm-port         For local backends
+  --build-script-dir PATH        build-scripts/<project>/ dir (enables Stage 4 witness)
+  -d, --harness-dir PATH         Output dir for witnesses (default: harnesses/<project>/)
 ```
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `src/llm_summary/triage.py` | TriageAgent orchestrator, three stage agents, system prompts, ReachabilityVerdict, DocAuditVerdict |
+| `src/llm_summary/triage.py` | TriageAgent orchestrator, four stage agents (reachability, doc audit, verdict, witness), system prompts |
 | `src/llm_summary/agent_tools.py` | Tool definitions (DB read, triage, enhanced triage), ToolExecutor |
 | `src/llm_summary/git_tools.py` | GitTools class, git_show/git_grep/git_ls_tree |
 | `src/llm_summary/harness_generator.py` | validate_triage(), TRIAGE_VALIDATE_PROMPT |

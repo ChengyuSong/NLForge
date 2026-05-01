@@ -3331,6 +3331,26 @@ def show_issues(
     "--limit", default=None, type=int,
     help="Max number of issues to triage (useful for testing).",
 )
+@click.option(
+    "--build-script-dir", default=None,
+    help="Path to build-scripts/<project>/ directory. Enables Stage 4: "
+         "witness generation for feasible verdicts. "
+         "compile_commands.json is auto-loaded from this dir.",
+)
+@click.option(
+    "-d", "--harness-dir", default=None,
+    help="Output directory for witness harnesses "
+         "(default: harnesses/<project>/).",
+)
+@click.option(
+    "--build-dir", default=None,
+    help="Host directory for ASan rebuild artifacts. Mounted into Docker "
+         "for build and test execution. Required with --build-script-dir.",
+)
+@click.option(
+    "--force", is_flag=True,
+    help="Re-triage issues regardless of existing review status.",
+)
 def triage(
     db_path: str, backend: str, model: str | None,
     llm_host: str, llm_port: int | None, disable_thinking: bool,
@@ -3338,6 +3358,10 @@ def triage(
     severity: str | None, issue_index: int | None,
     output: str | None, project_path: str | None,
     limit: int | None,
+    build_script_dir: str | None,
+    harness_dir: str | None,
+    build_dir: str | None,
+    force: bool,
 ) -> None:
     """Triage verification issues: prove safety or feasibility.
 
@@ -3368,10 +3392,37 @@ def triage(
     try:
         from pathlib import Path as _Path
         out_path = _Path(output) if output else None
+
+        # Stage 4 (witness) setup
+        compile_commands = None
+        bsd_path = _Path(build_script_dir) if build_script_dir else None
+        if bsd_path is not None:
+            cc_path = bsd_path / "compile_commands.json"
+            if cc_path.exists():
+                with open(cc_path) as f:
+                    compile_commands = json.load(f)
+                if verbose:
+                    console.print(
+                        f"Loaded compile_commands: "
+                        f"{len(compile_commands)} entries",
+                    )
+
+        harness_out: _Path | None = None
+        if harness_dir:
+            harness_out = _Path(harness_dir)
+        elif bsd_path is not None:
+            db_p = _Path(db_path)
+            proj_name = db_p.parent.name
+            harness_out = _Path("harnesses") / proj_name
+
         agent = TriageAgent(
             db, llm_factory, verbose=verbose,
             project_path=_Path(project_path) if project_path else None,
             output_path=out_path,
+            compile_commands=compile_commands,
+            build_script_dir=bsd_path,
+            harness_output_dir=harness_out,
+            build_dir=_Path(build_dir) if build_dir else None,
         )
 
         # Resolve functions to triage
@@ -3418,6 +3469,7 @@ def triage(
             else:
                 results = agent.triage_function(
                     func, severity_filter=severity_filter,
+                    force=force,
                 )
                 remaining = (
                     limit - len(all_results) if limit is not None

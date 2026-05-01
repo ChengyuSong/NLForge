@@ -22,6 +22,8 @@ Doc-mitigated → safe (skip stage 3).
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +77,9 @@ class TriageResult:
     doc_audit_searched: str = ""
     doc_mitigated: bool = False
 
+    # Stage 4: witness (ASan/UBSan unit test for feasible verdicts)
+    witness_path: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "function_name": self.function_name,
@@ -102,6 +107,8 @@ class TriageResult:
             result["doc_audit_searched"] = self.doc_audit_searched
         if self.doc_mitigated:
             result["doc_mitigated"] = self.doc_mitigated
+        if self.witness_path:
+            result["witness_path"] = self.witness_path
         return result
 
 
@@ -287,6 +294,34 @@ The violation IS triggerable. You MUST provide:
 - Do not guess — cite specific evidence
 """
 
+WITNESS_SYSTEM_PROMPT = """\
+You write a self-contained C unit test that reproduces a confirmed memory \
+safety bug. The test will be compiled with `clang -fsanitize=address,undefined` \
+and linked against the project's static library.
+
+## Goal
+
+Write a C program with a `main()` function that:
+1. Sets up the minimal state required to call the ENTRY function
+2. Calls the entry function with inputs that exercise the feasible bug path
+3. When run under AddressSanitizer, triggers the memory safety violation
+
+## Rules
+
+- Include the project's public headers (not internal headers)
+- Use standard libc for memory allocation and I/O
+- Keep setup minimal — only create what the entry function needs
+- Do NOT use assert.h assertions to detect the bug; ASan/UBSan will detect it
+- If the entry function expects a file or stream, create a temporary file or \
+use a buffer
+- If the entry function expects a struct, allocate and initialize it with the \
+minimum fields needed
+- Output a single ```c fenced block with the complete program
+- The program must be self-contained: no external test frameworks
+"""
+
+DEFAULT_WITNESS_TURNS = 3
+
 
 # ---------------------------------------------------------------------------
 # Shared ReAct loop
@@ -403,6 +438,12 @@ def _run_react_loop(
     return terminal_input
 
 
+def _extract_c_block(text: str) -> str | None:
+    """Extract the first ```c ... ``` fenced block from LLM output."""
+    m = re.search(r"```c\s*\n(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
 # ---------------------------------------------------------------------------
 # Stage data models
 # ---------------------------------------------------------------------------
@@ -450,12 +491,21 @@ class TriageAgent:
         verbose: bool = False,
         project_path: Path | None = None,
         output_path: Path | None = None,
+        *,
+        compile_commands: list[dict[str, Any]] | None = None,
+        build_script_dir: Path | None = None,
+        harness_output_dir: Path | None = None,
+        build_dir: Path | None = None,
     ) -> None:
         self.db = db
         self.llm_factory = llm_factory
         self.verbose = verbose
         self.project_path = project_path
         self.output_path = output_path
+        self.compile_commands = compile_commands
+        self.build_script_dir = build_script_dir
+        self.build_dir = build_dir
+        self.harness_output_dir = harness_output_dir
         self._results: list[dict[str, Any]] = []
 
     def _rel_path(self, abs_path: str) -> str:
@@ -481,6 +531,10 @@ class TriageAgent:
             self._mark_issue_review(
                 func, result, status="confirmed",
             )
+            if self.build_script_dir is not None and self.build_dir is not None:
+                witness = self._stage_witness(func, result)
+                if witness:
+                    result.witness_path = witness
 
         self._save_incremental(result)
         return result
@@ -673,6 +727,7 @@ class TriageAgent:
         func: Function,
         *,
         severity_filter: set[str] | None = None,
+        force: bool = False,
     ) -> list[TriageResult]:
         """Triage all issues for a function, skipping already-reviewed ones."""
         if func.id is None:
@@ -682,24 +737,26 @@ class TriageAgent:
         if vs is None or not vs.issues:
             return []
 
-        # Look up existing reviews to skip already-triaged issues
-        fingerprints = [iss.fingerprint() for iss in vs.issues]
-        reviewed = self.db.get_issue_reviews_by_fingerprints(
-            func.id, fingerprints,
-        )
+        reviewed: dict[str, dict[str, Any]] = {}
+        if not force:
+            fingerprints = [iss.fingerprint() for iss in vs.issues]
+            reviewed = self.db.get_issue_reviews_by_fingerprints(
+                func.id, fingerprints,
+            )
 
         results = []
         for i, issue in enumerate(vs.issues):
             if severity_filter and issue.severity not in severity_filter:
                 continue
-            review = reviewed.get(issue.fingerprint())
-            if review and review.get("status") != "pending":
-                if self.verbose:
-                    print(
-                        f"[Triage] skip {func.name}#{i}: "
-                        f"already {review['status']}",
-                    )
-                continue
+            if not force:
+                review = reviewed.get(issue.fingerprint())
+                if review and review.get("status") != "pending":
+                    if self.verbose:
+                        print(
+                            f"[Triage] skip {func.name}#{i}: "
+                            f"already {review['status']}",
+                        )
+                    continue
             result = self.triage_issue(func, issue, i)
             results.append(result)
         return results
@@ -982,3 +1039,289 @@ class TriageAgent:
             "Read the function source and contracts before deciding.",
         ])
         return "\n".join(lines)
+
+    # -- stage 4: witness (ASan/UBSan unit test for feasible verdicts) --
+
+    def _stage_witness(
+        self,
+        func: Function,
+        result: TriageResult,
+    ) -> str | None:
+        """Generate a self-contained ASan/UBSan unit test for a feasible bug.
+
+        Returns the path to the witness C file, or None on failure.
+        """
+        assert self.build_script_dir is not None
+        assert self.build_dir is not None
+
+        if self.verbose:
+            print(
+                f"[Triage] Stage 4 → generating witness for "
+                f"{func.name}#{result.issue_index}",
+            )
+
+        # Determine output directory
+        out_dir = self.harness_output_dir or Path("harnesses")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        test_name = f"test_{func.name}_{result.issue_index}"
+        witness_c = out_dir / f"{test_name}.c"
+        build_sh = out_dir / f"build_{test_name}.sh"
+
+        # Gather source code for the LLM
+        prompt = self._build_witness_prompt(func, result)
+
+        llm = self.llm_factory()
+        c_code: str | None = None
+        compile_err = ""
+
+        for attempt in range(DEFAULT_WITNESS_TURNS):
+            if attempt == 0:
+                response = llm.complete(
+                    prompt, system=WITNESS_SYSTEM_PROMPT,
+                )
+            else:
+                response = llm.complete(
+                    f"The previous witness failed to compile:\n\n"
+                    f"```\n{compile_err}\n```\n\n"
+                    "Fix the code. Output a single ```c fenced block.",
+                    system=WITNESS_SYSTEM_PROMPT,
+                )
+
+            text = (
+                response.text
+                if hasattr(response, "text")
+                else str(response)
+            )
+            extracted = _extract_c_block(text)
+            if not extracted:
+                if self.verbose:
+                    print(
+                        f"  [Witness] attempt {attempt + 1}: "
+                        f"no C block in response",
+                    )
+                continue
+
+            c_code = extracted
+
+            # Write and try to compile
+            witness_c.write_text(c_code)
+            build_script = self._build_witness_script(
+                test_name, witness_c,
+            )
+            build_sh.write_text(build_script)
+            build_sh.chmod(0o755)
+
+            ok, compile_err = self._compile_witness(build_sh)
+            if ok:
+                if self.verbose:
+                    print(f"  [Witness] compiled: {witness_c}")
+                return str(witness_c)
+
+            if self.verbose:
+                print(
+                    f"  [Witness] attempt {attempt + 1} compile failed: "
+                    f"{compile_err[:200]}",
+                )
+
+        if c_code is not None:
+            witness_c.write_text(c_code)
+            if self.verbose:
+                print(
+                    f"  [Witness] saved (uncompiled): {witness_c}",
+                )
+            return str(witness_c)
+
+        return None
+
+    def _build_witness_prompt(
+        self,
+        func: Function,
+        result: TriageResult,
+    ) -> str:
+        """Build the user prompt for witness generation."""
+        lines = [
+            "## Bug Report",
+            "",
+            f"Function: `{func.name}`",
+            f"File: {self._rel_path(func.file_path)}",
+            f"Issue: [{result.issue.severity}] {result.issue.issue_kind} "
+            f"— {result.issue.description}",
+            "",
+            "## Feasibility Analysis",
+            "",
+            f"**Entry function**: `{result.entry_function}`",
+        ]
+
+        if result.feasible_path:
+            chain = " → ".join(result.feasible_path)
+            lines.append(f"**Feasible path**: {chain}")
+        if result.data_flow_trace:
+            lines.append(f"**Data flow**: {result.data_flow_trace}")
+        if result.assumptions:
+            lines.append("")
+            lines.append("**Assumptions** (input conditions at entry):")
+            for a in result.assumptions:
+                lines.append(f"  - {a}")
+        if result.assertions:
+            lines.append("")
+            lines.append("**Violation**:")
+            for a in result.assertions:
+                lines.append(f"  - {a}")
+
+        lines.extend(["", f"**Reasoning**: {result.reasoning}", ""])
+
+        # Include source code of entry function and functions along path
+        funcs_to_show = []
+        names_seen: set[str] = set()
+        for name in [result.entry_function, *result.feasible_path,
+                      func.name]:
+            if not name or name in names_seen:
+                continue
+            names_seen.add(name)
+            found = self.db.get_function_by_name(name)
+            if found:
+                funcs_to_show.append(found[0])
+
+        if funcs_to_show:
+            lines.append("## Source Code")
+            lines.append("")
+            for f in funcs_to_show:
+                lines.append(f"### `{f.name}` ({self._rel_path(f.file_path)})")
+                lines.append(f"```c\n// {f.signature}")
+                if f.source:
+                    lines.append(f.source)
+                lines.append("```")
+                lines.append("")
+
+        lines.extend([
+            "## Instructions",
+            "",
+            f"Write a complete C program with main() that calls "
+            f"`{result.entry_function}` with inputs that trigger the bug.",
+            "The program will be compiled with "
+            "`clang -fsanitize=address,undefined` and linked against the "
+            "project's static library.",
+        ])
+
+        return "\n".join(lines)
+
+    def _build_witness_script(
+        self,
+        test_name: str,
+        test_c: Path,
+    ) -> str:
+        """Generate a Docker-based build script for the unit test.
+
+        Rebuilds the project with ASan/UBSan into ``--build-dir`` on
+        the host (mounted at ``/workspace/build`` in Docker), then
+        compiles the test and links against the sanitized library.
+        The test binary is also run inside Docker.
+        """
+        assert self.build_script_dir is not None
+        assert self.build_dir is not None
+
+        config_path = self.build_script_dir / "config.json"
+        config: dict[str, Any] = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+
+        project_path = config.get(
+            "project_path", "/data/csong/opensource/unknown",
+        )
+        host_build_dir = str(self.build_dir)
+
+        # Rewrite cmake flags: drop LTO, add sanitizers
+        cmake_flags = list(config.get("cmake_flags", []))
+        san_flags = (
+            "-g -fsanitize=address,undefined -fno-omit-frame-pointer"
+        )
+        sanitized: list[str] = []
+        for flag in cmake_flags:
+            if flag.startswith("-DCMAKE_C_FLAGS="):
+                sanitized.append(f"-DCMAKE_C_FLAGS={san_flags}")
+            elif flag.startswith("-DCMAKE_CXX_FLAGS="):
+                sanitized.append(f"-DCMAKE_CXX_FLAGS={san_flags}")
+            elif flag.startswith(
+                "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION",
+            ):
+                sanitized.append(
+                    "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
+                )
+            else:
+                sanitized.append(flag)
+
+        cmake_args = " ".join(f"'{f}'" for f in sanitized)
+
+        # Write a small inner script to avoid bash -c quoting issues
+        inner_lines = [
+            "#!/bin/bash",
+            "set -e",
+            "",
+            "# Step 1: rebuild project with ASan/UBSan",
+            "cd /workspace/build",
+            f"cmake -G Ninja {cmake_args} /workspace/src",
+            "ninja -j$(nproc)",
+            'echo "--- project rebuilt with ASan ---"',
+            "",
+            "# Step 2: compile and link the test",
+            "# Use ! -type l to skip symlinks and avoid duplicate symbols",
+            "LIB=$(find /workspace/build -name '*.a' ! -type l | head -1)",
+            f"clang-18 -fsanitize=address,undefined -g "
+            f"-I/workspace/src -I/workspace/build "
+            f'/test/{test_c.name} '
+            '"$LIB" '
+            f"-lm -lz -lpthread -lstdc++ "
+            f"-o /test/{test_name}",
+            "",
+            "# Step 3: run the test",
+            'echo "--- running test ---"',
+            f"/test/{test_name}",
+        ]
+        inner_script = "\n".join(inner_lines) + "\n"
+
+        # Write inner script next to the test
+        inner_path = test_c.parent / f"_inner_{test_name}.sh"
+        inner_path.write_text(inner_script)
+        inner_path.chmod(0o755)
+
+        lines = [
+            "#!/bin/bash",
+            "set -e",
+            "",
+            "# Generated unit test — rebuilds project with ASan, "
+            "then builds and runs the test",
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+            f'PROJECT_PATH="{project_path}"',
+            f'BUILD_DIR="{host_build_dir}"',
+            "",
+            'mkdir -p "$BUILD_DIR"',
+            "",
+            f'echo "Building and running {test_name} (ASan/UBSan)..."',
+            "docker run --rm \\",
+            '  -v "$PROJECT_PATH":/workspace/src:ro \\',
+            '  -v "$BUILD_DIR":/workspace/build \\',
+            '  -v "$SCRIPT_DIR":/test \\',
+            "  llm-summary-builder:latest \\",
+            f'  bash /test/{inner_path.name}',
+            "",
+            'echo "Done."',
+        ]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _compile_witness(build_sh: Path) -> tuple[bool, str]:
+        """Run the witness build script. Returns (success, error_output)."""
+        try:
+            result = subprocess.run(
+                ["bash", str(build_sh)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                return True, ""
+            return False, (result.stderr + result.stdout).strip()
+        except subprocess.TimeoutExpired:
+            return False, "Build timed out after 120s"
+        except Exception as e:
+            return False, str(e)
