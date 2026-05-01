@@ -30,10 +30,15 @@ def _safe_path(path: str) -> str:
 def _run_git(
     repo: Path, args: list[str], *, timeout: int = 30,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a git command in *repo*, returning CompletedProcess."""
+    """Run a git command in *repo*, returning CompletedProcess.
+
+    Uses ``errors="replace"`` so binary blobs (e.g. CRC tables) don't
+    crash the decoder.
+    """
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, timeout=timeout,
+        text=True, encoding="utf-8", errors="replace",
     )
 
 

@@ -23,6 +23,7 @@ from .ordering import ProcessingOrderer
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from .llm.base import LLMBackend
     from .stdlib_cache import StdlibCache
 
 console = Console()
@@ -3326,12 +3327,17 @@ def show_issues(
     "--project-path", default=None,
     help="Project source root (enables git_show/git_grep/git_ls_tree tools).",
 )
+@click.option(
+    "--limit", default=None, type=int,
+    help="Max number of issues to triage (useful for testing).",
+)
 def triage(
     db_path: str, backend: str, model: str | None,
     llm_host: str, llm_port: int | None, disable_thinking: bool,
     verbose: bool, function_names: tuple[str, ...],
     severity: str | None, issue_index: int | None,
     output: str | None, project_path: str | None,
+    limit: int | None,
 ) -> None:
     """Triage verification issues: prove safety or feasibility.
 
@@ -3354,14 +3360,18 @@ def triage(
         sys.exit(1)
 
     kwargs = _build_backend_kwargs(backend, llm_host, llm_port, disable_thinking)
-    llm = create_backend(backend, model=model, **kwargs)
     db = SummaryDB(db_path)
+
+    def llm_factory() -> "LLMBackend":
+        return create_backend(backend, model=model, **kwargs)
 
     try:
         from pathlib import Path as _Path
+        out_path = _Path(output) if output else None
         agent = TriageAgent(
-            db, llm, verbose=verbose,
+            db, llm_factory, verbose=verbose,
             project_path=_Path(project_path) if project_path else None,
+            output_path=out_path,
         )
 
         # Resolve functions to triage
@@ -3383,9 +3393,11 @@ def triage(
                     functions.append(func)
 
         severity_filter = {severity} if severity else None
-        all_results = []
+        all_results: list[Any] = []
 
         for func in functions:
+            if limit is not None and len(all_results) >= limit:
+                break
             assert func.id is not None
 
             if issue_index is not None:
@@ -3407,18 +3419,17 @@ def triage(
                 results = agent.triage_function(
                     func, severity_filter=severity_filter,
                 )
-                all_results.extend(results)
+                remaining = (
+                    limit - len(all_results) if limit is not None
+                    else len(results)
+                )
+                all_results.extend(results[:remaining])
 
-        # Output
-        results_json = [r.to_dict() for r in all_results]
-
+        # Output (agent saves incrementally via output_path)
         if output:
-            with open(output, "w") as f:
-                json.dump(results_json, f, indent=2)
-                f.write("\n")
             console.print(f"[green]Wrote {len(all_results)} results to {output}[/green]")
         else:
-            # Print summary table
+            # Print summary table to stdout
             safe_count = sum(1 for r in all_results if r.hypothesis == "safe")
             gap_count = sum(1 for r in all_results if r.hypothesis == "contract_gap")
             feasible_count = sum(1 for r in all_results if r.hypothesis == "feasible")
@@ -3442,7 +3453,9 @@ def triage(
 
             if verbose:
                 console.print("\n[dim]Full JSON:[/dim]")
-                console.print(json.dumps(results_json, indent=2))
+                console.print(json.dumps(
+                    [r.to_dict() for r in all_results], indent=2,
+                ))
 
     finally:
         db.close()

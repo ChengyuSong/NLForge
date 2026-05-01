@@ -8,6 +8,7 @@ Write tools:     update_contracts, submit_verdict
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -628,6 +629,192 @@ REFLECTION_VERDICT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+# Enhanced triage tools: reachability, doc audit, entry-level verdict
+ENHANCED_TRIAGE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "get_entry_functions",
+        "description": (
+            "Find entry functions — functions that have no callers in the "
+            "call graph and are directly callable by external code. These "
+            "define the library's interface boundary."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "restrict_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional: limit the search to these function names. "
+                        "When omitted, searches all functions in the database."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "get_reachability_path",
+        "description": (
+            "Find the shortest call chain from one function to another "
+            "using BFS over the call graph. Returns the path as a list "
+            "of function names if reachable, or reachable=false if no "
+            "path exists. Considers both direct and indirect call edges."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_function": {
+                    "type": "string",
+                    "description": "Source function (e.g. entry function).",
+                },
+                "to_function": {
+                    "type": "string",
+                    "description": "Target function (e.g. function with the bug).",
+                },
+            },
+            "required": ["from_function", "to_function"],
+        },
+    },
+    {
+        "name": "get_call_chain_contracts",
+        "description": (
+            "Batch-read contracts for a list of functions (e.g. a call "
+            "chain). Returns requires/ensures/modifies for each function "
+            "in order. More efficient than calling get_contracts N times."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "function_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered list of function names.",
+                },
+            },
+            "required": ["function_names"],
+        },
+    },
+    {
+        "name": "submit_reachability",
+        "description": (
+            "Submit the reachability and path-feasibility verdict. "
+            "Terminal call for the reachability stage."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reachable": {
+                    "type": "boolean",
+                    "description": (
+                        "True iff the issue is both structurally reachable "
+                        "from an entry function AND the triggering condition "
+                        "is satisfiable given path constraints."
+                    ),
+                },
+                "entry_function": {
+                    "type": "string",
+                    "description": (
+                        "The entry function through which the issue is "
+                        "reachable. Empty if unreachable."
+                    ),
+                },
+                "call_chain": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Call chain from entry to bug site. E.g. "
+                        "['png_read_row', 'png_read_filter_row', "
+                        "'png_read_finish_row']."
+                    ),
+                },
+                "path_constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Guards and sanitizers found along the path. E.g. "
+                        "'png_read_row:42 checks png_ptr != NULL before call', "
+                        "'validate_header:88 clamps width to MAX_WIDTH'."
+                    ),
+                },
+                "data_flow_trace": {
+                    "type": "string",
+                    "description": (
+                        "How the triggering parameter flows from entry input "
+                        "through the call chain to the bug site. E.g. "
+                        "'width comes from PNG header (user-controlled) -> "
+                        "png_read_info() stores in png_ptr->width -> "
+                        "png_read_row() passes to filter_row(width)'."
+                    ),
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": (
+                        "Detailed explanation of why the issue is or is "
+                        "not reachable/triggerable."
+                    ),
+                },
+                "summarizer_gap": {
+                    "type": "boolean",
+                    "description": (
+                        "True if the verifier/summarizer missed important "
+                        "details (e.g. a callee ensures already guarantees "
+                        "the property). False otherwise."
+                    ),
+                },
+            },
+            "required": [
+                "reachable", "entry_function", "call_chain",
+                "reasoning",
+            ],
+        },
+    },
+    {
+        "name": "submit_doc_audit",
+        "description": (
+            "Submit the documentation audit verdict for a reachable issue. "
+            "Terminal call for the doc-audit stage."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mitigated": {
+                    "type": "boolean",
+                    "description": (
+                        "True iff project documentation or inline comments "
+                        "CLEARLY state a constraint that prevents the bug. "
+                        "Vague mentions do NOT count — lean strict."
+                    ),
+                },
+                "doc_searched": {
+                    "type": "string",
+                    "description": (
+                        "Audit trail: what docs/files/comments you searched "
+                        "and what you found. E.g. 'README.md (no mention); "
+                        "png.h:1023 (decl only); pngread.c:42 (comment says "
+                        "width must be validated by caller)'."
+                    ),
+                },
+                "doc_quote": {
+                    "type": "string",
+                    "description": (
+                        "Verbatim quote from docs/comments if a mention "
+                        "exists. Empty if docs are silent."
+                    ),
+                },
+                "mitigating_constraint": {
+                    "type": "string",
+                    "description": (
+                        "The specific constraint that mitigates the issue. "
+                        "E.g. 'callers must validate width <= PNG_MAX_WIDTH "
+                        "before calling png_read_row'. Empty if not mitigated."
+                    ),
+                },
+            },
+            "required": ["mitigated", "doc_searched"],
+        },
+    },
+]
+
 # Git tool names for filtering
 GIT_TOOL_NAMES = {"git_show", "git_ls_tree", "git_grep"}
 
@@ -1056,3 +1243,91 @@ class ToolExecutor:
 
     def _tool_transition_phase(self, inp: dict[str, Any]) -> dict[str, Any]:
         return {"next_phase": inp["next_phase"]}
+
+    # -- get_entry_functions (enhanced triage) --
+
+    def _tool_get_entry_functions(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        from .code_contract.checker import find_entry_functions
+
+        restrict_to = inp.get("restrict_to")
+        entries = find_entry_functions(self.db, restrict_to=restrict_to)
+        return {"entries": entries, "count": len(entries)}
+
+    # -- get_reachability_path (enhanced triage) --
+
+    def _build_call_graph(self) -> dict[int, list[int]]:
+        """Build and cache the forward call graph."""
+        if not hasattr(self, "_call_graph_cache"):
+            graph: dict[int, list[int]] = {}
+            for edge in self.db.get_all_call_edges():
+                graph.setdefault(edge.caller_id, []).append(edge.callee_id)
+            self._call_graph_cache = graph
+        return self._call_graph_cache
+
+    def _tool_get_reachability_path(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        from_name = inp["from_function"]
+        to_name = inp["to_function"]
+
+        from_func = self._get_func(from_name)
+        to_func = self._get_func(to_name)
+        if from_func is None:
+            return {"error": f"Function '{from_name}' not found in database."}
+        if to_func is None:
+            return {"error": f"Function '{to_name}' not found in database."}
+        if from_func.id is None or to_func.id is None:
+            return {"error": "Function has no ID."}
+
+        graph = self._build_call_graph()
+        src, dst = from_func.id, to_func.id
+
+        # BFS for shortest path
+        visited: set[int] = {src}
+        queue: deque[list[int]] = deque([[src]])
+        while queue:
+            path = queue.popleft()
+            node = path[-1]
+            if node == dst:
+                names = []
+                for fid in path:
+                    f = self.db.get_function(fid)
+                    names.append(f.name if f else f"<id:{fid}>")
+                return {"reachable": True, "path": names}
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append([*path, neighbor])
+
+        return {"reachable": False, "path": []}
+
+    # -- get_call_chain_contracts (enhanced triage) --
+
+    def _tool_get_call_chain_contracts(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        names = inp["function_names"]
+        if not isinstance(names, list):
+            return {"error": "function_names must be a list of strings"}
+
+        contracts: list[dict[str, Any]] = []
+        for name in names:
+            result = self._tool_get_contracts({"function_name": name})
+            contracts.append(result)
+        return {"contracts": contracts}
+
+    # -- submit_reachability (enhanced triage) --
+
+    def _tool_submit_reachability(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"accepted": True, **inp}
+
+    # -- submit_doc_audit (enhanced triage) --
+
+    def _tool_submit_doc_audit(
+        self, inp: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"accepted": True, **inp}
