@@ -295,6 +295,10 @@
     "musl": "feof",
     "via": "weak_alias"
   },
+  "fopen64": {
+    "musl": "fopen",
+    "via": "lfs-alias"
+  },
   "ferror_unlocked": {
     "musl": "ferror",
     "via": "weak_alias"
@@ -575,6 +579,10 @@
     "musl": "__nl_langinfo_l",
     "via": "weak_alias"
   },
+  "open64": {
+    "musl": "open",
+    "via": "lfs-alias"
+  },
   "pow10": {
     "musl": "exp10",
     "via": "weak_alias"
@@ -734,6 +742,10 @@
   "sigaction": {
     "musl": "__sigaction",
     "via": "weak_alias"
+  },
+  "stat64": {
+    "musl": "stat",
+    "via": "lfs-alias"
   },
   "statfs": {
     "musl": "__statfs",

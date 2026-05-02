@@ -427,6 +427,24 @@ def _build_libc_contracts() -> dict[str, CodeContractSummary]:
         "lseek64",
         memsafe={"requires": ["fd is an open file descriptor that supports seeking"]},
     )
+    out["stat"] = _summary(
+        "stat",
+        memsafe={"requires": ["pathname is non-NULL and points to a NUL-terminated string",
+                              "statbuf is non-NULL and writable for sizeof(struct stat) bytes"],
+                 "ensures":  ["on success: initialized(statbuf, sizeof(struct stat))"]},
+    )
+    out["fstat"] = _summary(
+        "fstat",
+        memsafe={"requires": ["fd is an open file descriptor",
+                              "statbuf is non-NULL and writable for sizeof(struct stat) bytes"],
+                 "ensures":  ["on success: initialized(statbuf, sizeof(struct stat))"]},
+    )
+    out["lstat"] = _summary(
+        "lstat",
+        memsafe={"requires": ["pathname is non-NULL and points to a NUL-terminated string",
+                              "statbuf is non-NULL and writable for sizeof(struct stat) bytes"],
+                 "ensures":  ["on success: initialized(statbuf, sizeof(struct stat))"]},
+    )
     out["fcntl"] = _summary(
         "fcntl",
         memsafe={"requires": ["fd is an open file descriptor",
