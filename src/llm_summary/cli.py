@@ -819,6 +819,31 @@ def init_stdlib(
     if seeded:
         console.print(f"  Seeded {seeded} hand-crafted builtin entries into cache (priority)")
 
+    # 4b. Resolve aliases against builtins already in cache (e.g. fopen64→fopen).
+    #     This covers the case where no --seed-from musl DB is given.
+    alias_seeded = 0
+    for glibc_name, musl_name in libc_aliases.items():
+        if musl_name is None:
+            continue
+        if cache.has(glibc_name, "code_contract"):
+            continue
+        entry = cache.get(musl_name)
+        if entry is None:
+            continue
+        cache.put(
+            name=glibc_name,
+            allocation_json=entry.allocation_json,
+            free_json=entry.free_json,
+            init_json=entry.init_json,
+            memsafe_json=entry.memsafe_json,
+            model_used=entry.model_used,
+            code_contract_json=entry.code_contract_json,
+            code_contract_model=entry.code_contract_model,
+        )
+        alias_seeded += 1
+    if alias_seeded:
+        console.print(f"  Resolved {alias_seeded} alias(es) from cached builtins")
+
     if not db_path:
         cache.close()
         return
