@@ -1102,7 +1102,13 @@ class ToolExecutor:
         if func.id is None:
             return {"error": f"Function '{name}' has no ID."}
 
-        contract_data = dict(inp["contract"])
+        raw_contract = inp.get("contract")
+        if raw_contract is None:
+            # LLM may have flattened the contract fields into inp
+            raw_contract = {
+                k: v for k, v in inp.items() if k != "function_name"
+            }
+        contract_data = dict(raw_contract)
         contract_data["function"] = name
         try:
             trial_summary = CodeContractSummary.from_dict(contract_data)

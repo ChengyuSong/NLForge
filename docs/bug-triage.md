@@ -1,6 +1,6 @@
 # Bug Triage Agent
 
-Three-stage pipeline that proves memory safety issues (from verification
+Five-stage pipeline that proves memory safety issues (from verification
 Pass 5) are either **safe** (cannot manifest) or **feasible** (reachable
 with concrete inputs from an entry function). Uses `complete_with_tools()`
 with any LLM backend, fresh context per stage.
@@ -36,7 +36,7 @@ or jumps to conclusions. The multi-stage pipeline solved this.
 Verification Pass (existing)
   | SafetyIssue[] (in functions.db)
   v
-TriageAgent (triage.py) — three-stage pipeline
+TriageAgent (triage.py) — five-stage pipeline
   |
   | Stage 1: REACHABILITY (fresh LLM, 30 turns)
   |   Is the bug reachable from an entry function?
@@ -46,7 +46,7 @@ TriageAgent (triage.py) — three-stage pipeline
   |          get_callers, get_callees, get_contracts, get_issues
   |   → submit_reachability
   |
-  |   unreachable/infeasible → SAFE (skip stages 2-3)
+  |   unreachable/infeasible → SAFE (skip stages 2-5)
   |
   | Stage 2: DOC AUDIT (fresh LLM, 25 turns)
   |   Do project docs or inline comments mitigate the issue?
@@ -54,7 +54,7 @@ TriageAgent (triage.py) — three-stage pipeline
   |          read_function_source, get_contracts
   |   → submit_doc_audit
   |
-  |   mitigated → SAFE (skip stage 3)
+  |   mitigated → SAFE (skip stages 3-5)
   |
   | Stage 3: VERDICT (fresh LLM, 35 turns)
   |   Produce entry-level proof: safe, contract_gap, or feasible
@@ -74,8 +74,17 @@ Stage 4: WITNESS (optional, fresh LLM)
   | Generate self-contained ASan/UBSan unit test
   | Calls ENTRY function with bug-triggering inputs
   | Compile with clang -fsanitize=address,undefined in Docker
+  |
+  | ASan triggered → confirmed bug (done)
+  | Ran clean → Stage 5
   v
-witness_<func>_<idx>.c + build_witness_<func>_<idx>.sh
+Stage 5: DEBUG (optional, fresh LLM × 2)
+  | Generate GDB batch script from path constraints
+  | Run test under gdb -batch in Docker
+  | Diagnose: path_blocked | not_reached | asan_limitation
+  | If path_blocked → flip to safe, update contracts
+  v
+test_<func>_<idx>.c + _gdb_<test>.gdb + corrected verdict
 ```
 
 ## Three Stages
@@ -137,6 +146,31 @@ Generates a self-contained C unit test that reproduces the bug:
   (struct allocation, file creation, etc.) from the feasibility context
 - **Compile-fix loop**: Up to 3 LLM attempts to fix compilation errors
 
+### Stage 5: DEBUG (optional)
+
+Only runs when Stage 4 produced a witness that compiled and ran **clean**
+(no ASan/UBSan reports). A clean run of a "feasible" bug is suspicious
+and triggers automated diagnosis:
+
+1. **GDB script generation** (LLM call 1) — reads path constraints,
+   data flow trace, and source code to produce a `gdb -batch` script
+   with breakpoints at key control flow points
+2. **Docker GDB run** — executes the test under GDB inside Docker
+   (with `--cap-add=SYS_PTRACE`), capturing variable values at each
+   breakpoint
+3. **Diagnosis** (LLM call 2) — analyzes GDB output against the
+   original reasoning to determine why ASan didn't trigger:
+   - **path_blocked**: A guard/check in the caller prevents the bug
+     condition (false positive) → flip verdict to safe, update contracts
+   - **not_reached**: Test doesn't exercise the right path (bad test)
+     → keep feasible, test needs improvement
+   - **asan_limitation**: Bug IS reachable but ASan can't detect it
+     (e.g., intra-object overflow) → keep feasible with note
+
+When the diagnosis is `path_blocked`, the verdict flips from "feasible"
+to "safe" and the caller's guard is recorded as a contract ensuring the
+callee's precondition.
+
 ### Three Outcomes
 
 **Safety proof** — the issue cannot manifest:
@@ -182,6 +216,11 @@ class TriageResult:
     data_flow_trace: str         # how bug parameter flows
     doc_audit_searched: str      # audit trail
     doc_mitigated: bool          # True if docs mitigate
+
+    # Stage 4-5
+    witness_path: str            # path to generated witness C file
+    debug_diagnosis: str         # path_blocked | not_reached | asan_limitation
+    debug_explanation: str       # diagnosis detail
 
 @dataclass
 class ReachabilityVerdict:
@@ -239,10 +278,10 @@ class DocAuditVerdict:
 | `git_show` / `git_grep` / `git_ls_tree` | Source inspection |
 | `submit_verdict` | Terminal: submit final verdict |
 
-## Witness Generation (Stage 4)
+## Witness Generation & Debug (Stages 4-5)
 
 When `--build-script-dir` is provided, triage automatically generates
-ASan/UBSan witnesses for feasible verdicts:
+ASan/UBSan witnesses for feasible verdicts and debugs false positives:
 
 ```
 llm-summary triage --db <db> -f func --build-script-dir build-scripts/zlib/ -v
@@ -252,9 +291,15 @@ Stages 1-3 produce TriageResult with hypothesis="feasible"
 Stage 4: _stage_witness()
   1. Read entry function + feasible path source from DB
   2. LLM generates standalone C test calling ENTRY function
-  3. Write witness_<func>_<idx>.c + build script
+  3. Write test_<func>_<idx>.c + build script
   4. Compile in Docker with clang -fsanitize=address,undefined
   5. If compile fails, feed errors to LLM for fix (up to 3 attempts)
+  ↓ (if test ran clean — no ASan reports)
+Stage 5: _stage_debug()
+  1. LLM generates GDB batch script with breakpoints at path constraints
+  2. Run test under gdb -batch in Docker
+  3. LLM diagnoses from GDB output: path_blocked | not_reached | asan_limitation
+  4. If path_blocked → flip verdict to safe, update caller contracts
 ```
 
 ### Legacy: ucsan symbolic validation
@@ -338,7 +383,7 @@ Optional:
 
 | File | Purpose |
 |---|---|
-| `src/llm_summary/triage.py` | TriageAgent orchestrator, four stage agents (reachability, doc audit, verdict, witness), system prompts |
+| `src/llm_summary/triage.py` | TriageAgent orchestrator, five stages (reachability, doc audit, verdict, witness, debug), system prompts |
 | `src/llm_summary/agent_tools.py` | Tool definitions (DB read, triage, enhanced triage), ToolExecutor |
 | `src/llm_summary/git_tools.py` | GitTools class, git_show/git_grep/git_ls_tree |
 | `src/llm_summary/harness_generator.py` | validate_triage(), TRIAGE_VALIDATE_PROMPT |

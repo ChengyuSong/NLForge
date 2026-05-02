@@ -43,6 +43,8 @@ RUN apt-get update && apt-get install -y \
     gettext \
     autopoint \
     nasm \
+    # Debugging
+    gdb \
     # Utilities
     wget \
     curl \

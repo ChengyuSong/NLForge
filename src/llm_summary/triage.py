@@ -80,6 +80,10 @@ class TriageResult:
     # Stage 4: witness (ASan/UBSan unit test for feasible verdicts)
     witness_path: str = ""
 
+    # Stage 5: debug (GDB diagnosis when witness runs clean)
+    debug_diagnosis: str = ""  # path_blocked | not_reached | asan_limitation
+    debug_explanation: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "function_name": self.function_name,
@@ -109,6 +113,10 @@ class TriageResult:
             result["doc_mitigated"] = self.doc_mitigated
         if self.witness_path:
             result["witness_path"] = self.witness_path
+        if self.debug_diagnosis:
+            result["debug_diagnosis"] = self.debug_diagnosis
+        if self.debug_explanation:
+            result["debug_explanation"] = self.debug_explanation
         return result
 
 
@@ -322,6 +330,79 @@ minimum fields needed
 
 DEFAULT_WITNESS_TURNS = 3
 
+DEBUG_GDB_SYSTEM_PROMPT = """\
+You write a GDB batch script to diagnose why an AddressSanitizer unit test \
+did NOT trigger a memory safety violation that was predicted to be feasible.
+
+## Goal
+
+Write a GDB script that runs in `gdb -batch` mode and traces execution \
+through the predicted bug path, printing key variables at each control \
+flow point to determine:
+1. Whether the target function was reached
+2. What values the critical variables have at each branch point
+3. Which guard/check blocks the predicted bug condition
+
+## Rules
+
+- Use `break <function>` or `break <file>:<line>` for breakpoints
+- Use `commands ... end` blocks to print variables automatically
+- Always include `set pagination off` and `set confirm off` at the top
+- Print variables mentioned in the path constraints and data flow trace
+- End with `run` followed by `quit`
+- Output a single ```gdb fenced block
+- Keep the script focused — only break at points along the feasible path
+"""
+
+DEBUG_DIAGNOSE_SYSTEM_PROMPT = """\
+You are diagnosing why a unit test for a predicted memory safety bug ran \
+clean under AddressSanitizer. You receive:
+1. The original bug report and feasibility analysis
+2. GDB trace output showing actual runtime values
+
+## Diagnosis Categories
+
+- **path_blocked**: The bug-triggering condition cannot hold because a \
+guard/check in the caller prevents it (e.g., a length check ensures the \
+denominator is never zero). This means the original verdict was wrong — \
+the caller already guarantees the callee's precondition.
+- **not_reached**: The target function was never called, or the test \
+input doesn't exercise the right code path. The test needs fixing.
+- **asan_limitation**: The bug condition IS reachable but ASan cannot \
+detect it (e.g., intra-object overflow, uninitialized read). The \
+verdict is correct but requires a different detection method.
+
+## Output
+
+Respond with a single JSON object (no markdown fencing):
+
+{
+  "diagnosis": "path_blocked|not_reached|asan_limitation",
+  "explanation": "Detailed explanation of what the GDB trace shows...",
+  "corrected_hypothesis": "safe|feasible",
+  "updated_contracts": [
+    {
+      "function": "caller_function_name",
+      "property": "overflow|memsafe|...",
+      "clause_type": "ensures",
+      "predicate": "C-like predicate that the caller guarantees"
+    }
+  ]
+}
+
+Rules:
+- For path_blocked: set corrected_hypothesis to "safe" and emit \
+updated_contracts showing what the caller guarantees
+- For not_reached: set corrected_hypothesis to "feasible" (test is bad, \
+not the analysis) with empty updated_contracts
+- For asan_limitation: set corrected_hypothesis to "feasible" with empty \
+updated_contracts
+- The predicate in updated_contracts should be a concise C-like \
+expression describing the invariant the caller enforces
+"""
+
+DEFAULT_DEBUG_TURNS = 2
+
 
 # ---------------------------------------------------------------------------
 # Shared ReAct loop
@@ -444,6 +525,21 @@ def _extract_c_block(text: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _extract_gdb_block(text: str) -> str | None:
+    """Extract the first ```gdb ... ``` fenced block from LLM output."""
+    m = re.search(r"```gdb\s*\n(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+_ASAN_MARKERS = (
+    "ERROR: AddressSanitizer",
+    "ERROR: LeakSanitizer",
+    "runtime error:",
+    "SUMMARY: AddressSanitizer",
+    "SUMMARY: UndefinedBehaviorSanitizer",
+)
+
+
 # ---------------------------------------------------------------------------
 # Stage data models
 # ---------------------------------------------------------------------------
@@ -532,9 +628,16 @@ class TriageAgent:
                 func, result, status="confirmed",
             )
             if self.build_script_dir is not None and self.build_dir is not None:
-                witness = self._stage_witness(func, result)
+                witness, ran_clean = self._stage_witness(func, result)
                 if witness:
                     result.witness_path = witness
+                    if ran_clean:
+                        result = self._stage_debug(func, result)
+                    else:
+                        self._mark_issue_review(
+                            func, result,
+                            status="confirmed_witness",
+                        )
 
         self._save_incremental(result)
         return result
@@ -1046,10 +1149,11 @@ class TriageAgent:
         self,
         func: Function,
         result: TriageResult,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Generate a self-contained ASan/UBSan unit test for a feasible bug.
 
-        Returns the path to the witness C file, or None on failure.
+        Returns ``(witness_c_path, ran_clean)`` where *ran_clean* is
+        ``True`` when the test compiled and ran without ASan reports.
         """
         assert self.build_script_dir is not None
         assert self.build_dir is not None
@@ -1082,7 +1186,11 @@ class TriageAgent:
                 )
             else:
                 response = llm.complete(
-                    f"The previous witness failed to compile:\n\n"
+                    f"{prompt}\n\n"
+                    f"---\n\n"
+                    f"The previous attempt:\n\n"
+                    f"```c\n{c_code}\n```\n\n"
+                    f"failed with:\n\n"
                     f"```\n{compile_err}\n```\n\n"
                     "Fix the code. Output a single ```c fenced block.",
                     system=WITNESS_SYSTEM_PROMPT,
@@ -1112,16 +1220,36 @@ class TriageAgent:
             build_sh.write_text(build_script)
             build_sh.chmod(0o755)
 
-            ok, compile_err = self._compile_witness(build_sh)
-            if ok:
-                if self.verbose:
-                    print(f"  [Witness] compiled: {witness_c}")
-                return str(witness_c)
+            phase, stderr, _stdout = self._compile_witness(build_sh)
 
+            if phase == "run_sanitizer":
+                if self.verbose:
+                    print(
+                        f"  [Witness] sanitizer triggered: "
+                        f"{witness_c}",
+                    )
+                return str(witness_c), False
+            if phase == "run_clean":
+                if self.verbose:
+                    print(
+                        f"  [Witness] ran clean (no reports): "
+                        f"{witness_c}",
+                    )
+                return str(witness_c), True
+            if phase == "run_crash":
+                if self.verbose:
+                    print(
+                        f"  [Witness] crashed (no sanitizer): "
+                        f"{witness_c}",
+                    )
+                return str(witness_c), False
+
+            # compile_error / timeout / error → retry
+            compile_err = stderr
             if self.verbose:
                 print(
-                    f"  [Witness] attempt {attempt + 1} compile failed: "
-                    f"{compile_err[:200]}",
+                    f"  [Witness] attempt {attempt + 1} "
+                    f"{phase}: {compile_err[:200]}",
                 )
 
         if c_code is not None:
@@ -1130,9 +1258,9 @@ class TriageAgent:
                 print(
                     f"  [Witness] saved (uncompiled): {witness_c}",
                 )
-            return str(witness_c)
+            return str(witness_c), False
 
-        return None
+        return None, False
 
     def _build_witness_prompt(
         self,
@@ -1194,6 +1322,39 @@ class TriageAgent:
                 lines.append("```")
                 lines.append("")
 
+        # Build environment context
+        if self.build_script_dir is not None:
+            build_sh = self.build_script_dir / "build.sh"
+            if build_sh.exists():
+                lines.extend([
+                    "## Project Build Script",
+                    "",
+                    "```bash",
+                    build_sh.read_text().strip(),
+                    "```",
+                    "",
+                ])
+
+        # Available include directories
+        if self.compile_commands:
+            inc_dirs: set[str] = set()
+            for entry in self.compile_commands:
+                cmd = entry.get("command", "")
+                for token in cmd.split():
+                    if token.startswith("-I") and len(token) > 2:
+                        inc_dirs.add(token[2:])
+            if inc_dirs:
+                lines.extend([
+                    "## Available Include Directories",
+                    "",
+                    "The following `-I` paths are used when building "
+                    "the project (Docker container paths):",
+                    "",
+                ])
+                for d in sorted(inc_dirs):
+                    lines.append(f"  - `{d}`")
+                lines.append("")
+
         lines.extend([
             "## Instructions",
             "",
@@ -1205,6 +1366,31 @@ class TriageAgent:
         ])
 
         return "\n".join(lines)
+
+    def _extract_include_flags(self) -> str:
+        """Extract unique -I flags from compile_commands.json.
+
+        The paths in compile_commands.json are already Docker paths
+        (``/workspace/src/...``, ``/workspace/build/...``), so they
+        can be used directly in the inner script.
+        """
+        if not self.compile_commands:
+            return "-I/workspace/src -I/workspace/build"
+
+        seen: set[str] = set()
+        for entry in self.compile_commands:
+            cmd = entry.get("command", "")
+            for token in cmd.split():
+                if token.startswith("-I"):
+                    inc = token[2:] if len(token) > 2 else ""
+                    if inc and inc not in seen:
+                        seen.add(inc)
+        if not seen:
+            return "-I/workspace/src -I/workspace/build"
+        # Always include src and build roots
+        seen.add("/workspace/src")
+        seen.add("/workspace/build")
+        return " ".join(f"-I{d}" for d in sorted(seen))
 
     def _build_witness_script(
         self,
@@ -1254,7 +1440,13 @@ class TriageAgent:
 
         cmake_args = " ".join(f"'{f}'" for f in sanitized)
 
-        # Write a small inner script to avoid bash -c quoting issues
+        # Extract -I flags from compile_commands.json
+        include_flags = self._extract_include_flags()
+
+        # Write a small inner script to avoid bash -c quoting issues.
+        # Steps 1-2 (build) use set -e; step 3 (run) captures the
+        # exit code separately so the caller can distinguish compile
+        # failure from a runtime sanitizer report.
         inner_lines = [
             "#!/bin/bash",
             "set -e",
@@ -1269,15 +1461,22 @@ class TriageAgent:
             "# Use ! -type l to skip symlinks and avoid duplicate symbols",
             "LIB=$(find /workspace/build -name '*.a' ! -type l | head -1)",
             f"clang-18 -fsanitize=address,undefined -g "
-            f"-I/workspace/src -I/workspace/build "
+            f"{include_flags} "
             f'/test/{test_c.name} '
             '"$LIB" '
             f"-lm -lz -lpthread -lstdc++ "
             f"-o /test/{test_name}",
             "",
-            "# Step 3: run the test",
+            "# Compile succeeded — mark it so the caller knows",
+            f'echo "COMPILE_OK" > /test/.{test_name}_compiled',
+            "",
+            "# Step 3: run the test (don't set -e; capture exit code)",
             'echo "--- running test ---"',
+            "set +e",
             f"/test/{test_name}",
+            "RC=$?",
+            'echo "--- test exited with code $RC ---"',
+            "exit $RC",
         ]
         inner_script = "\n".join(inner_lines) + "\n"
 
@@ -1311,17 +1510,420 @@ class TriageAgent:
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _compile_witness(build_sh: Path) -> tuple[bool, str]:
-        """Run the witness build script. Returns (success, error_output)."""
+    def _compile_witness(
+        build_sh: Path,
+    ) -> tuple[str, str, str]:
+        """Run the witness build+run script.
+
+        Returns ``(phase, stderr, stdout)`` where *phase* is one of:
+
+        - ``"compile_error"`` — build/compile failed
+        - ``"run_clean"`` — test ran and exited 0 with no sanitizer reports
+        - ``"run_sanitizer"`` — test ran and a sanitizer fired
+        - ``"run_crash"`` — test ran and crashed (non-zero, no sanitizer)
+        - ``"timeout"`` — overall timeout
+        - ``"error"`` — unexpected exception
+        """
         try:
             result = subprocess.run(
                 ["bash", str(build_sh)],
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return "timeout", "Build/run timed out after 180s", ""
+        except Exception as e:
+            return "error", str(e), ""
+
+        stderr = result.stderr
+        stdout = result.stdout
+        combined = (stderr + stdout).strip()
+
+        # Check for compile marker written by inner script
+        # The marker file is next to the build script
+        test_dir = build_sh.parent
+        test_name = build_sh.name.removeprefix("build_")
+        test_name = test_name.removesuffix(".sh")
+        marker = test_dir / f".{test_name}_compiled"
+
+        compiled = marker.exists()
+        if compiled:
+            marker.unlink(missing_ok=True)
+
+        if not compiled:
+            return "compile_error", combined, ""
+
+        sanitizer_fired = any(m in combined for m in _ASAN_MARKERS)
+        if sanitizer_fired:
+            return "run_sanitizer", stderr, stdout
+        if result.returncode == 0:
+            return "run_clean", stderr, stdout
+        return "run_crash", stderr, stdout
+
+    # ------------------------------------------------------------------
+    # Stage 5: DEBUG — GDB diagnosis when witness runs clean
+    # ------------------------------------------------------------------
+
+    def _stage_debug(
+        self,
+        func: Function,
+        result: TriageResult,
+    ) -> TriageResult:
+        """Diagnose why a feasible-verdict witness ran clean under ASan.
+
+        Generates a GDB script, runs the test under GDB inside Docker,
+        then asks the LLM to diagnose.  If the diagnosis shows the bug
+        path is blocked, updates the verdict and contracts.
+        """
+        assert self.build_script_dir is not None
+        assert self.build_dir is not None
+
+        if self.verbose:
+            print(
+                f"[Triage] Stage 5 → debugging witness for "
+                f"{func.name}#{result.issue_index}",
+            )
+
+        out_dir = self.harness_output_dir or Path("harnesses")
+        test_name = f"test_{func.name}_{result.issue_index}"
+
+        # -- Step 1: LLM generates GDB script --
+        gdb_prompt = self._build_gdb_prompt(func, result, test_name)
+        llm = self.llm_factory()
+
+        gdb_script: str | None = None
+        for attempt in range(DEFAULT_DEBUG_TURNS):
+            if attempt == 0:
+                resp = llm.complete(
+                    gdb_prompt, system=DEBUG_GDB_SYSTEM_PROMPT,
+                )
+            else:
+                resp = llm.complete(
+                    "The GDB script produced no useful output. "
+                    "Revise the breakpoints and try again. "
+                    "Output a single ```gdb fenced block.",
+                    system=DEBUG_GDB_SYSTEM_PROMPT,
+                )
+            text = (
+                resp.text if hasattr(resp, "text") else str(resp)
+            )
+            extracted = _extract_gdb_block(text)
+            if extracted:
+                gdb_script = extracted
+                break
+            if self.verbose:
+                print(
+                    f"  [Debug] attempt {attempt + 1}: "
+                    f"no GDB block in response",
+                )
+
+        if gdb_script is None:
+            if self.verbose:
+                print("  [Debug] failed to generate GDB script")
+            return result
+
+        # Write GDB script
+        gdb_path = out_dir / f"_gdb_{test_name}.gdb"
+        gdb_path.write_text(gdb_script + "\n")
+
+        # -- Step 2: run under GDB in Docker --
+        gdb_output = self._run_gdb_in_docker(
+            test_name, out_dir, gdb_path,
+        )
+        if gdb_output is None:
+            if self.verbose:
+                print("  [Debug] GDB run failed")
+            return result
+
+        if self.verbose:
+            preview = gdb_output[:500]
+            print(f"  [Debug] GDB output ({len(gdb_output)} chars):")
+            print(f"    {preview}")
+
+        # -- Step 3: LLM diagnoses from GDB output --
+        diag_prompt = self._build_diagnose_prompt(
+            func, result, gdb_output,
+        )
+        llm2 = self.llm_factory()
+        diag_resp = llm2.complete(
+            diag_prompt, system=DEBUG_DIAGNOSE_SYSTEM_PROMPT,
+        )
+        diag_text = (
+            diag_resp.text
+            if hasattr(diag_resp, "text")
+            else str(diag_resp)
+        )
+
+        # Parse JSON from response
+        diagnosis = self._parse_diagnosis(diag_text)
+        if diagnosis is None:
+            if self.verbose:
+                print("  [Debug] could not parse diagnosis JSON")
+            return result
+
+        result.debug_diagnosis = diagnosis.get("diagnosis", "")
+        result.debug_explanation = diagnosis.get("explanation", "")
+
+        if self.verbose:
+            print(
+                f"  [Debug] diagnosis={result.debug_diagnosis}: "
+                f"{result.debug_explanation[:200]}",
+            )
+
+        # -- Step 4: update verdict if path_blocked --
+        corrected = diagnosis.get("corrected_hypothesis", "feasible")
+        if corrected != "feasible":
+            result.hypothesis = corrected
+            contracts = diagnosis.get("updated_contracts", [])
+            if contracts:
+                result.updated_contracts = contracts
+            result.reasoning += (
+                f"\n\n## Stage 5 Debug Correction\n\n"
+                f"**Diagnosis**: {result.debug_diagnosis}\n\n"
+                f"{result.debug_explanation}"
+            )
+            self._apply_contract_updates(func, result)
+            self._mark_issue_review(
+                func, result, status="false_positive",
+            )
+            if self.verbose:
+                print(
+                    f"  [Debug] verdict corrected to "
+                    f"{result.hypothesis}",
+                )
+
+        return result
+
+    def _build_gdb_prompt(
+        self,
+        func: Function,
+        result: TriageResult,
+        test_name: str,
+    ) -> str:
+        """Build the user prompt for GDB script generation."""
+        lines = [
+            "## Bug Report",
+            "",
+            f"Function: `{func.name}`",
+            f"Issue: [{result.issue.severity}] "
+            f"{result.issue.issue_kind} — "
+            f"{result.issue.description}",
+            "",
+        ]
+
+        if result.feasible_path:
+            chain = " → ".join(result.feasible_path)
+            lines.append(f"**Feasible path**: {chain}")
+        if result.path_constraints:
+            lines.append("")
+            lines.append("**Path constraints** (branch guards along path):")
+            for pc in result.path_constraints:
+                lines.append(f"  - {pc}")
+        if result.data_flow_trace:
+            lines.append("")
+            lines.append(f"**Data flow**: {result.data_flow_trace}")
+        if result.assumptions:
+            lines.append("")
+            lines.append("**Assumptions**:")
+            for a in result.assumptions:
+                lines.append(f"  - {a}")
+
+        # Source code of functions along path
+        names_seen: set[str] = set()
+        funcs_to_show: list[Function] = []
+        for name in [result.entry_function, *result.feasible_path,
+                      func.name]:
+            if not name or name in names_seen:
+                continue
+            names_seen.add(name)
+            found = self.db.get_function_by_name(name)
+            if found:
+                funcs_to_show.append(found[0])
+
+        if funcs_to_show:
+            lines.extend(["", "## Source Code", ""])
+            for f in funcs_to_show:
+                lines.append(
+                    f"### `{f.name}` "
+                    f"({self._rel_path(f.file_path)})",
+                )
+                lines.append(f"```c\n// {f.signature}")
+                if f.source:
+                    lines.append(f.source)
+                lines.append("```")
+                lines.append("")
+
+        # Witness test source
+        out_dir = self.harness_output_dir or Path("harnesses")
+        witness_c = out_dir / f"{test_name}.c"
+        if witness_c.exists():
+            lines.extend([
+                "## Unit Test Source",
+                "",
+                f"```c\n{witness_c.read_text()}\n```",
+                "",
+            ])
+
+        lines.extend([
+            "## Task",
+            "",
+            "Write a GDB batch script that sets breakpoints at key "
+            "points along the feasible path and prints the variables "
+            "mentioned in the path constraints and data flow trace. "
+            "The goal is to determine whether the bug condition "
+            "actually holds at runtime.",
+        ])
+
+        return "\n".join(lines)
+
+    def _build_diagnose_prompt(
+        self,
+        func: Function,
+        result: TriageResult,
+        gdb_output: str,
+    ) -> str:
+        """Build the prompt for diagnosis from GDB output."""
+        lines = [
+            "## Original Bug Report",
+            "",
+            f"Function: `{func.name}`",
+            f"Issue: [{result.issue.severity}] "
+            f"{result.issue.issue_kind} — "
+            f"{result.issue.description}",
+            "",
+        ]
+
+        if result.feasible_path:
+            chain = " → ".join(result.feasible_path)
+            lines.append(f"**Feasible path**: {chain}")
+        if result.assumptions:
+            lines.append("")
+            lines.append("**Assumptions**:")
+            for a in result.assumptions:
+                lines.append(f"  - {a}")
+        if result.assertions:
+            lines.append("")
+            lines.append("**Expected violation**:")
+            for a in result.assertions:
+                lines.append(f"  - {a}")
+
+        lines.extend([
+            "",
+            f"**Original reasoning**: {result.reasoning}",
+            "",
+            "## GDB Trace Output",
+            "",
+            f"```\n{gdb_output}\n```",
+            "",
+            "## Task",
+            "",
+            "Analyze the GDB output against the original reasoning. "
+            "Determine which diagnosis category applies "
+            "(path_blocked, not_reached, or asan_limitation) and "
+            "output the JSON object as specified.",
+        ])
+
+        return "\n".join(lines)
+
+    def _run_gdb_in_docker(
+        self,
+        test_name: str,
+        out_dir: Path,
+        gdb_path: Path,
+    ) -> str | None:
+        """Run the test binary under GDB inside Docker.
+
+        Returns GDB's combined stdout+stderr, or None on failure.
+        """
+        assert self.build_script_dir is not None
+        assert self.build_dir is not None
+
+        config_path = self.build_script_dir / "config.json"
+        config: dict[str, Any] = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+
+        project_path = config.get(
+            "project_path", "/data/csong/opensource/unknown",
+        )
+        host_build_dir = str(self.build_dir)
+
+        inner_lines = [
+            "#!/bin/bash",
+            "set -e",
+            "",
+            "# Run test under GDB (binary already built by Stage 4)",
+            'echo "--- running under GDB ---"',
+            "ASAN_OPTIONS=detect_leaks=0 "
+            f"gdb -batch -x /test/{gdb_path.name} "
+            f"/test/{test_name}",
+        ]
+        inner_path = out_dir / f"_inner_gdb_{test_name}.sh"
+        inner_path.write_text("\n".join(inner_lines) + "\n")
+        inner_path.chmod(0o755)
+
+        gdb_sh = out_dir / f"gdb_{test_name}.sh"
+        lines = [
+            "#!/bin/bash",
+            "set -e",
+            "",
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" '
+            '&& pwd)"',
+            f'PROJECT_PATH="{project_path}"',
+            f'BUILD_DIR="{host_build_dir}"',
+            "",
+            "docker run --rm \\",
+            "  --cap-add=SYS_PTRACE \\",
+            "  --security-opt seccomp=unconfined \\",
+            '  -e ASAN_OPTIONS=detect_leaks=0 \\',
+            '  -v "$PROJECT_PATH":/workspace/src:ro \\',
+            '  -v "$BUILD_DIR":/workspace/build \\',
+            '  -v "$SCRIPT_DIR":/test \\',
+            "  llm-summary-builder:latest \\",
+            f"  bash /test/{inner_path.name}",
+        ]
+        gdb_sh.write_text("\n".join(lines) + "\n")
+        gdb_sh.chmod(0o755)
+
+        try:
+            proc = subprocess.run(
+                ["bash", str(gdb_sh)],
                 capture_output=True, text=True, timeout=120,
             )
-            if result.returncode == 0:
-                return True, ""
-            return False, (result.stderr + result.stdout).strip()
+            return (proc.stdout + proc.stderr).strip()
         except subprocess.TimeoutExpired:
-            return False, "Build timed out after 120s"
+            if self.verbose:
+                print("  [Debug] GDB run timed out")
+            return None
         except Exception as e:
-            return False, str(e)
+            if self.verbose:
+                print(f"  [Debug] GDB run error: {e}")
+            return None
+
+    @staticmethod
+    def _parse_diagnosis(text: str) -> dict[str, Any] | None:
+        """Parse diagnosis JSON from LLM response."""
+        # Try raw JSON first
+        text = text.strip()
+        try:
+            return json.loads(text)  # type: ignore[no-any-return]
+        except json.JSONDecodeError:
+            pass
+        # Try extracting from ```json block
+        m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))  # type: ignore[no-any-return]
+            except json.JSONDecodeError:
+                pass
+        # Try finding first { ... } block
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(  # type: ignore[no-any-return]
+                    text[start:end + 1],
+                )
+            except json.JSONDecodeError:
+                pass
+        return None
