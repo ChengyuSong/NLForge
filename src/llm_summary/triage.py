@@ -326,9 +326,24 @@ use a buffer
 minimum fields needed
 - Output a single ```c fenced block with the complete program
 - The program must be self-contained: no external test frameworks
+
+## Runtime dependencies
+
+The test runs in an Ubuntu 24.04 Docker container. If the bug path requires \
+a library that is not part of the project itself (e.g., HarfBuzz, ICU, \
+libxml2), you may request it by adding a `DEPS:` comment line at the top \
+of the program listing the apt package names, for example:
+
+```c
+// DEPS: libharfbuzz-dev libxml2-dev
+```
+
+The build system will `apt-get install` these before compiling. \
+Only request packages when the bug path genuinely requires them.
 """
 
 DEFAULT_WITNESS_TURNS = 3
+DEFAULT_WITNESS_DEBUG_ITERATIONS = 3
 
 DEBUG_GDB_SYSTEM_PROMPT = """\
 You write a GDB batch script to diagnose why an AddressSanitizer unit test \
@@ -394,7 +409,12 @@ Rules:
 - For path_blocked: set corrected_hypothesis to "safe" and emit \
 updated_contracts showing what the caller guarantees
 - For not_reached: set corrected_hypothesis to "feasible" (test is bad, \
-not the analysis) with empty updated_contracts
+not the analysis) with empty updated_contracts. In the explanation, \
+describe WHY the target was not reached — missing runtime dependency \
+(e.g., the code path requires HarfBuzz/ICU/etc. to be installed), \
+wrong API usage, missing initialization, etc. If a library is needed, \
+mention the apt package name (e.g., libharfbuzz-dev) so the next \
+test iteration can add a `// DEPS: <pkg>` line
 - For asan_limitation: set corrected_hypothesis to "feasible" with empty \
 updated_contracts
 - The predicate in updated_contracts should be a concise C-like \
@@ -628,16 +648,40 @@ class TriageAgent:
                 func, result, status="confirmed",
             )
             if self.build_script_dir is not None and self.build_dir is not None:
-                witness, ran_clean = self._stage_witness(func, result)
-                if witness:
+                debug_feedback = ""
+                for wd_iter in range(DEFAULT_WITNESS_DEBUG_ITERATIONS):
+                    witness, ran_clean = self._stage_witness(
+                        func, result, debug_feedback=debug_feedback,
+                    )
+                    if not witness:
+                        break
                     result.witness_path = witness
-                    if ran_clean:
-                        result = self._stage_debug(func, result)
-                    else:
+                    if not ran_clean:
                         self._mark_issue_review(
                             func, result,
                             status="confirmed_witness",
                         )
+                        break
+                    # Witness ran clean → diagnose with GDB
+                    result = self._stage_debug(func, result)
+                    if result.debug_diagnosis != "not_reached":
+                        break
+                    # not_reached → retry witness with debug feedback
+                    if wd_iter + 1 < DEFAULT_WITNESS_DEBUG_ITERATIONS:
+                        debug_feedback = (
+                            f"## Previous Attempt Failed\n\n"
+                            f"The test did not reach the target "
+                            f"function. GDB diagnosis:\n\n"
+                            f"{result.debug_explanation}\n\n"
+                            f"Generate a new test that addresses "
+                            f"this issue."
+                        )
+                        if self.verbose:
+                            print(
+                                f"  [Witness↔Debug] iteration "
+                                f"{wd_iter + 1}: not_reached, "
+                                f"retrying witness",
+                            )
 
         self._save_incremental(result)
         return result
@@ -1149,11 +1193,17 @@ class TriageAgent:
         self,
         func: Function,
         result: TriageResult,
+        *,
+        debug_feedback: str = "",
     ) -> tuple[str | None, bool]:
         """Generate a self-contained ASan/UBSan unit test for a feasible bug.
 
         Returns ``(witness_c_path, ran_clean)`` where *ran_clean* is
         ``True`` when the test compiled and ran without ASan reports.
+
+        When *debug_feedback* is provided (from a prior Stage 5 debug
+        iteration), it is appended to the witness prompt so the LLM can
+        fix reachability issues in the generated test.
         """
         assert self.build_script_dir is not None
         assert self.build_dir is not None
@@ -1173,7 +1223,9 @@ class TriageAgent:
         build_sh = out_dir / f"build_{test_name}.sh"
 
         # Gather source code for the LLM
-        prompt = self._build_witness_prompt(func, result)
+        prompt = self._build_witness_prompt(
+            func, result, debug_feedback=debug_feedback,
+        )
 
         llm = self.llm_factory()
         c_code: str | None = None
@@ -1266,6 +1318,8 @@ class TriageAgent:
         self,
         func: Function,
         result: TriageResult,
+        *,
+        debug_feedback: str = "",
     ) -> str:
         """Build the user prompt for witness generation."""
         lines = [
@@ -1355,6 +1409,9 @@ class TriageAgent:
                     lines.append(f"  - `{d}`")
                 lines.append("")
 
+        if debug_feedback:
+            lines.extend(["", debug_feedback, ""])
+
         lines.extend([
             "## Instructions",
             "",
@@ -1370,12 +1427,22 @@ class TriageAgent:
     def _extract_include_flags(self) -> str:
         """Extract unique -I flags from compile_commands.json.
 
-        The paths in compile_commands.json are already Docker paths
-        (``/workspace/src/...``, ``/workspace/build/...``), so they
-        can be used directly in the inner script.
+        Host paths from ``compile_commands.json`` are remapped to
+        Docker container paths (``/workspace/src``, ``/workspace/build``)
+        so the inner script can use them directly.
         """
         if not self.compile_commands:
             return "-I/workspace/src -I/workspace/build"
+
+        # Determine host paths for remapping
+        assert self.build_script_dir is not None
+        assert self.build_dir is not None
+        config_path = self.build_script_dir / "config.json"
+        project_path = ""
+        if config_path.exists():
+            with open(config_path) as f:
+                project_path = json.load(f).get("project_path", "")
+        host_build = str(self.build_dir)
 
         seen: set[str] = set()
         for entry in self.compile_commands:
@@ -1383,14 +1450,35 @@ class TriageAgent:
             for token in cmd.split():
                 if token.startswith("-I"):
                     inc = token[2:] if len(token) > 2 else ""
-                    if inc and inc not in seen:
+                    if not inc:
+                        continue
+                    # Remap host paths to Docker paths
+                    if host_build and inc.startswith(host_build):
+                        inc = "/workspace/build" + inc[len(host_build):]
+                    elif project_path and inc.startswith(project_path):
+                        inc = "/workspace/src" + inc[len(project_path):]
+                    if inc not in seen:
                         seen.add(inc)
         if not seen:
             return "-I/workspace/src -I/workspace/build"
-        # Always include src and build roots
         seen.add("/workspace/src")
         seen.add("/workspace/build")
         return " ".join(f"-I{d}" for d in sorted(seen))
+
+    @staticmethod
+    def _parse_witness_deps(test_c: Path) -> list[str]:
+        """Extract ``// DEPS: pkg1 pkg2`` from the test source."""
+        if not test_c.exists():
+            return []
+        pkgs: list[str] = []
+        for line in test_c.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("// DEPS:"):
+                for pkg in stripped[len("// DEPS:"):].split():
+                    pkg = pkg.strip(",")
+                    if pkg and re.fullmatch(r"[a-z0-9][a-z0-9.+\-]+", pkg):
+                        pkgs.append(pkg)
+        return pkgs
 
     def _build_witness_script(
         self,
@@ -1443,6 +1531,9 @@ class TriageAgent:
         # Extract -I flags from compile_commands.json
         include_flags = self._extract_include_flags()
 
+        # Parse // DEPS: lines from the test source for apt packages
+        deps_pkgs = self._parse_witness_deps(test_c)
+
         # Write a small inner script to avoid bash -c quoting issues.
         # Steps 1-2 (build) use set -e; step 3 (run) captures the
         # exit code separately so the caller can distinguish compile
@@ -1451,8 +1542,24 @@ class TriageAgent:
             "#!/bin/bash",
             "set -e",
             "",
+        ]
+
+        if deps_pkgs:
+            pkgs = " ".join(deps_pkgs)
+            inner_lines.extend([
+                "# Step 0: install runtime dependencies",
+                f"apt-get update -qq && apt-get install -y -qq"
+                f" {pkgs} >/dev/null 2>&1",
+                "",
+            ])
+
+        inner_lines.extend([
             "# Step 1: rebuild project with ASan/UBSan",
             "cd /workspace/build",
+        ])
+        if deps_pkgs:
+            inner_lines.append("rm -rf CMakeCache.txt CMakeFiles")
+        inner_lines.extend([
             f"cmake -G Ninja {cmake_args} /workspace/src",
             "ninja -j$(nproc)",
             'echo "--- project rebuilt with ASan ---"',
@@ -1460,11 +1567,16 @@ class TriageAgent:
             "# Step 2: compile and link the test",
             "# Use ! -type l to skip symlinks and avoid duplicate symbols",
             "LIB=$(find /workspace/build -name '*.a' ! -type l | head -1)",
+            "# Extract link libraries cmake discovered",
+            "CMAKE_LIBS=$(grep -E 'LIBRAR(Y[^:]*|IES):FILEPATH=/' "
+            "/workspace/build/CMakeCache.txt 2>/dev/null "
+            "| grep -v NOTFOUND | sed 's/.*=//' "
+            "| sort -u | tr '\\n' ' ')",
             f"clang-18 -fsanitize=address,undefined -g "
             f"{include_flags} "
-            f'/test/{test_c.name} '
-            '"$LIB" '
-            f"-lm -lz -lpthread -lstdc++ "
+            f"/test/{test_c.name} "
+            '"$LIB" $CMAKE_LIBS '
+            f"-lm -lz -lpthread -lstdc++ -ldl "
             f"-o /test/{test_name}",
             "",
             "# Compile succeeded — mark it so the caller knows",
@@ -1477,7 +1589,7 @@ class TriageAgent:
             "RC=$?",
             'echo "--- test exited with code $RC ---"',
             "exit $RC",
-        ]
+        ])
         inner_script = "\n".join(inner_lines) + "\n"
 
         # Write inner script next to the test
@@ -1848,16 +1960,32 @@ class TriageAgent:
         )
         host_build_dir = str(self.build_dir)
 
+        # Parse deps from witness source for runtime libraries
+        witness_c = out_dir / f"{test_name}.c"
+        deps_pkgs = self._parse_witness_deps(witness_c)
+
         inner_lines = [
             "#!/bin/bash",
             "set -e",
             "",
+        ]
+
+        if deps_pkgs:
+            pkgs = " ".join(deps_pkgs)
+            inner_lines.extend([
+                "# Install runtime deps",
+                f"apt-get update -qq && apt-get install -y -qq"
+                f" {pkgs} >/dev/null 2>&1",
+                "",
+            ])
+
+        inner_lines.extend([
             "# Run test under GDB (binary already built by Stage 4)",
             'echo "--- running under GDB ---"',
             "ASAN_OPTIONS=detect_leaks=0 "
             f"gdb -batch -x /test/{gdb_path.name} "
             f"/test/{test_name}",
-        ]
+        ])
         inner_path = out_dir / f"_inner_gdb_{test_name}.sh"
         inner_path.write_text("\n".join(inner_lines) + "\n")
         inner_path.chmod(0o755)
