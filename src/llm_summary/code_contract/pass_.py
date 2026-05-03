@@ -430,11 +430,26 @@ class CodeContractPass:
             if func.id is not None else []
         )
         use_chunked = bool(blocks) and len(func.llm_source) > _CHUNK_THRESHOLD
+        chunked_callee_names: list[str] = callee_names
         if use_chunked:
             self.chunked_functions += 1
+            skel_line_map = build_skeleton_line_map(
+                func.line_start, len(func.source.splitlines()), blocks,
+            )
+            skeleton_callees: set[str] = set()
+            for cs in func.callsites:
+                callee = cs.get("callee")
+                lib = cs.get("line_in_body")
+                if callee and lib is not None and lib in skel_line_map:
+                    skeleton_callees.add(callee)
+            chunked_callee_names = [
+                n for n in callee_names if n in skeleton_callees
+            ]
             self._log(
                 f"--- CHUNKED MODE: {len(blocks)} blocks,"
-                f" {len(func.llm_source)} chars ---\n"
+                f" {len(func.llm_source)} chars,"
+                f" callees {len(callee_names)}→{len(chunked_callee_names)}"
+                f" (skeleton-only) ---\n"
             )
 
         response_format = make_json_response_format(
@@ -463,8 +478,11 @@ class CodeContractPass:
                 alias_context_section = "\n" + ctx + "\n"
 
         for prop in props:
+            effective_callee_names = (
+                chunked_callee_names if use_chunked else callee_names
+            )
             callee_block = build_callee_block(
-                func, summaries, prop, callee_names,
+                func, summaries, prop, effective_callee_names,
             )
             if use_chunked:
                 source_inlined = self._build_chunked_source(
