@@ -207,6 +207,38 @@
     "musl": "strerror_r",
     "via": "weak_alias"
   },
+  "aio_cancel64": {
+    "musl": "aio_cancel",
+    "via": "lfs-alias"
+  },
+  "aio_error64": {
+    "musl": "aio_error",
+    "via": "lfs-alias"
+  },
+  "aio_fsync64": {
+    "musl": "aio_fsync",
+    "via": "lfs-alias"
+  },
+  "aio_read64": {
+    "musl": "aio_read",
+    "via": "lfs-alias"
+  },
+  "aio_return64": {
+    "musl": "aio_return",
+    "via": "lfs-alias"
+  },
+  "aio_suspend64": {
+    "musl": "aio_suspend",
+    "via": "lfs-alias"
+  },
+  "aio_write64": {
+    "musl": "aio_write",
+    "via": "lfs-alias"
+  },
+  "alphasort64": {
+    "musl": "alphasort",
+    "via": "lfs-alias"
+  },
   "asctime_r": {
     "musl": "__asctime_r",
     "via": "weak_alias"
@@ -226,6 +258,10 @@
   "clock_nanosleep": {
     "musl": "__clock_nanosleep",
     "via": "weak_alias"
+  },
+  "creat64": {
+    "musl": "creat",
+    "via": "lfs-alias"
   },
   "crypt_r": {
     "musl": "__crypt_r",
@@ -287,6 +323,14 @@
     "musl": "__execvpe",
     "via": "weak_alias"
   },
+  "fallocate64": {
+    "musl": "fallocate",
+    "via": "lfs-alias"
+  },
+  "fcntl64": {
+    "musl": "fcntl",
+    "via": "lfs-alias"
+  },
   "fdopen": {
     "musl": "__fdopen",
     "via": "weak_alias"
@@ -295,10 +339,6 @@
     "musl": "feof",
     "via": "weak_alias"
   },
-  "fopen64": {
-    "musl": "fopen",
-    "via": "lfs-alias"
-  },
   "ferror_unlocked": {
     "musl": "ferror",
     "via": "weak_alias"
@@ -306,6 +346,10 @@
   "fflush_unlocked": {
     "musl": "fflush",
     "via": "weak_alias"
+  },
+  "fgetpos64": {
+    "musl": "fgetpos",
+    "via": "lfs-alias"
   },
   "fgets_unlocked": {
     "musl": "fgets",
@@ -322,6 +366,10 @@
   "fileno_unlocked": {
     "musl": "fileno",
     "via": "weak_alias"
+  },
+  "fopen64": {
+    "musl": "fopen",
+    "via": "lfs-alias"
   },
   "fputc_unlocked": {
     "musl": "putc_unlocked",
@@ -343,25 +391,65 @@
     "musl": "fread",
     "via": "weak_alias"
   },
+  "freopen64": {
+    "musl": "freopen",
+    "via": "lfs-alias"
+  },
   "fseeko": {
     "musl": "__fseeko",
     "via": "weak_alias"
+  },
+  "fseeko64": {
+    "musl": "fseeko",
+    "via": "lfs-alias"
+  },
+  "fsetpos64": {
+    "musl": "fsetpos",
+    "via": "lfs-alias"
   },
   "fstat": {
     "musl": "__fstat",
     "via": "weak_alias"
   },
+  "fstat64": {
+    "musl": "fstat",
+    "via": "lfs-alias"
+  },
   "fstatat": {
     "musl": "__fstatat",
     "via": "weak_alias"
+  },
+  "fstatat64": {
+    "musl": "fstatat",
+    "via": "lfs-alias"
   },
   "fstatfs": {
     "musl": "__fstatfs",
     "via": "weak_alias"
   },
+  "fstatfs64": {
+    "musl": "fstatfs",
+    "via": "lfs-alias"
+  },
+  "fstatvfs64": {
+    "musl": "fstatvfs",
+    "via": "lfs-alias"
+  },
   "ftello": {
     "musl": "__ftello",
     "via": "weak_alias"
+  },
+  "ftello64": {
+    "musl": "ftello",
+    "via": "lfs-alias"
+  },
+  "ftruncate64": {
+    "musl": "ftruncate",
+    "via": "lfs-alias"
+  },
+  "ftw64": {
+    "musl": "ftw",
+    "via": "lfs-alias"
   },
   "futimesat": {
     "musl": "__futimesat",
@@ -374,6 +462,10 @@
   "getauxval": {
     "musl": "__getauxval",
     "via": "weak_alias"
+  },
+  "getrlimit64": {
+    "musl": "getrlimit",
+    "via": "lfs-alias"
   },
   "getutent": {
     "musl": "getutxent",
@@ -394,6 +486,14 @@
   "getwchar_unlocked": {
     "musl": "getwchar",
     "via": "weak_alias"
+  },
+  "glob64": {
+    "musl": "glob",
+    "via": "lfs-alias"
+  },
+  "globfree64": {
+    "musl": "globfree",
+    "via": "lfs-alias"
   },
   "gmtime_r": {
     "musl": "__gmtime_r",
@@ -527,6 +627,10 @@
     "musl": "__lgammal_r",
     "via": "weak_alias"
   },
+  "lio_listio64": {
+    "musl": "lio_listio",
+    "via": "lfs-alias"
+  },
   "localtime_r": {
     "musl": "__localtime_r",
     "via": "weak_alias"
@@ -534,6 +638,14 @@
   "lseek": {
     "musl": "__lseek",
     "via": "weak_alias"
+  },
+  "lseek64": {
+    "musl": "lseek",
+    "via": "lfs-alias"
+  },
+  "lstat64": {
+    "musl": "lstat",
+    "via": "lfs-alias"
   },
   "madvise": {
     "musl": "__madvise",
@@ -547,13 +659,33 @@
     "musl": "__memrchr",
     "via": "weak_alias"
   },
+  "mkostemp64": {
+    "musl": "mkostemp",
+    "via": "lfs-alias"
+  },
   "mkostemps": {
     "musl": "__mkostemps",
     "via": "weak_alias"
   },
+  "mkostemps64": {
+    "musl": "mkostemps",
+    "via": "lfs-alias"
+  },
+  "mkstemp64": {
+    "musl": "mkstemp",
+    "via": "lfs-alias"
+  },
+  "mkstemps64": {
+    "musl": "mkstemps",
+    "via": "lfs-alias"
+  },
   "mmap": {
     "musl": "__mmap",
     "via": "weak_alias"
+  },
+  "mmap64": {
+    "musl": "mmap",
+    "via": "lfs-alias"
   },
   "mprotect": {
     "musl": "__mprotect",
@@ -571,6 +703,10 @@
     "musl": "__newlocale",
     "via": "weak_alias"
   },
+  "nftw64": {
+    "musl": "nftw",
+    "via": "lfs-alias"
+  },
   "nl_langinfo": {
     "musl": "__nl_langinfo",
     "via": "weak_alias"
@@ -581,6 +717,18 @@
   },
   "open64": {
     "musl": "open",
+    "via": "lfs-alias"
+  },
+  "openat64": {
+    "musl": "openat",
+    "via": "lfs-alias"
+  },
+  "posix_fadvise64": {
+    "musl": "posix_fadvise",
+    "via": "lfs-alias"
+  },
+  "posix_fallocate64": {
+    "musl": "posix_fallocate",
     "via": "lfs-alias"
   },
   "pow10": {
@@ -594,6 +742,18 @@
   "pow10l": {
     "musl": "exp10l",
     "via": "weak_alias"
+  },
+  "pread64": {
+    "musl": "pread",
+    "via": "lfs-alias"
+  },
+  "preadv64": {
+    "musl": "preadv",
+    "via": "lfs-alias"
+  },
+  "prlimit64": {
+    "musl": "prlimit",
+    "via": "lfs-alias"
   },
   "pthread_cond_timedwait": {
     "musl": "__pthread_cond_timedwait",
@@ -715,9 +875,21 @@
     "musl": "putwchar",
     "via": "weak_alias"
   },
+  "pwrite64": {
+    "musl": "pwrite",
+    "via": "lfs-alias"
+  },
+  "pwritev64": {
+    "musl": "pwritev",
+    "via": "lfs-alias"
+  },
   "qsort_r": {
     "musl": "__qsort_r",
     "via": "weak_alias"
+  },
+  "readdir64": {
+    "musl": "readdir",
+    "via": "lfs-alias"
   },
   "res_mkquery": {
     "musl": "__res_mkquery",
@@ -731,9 +903,21 @@
     "musl": "__res_send",
     "via": "weak_alias"
   },
+  "scandir64": {
+    "musl": "scandir",
+    "via": "lfs-alias"
+  },
+  "sendfile64": {
+    "musl": "sendfile",
+    "via": "lfs-alias"
+  },
   "setnetent": {
     "musl": "sethostent",
     "via": "weak_alias"
+  },
+  "setrlimit64": {
+    "musl": "setrlimit",
+    "via": "lfs-alias"
   },
   "setutent": {
     "musl": "setutxent",
@@ -750,6 +934,14 @@
   "statfs": {
     "musl": "__statfs",
     "via": "weak_alias"
+  },
+  "statfs64": {
+    "musl": "statfs",
+    "via": "lfs-alias"
+  },
+  "statvfs64": {
+    "musl": "statvfs",
+    "via": "lfs-alias"
   },
   "stpcpy": {
     "musl": "__stpcpy",
@@ -803,6 +995,10 @@
     "musl": "__pthread_equal",
     "via": "weak_alias"
   },
+  "tmpfile64": {
+    "musl": "tmpfile",
+    "via": "lfs-alias"
+  },
   "tolower_l": {
     "musl": "__tolower_l",
     "via": "weak_alias"
@@ -822,6 +1018,10 @@
   "towupper_l": {
     "musl": "__towupper_l",
     "via": "weak_alias"
+  },
+  "truncate64": {
+    "musl": "truncate",
+    "via": "lfs-alias"
   },
   "tss_get": {
     "musl": "__pthread_getspecific",
@@ -846,6 +1046,10 @@
   "utmpxname": {
     "musl": "__utmpxname",
     "via": "weak_alias"
+  },
+  "versionsort64": {
+    "musl": "versionsort",
+    "via": "lfs-alias"
   },
   "vsyslog": {
     "musl": "__vsyslog",
