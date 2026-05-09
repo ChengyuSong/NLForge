@@ -819,5 +819,12 @@
     "tier" : 1,
     "area": "Other essential libraries",
     "project_dir": "freetype"
+  },
+  {
+    "name": "harfbuzz",
+    "url": "https://github.com/harfbuzz/harfbuzz",
+    "tier" : 1,
+    "area": "Other essential libraries",
+    "project_dir": "harfbuzz"
   }
 ]
