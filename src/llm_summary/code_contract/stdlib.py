@@ -518,6 +518,13 @@ def _build_libc_contracts() -> dict[str, CodeContractSummary]:
     for name in ("__mulsc3", "__muldc3", "__mulxc3"):
         out[name] = _summary(name, memsafe={})
 
+    # ── glibc C++ runtime ──
+    out["__cxa_thread_atexit_impl"] = _summary(
+        "__cxa_thread_atexit_impl",
+        memsafe={"requires": ["func is a valid function pointer",
+                              "obj is NULL or a valid pointer"]},
+    )
+
     return out
 
 

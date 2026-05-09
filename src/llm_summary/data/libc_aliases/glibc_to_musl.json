@@ -43,11 +43,19 @@
     "musl": "strtoll",
     "via": "c23-variant"
   },
+  "__isoc23_strtoll_l": {
+    "musl": "strtoll",
+    "via": "c23-variant"
+  },
   "__isoc23_strtoul": {
     "musl": "strtoul",
     "via": "c23-variant"
   },
   "__isoc23_strtoull": {
+    "musl": "strtoull",
+    "via": "c23-variant"
+  },
+  "__isoc23_strtoull_l": {
     "musl": "strtoull",
     "via": "c23-variant"
   },
@@ -159,6 +167,10 @@
     "musl": "wscanf",
     "via": "weak_alias"
   },
+  "__mbrlen": {
+    "musl": "mbrlen",
+    "via": "weak_alias"
+  },
   "__posix_getopt": {
     "musl": "getopt",
     "via": "weak_alias"
@@ -183,6 +195,10 @@
     "musl": "strtold_l",
     "via": "weak_alias"
   },
+  "__strtoll_l": {
+    "musl": "strtoll",
+    "via": "weak_alias"
+  },
   "__strtoll_internal": {
     "musl": "strtoll",
     "via": "weak_alias"
@@ -192,6 +208,10 @@
     "via": "weak_alias"
   },
   "__strtoull_internal": {
+    "musl": "strtoull",
+    "via": "weak_alias"
+  },
+  "__strtoull_l": {
     "musl": "strtoull",
     "via": "weak_alias"
   },
