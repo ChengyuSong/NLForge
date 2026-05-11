@@ -408,22 +408,51 @@ def run_kamain(
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Redirect stdout/stderr to log files to avoid buffering large output
+    # in memory (reduces OOM pressure).  start_new_session isolates KAMain
+    # in its own process group so OOM-killer signals don't propagate to the
+    # parent session (e.g. tmux).
+    log_dir = out_dir or Path(".")
+    stdout_log = log_dir / "kamain_stdout.log"
+    stderr_log = log_dir / "kamain_stderr.log"
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-        )
+        with open(stdout_log, "w") as f_out, open(stderr_log, "w") as f_err:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=f_out,
+                stderr=f_err,
+                start_new_session=True,
+            )
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                import os as _os
+                import signal as _signal
+                # Kill the entire process group
+                try:
+                    _os.killpg(proc.pid, _signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                proc.wait()
+                return False, f"timeout after {timeout}s", time.monotonic() - start
+
         duration = time.monotonic() - start
 
-        if result.returncode == 0:
-            # Verify expected output was produced
+        if rc == 0:
             if output_json and not output_json.exists():
                 return False, "KAMain exited 0 but no callgraph JSON produced", duration
             if cfl_compressed_output and not cfl_compressed_output.exists():
                 return False, "KAMain exited 0 but no .cflcg file produced", duration
             return True, "", duration
 
-        # Detect OOM kill: SIGKILL = -9 (Python) or 137 (shell convention)
-        rc = result.returncode
+        # Read tail of stderr for diagnostics
+        stderr_tail = ""
+        try:
+            stderr_tail = stderr_log.read_text(errors="replace")[-500:]
+        except OSError:
+            pass
+
         if rc == -9 or rc == 137:
             return False, "OOM killed (SIGKILL)", duration
         if rc < 0:
@@ -433,17 +462,15 @@ def run_kamain(
             except (ValueError, AttributeError):
                 sig_name = f"signal {-rc}"
             error = f"killed by {sig_name}"
-            if result.stderr:
-                error += f"\n{result.stderr[-500:]}"
+            if stderr_tail:
+                error += f"\n{stderr_tail}"
             return False, error, duration
 
         error = f"exit code {rc}"
-        if result.stderr:
-            error += f"\n{result.stderr[-500:]}"
+        if stderr_tail:
+            error += f"\n{stderr_tail}"
         return False, error, duration
 
-    except subprocess.TimeoutExpired:
-        return False, f"timeout after {timeout}s", time.monotonic() - start
     except FileNotFoundError:
         return False, f"KAMain not found: {kamain_bin}", time.monotonic() - start
     except Exception as e:

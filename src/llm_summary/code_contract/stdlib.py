@@ -525,6 +525,262 @@ def _build_libc_contracts() -> dict[str, CodeContractSummary]:
                               "obj is NULL or a valid pointer"]},
     )
 
+    # ── x86 SIMD intrinsics ──
+    # These are compiler builtins that clang may leave as function calls in
+    # unoptimised bitcode.  Contracts are grouped by memory access pattern.
+    #
+    # Loads: read from a pointer operand.
+    _simd_loads_aligned = [
+        # 128-bit aligned loads (require 16-byte alignment)
+        "_mm_load_si128",
+        # 256-bit aligned loads (require 32-byte alignment)
+        "_mm256_load_si256",
+        # 256-bit aligned stores (require 32-byte alignment) – listed here
+        # because the contract shape is the same as aligned loads.
+    ]
+    _simd_loads_unaligned = [
+        # 128-bit unaligned loads
+        "_mm_loadu_si128",
+        "_mm_loadl_epi64",     # loads low 64 bits
+        # 256-bit unaligned loads
+        "_mm256_loadu_si256",
+    ]
+    _simd_loads_masked = [
+        "_mm_maskload_epi32",      # reads up to 4 ints via mask
+        "_mm256_maskload_epi32",   # reads up to 8 ints via mask
+    ]
+    # Stores: write through a pointer operand.
+    _simd_stores_aligned = [
+        "_mm_store_si128",         # 16-byte aligned
+        "_mm256_store_si256",      # 32-byte aligned
+    ]
+    _simd_stores_unaligned = [
+        "_mm_storeu_si128",
+        "_mm_storel_epi64",        # stores low 64 bits
+        "_mm256_storeu_si256",
+    ]
+    # Pure register-only operations (no memory access).
+    _simd_pure: list[str] = [
+        # 128-bit arithmetic
+        "_mm_add_epi8", "_mm_add_epi16", "_mm_add_epi32", "_mm_add_epi64",
+        "_mm_sub_epi8", "_mm_sub_epi16", "_mm_sub_epi32", "_mm_sub_epi64",
+        "_mm_mul_epu32",
+        # 128-bit bitwise
+        "_mm_and_si128", "_mm_andnot_si128", "_mm_or_si128", "_mm_xor_si128",
+        # 128-bit compare
+        "_mm_cmpeq_epi8", "_mm_cmpeq_epi16", "_mm_cmpeq_epi32",
+        "_mm_cmpeq_epi64",
+        "_mm_cmpgt_epi8", "_mm_cmpgt_epi16", "_mm_cmpgt_epi32",
+        "_mm_cmplt_epi16", "_mm_cmplt_epi32",
+        # 128-bit shift
+        "_mm_sll_epi32", "_mm_srl_epi32",
+        "_mm_slli_epi16", "_mm_slli_epi32", "_mm_slli_epi64",
+        "_mm_srli_epi16", "_mm_srli_epi32", "_mm_srli_epi64",
+        "_mm_srai_epi32",
+        # 128-bit pack / shuffle / blend
+        "_mm_packs_epi32", "_mm_packus_epi16",
+        "_mm_shuffle_epi8", "_mm_blendv_epi8",
+        "_mm_unpackhi_epi8", "_mm_unpackhi_epi16",
+        "_mm_unpacklo_epi8", "_mm_unpacklo_epi16",
+        # 128-bit set / convert / extract
+        "_mm_set_epi8", "_mm_set_epi16", "_mm_set_epi32", "_mm_set_epi64x",
+        "_mm_set1_epi8", "_mm_set1_epi16", "_mm_set1_epi32",
+        "_mm_setzero_si128",
+        "_mm_cvtsi32_si128", "_mm_cvtsi64_si128", "_mm_cvtsi128_si32",
+        "_mm_movemask_epi8",
+        "_mm_avg_epu8", "_mm_min_epi16",
+        # 256-bit arithmetic
+        "_mm256_add_epi8", "_mm256_add_epi16", "_mm256_add_epi32",
+        "_mm256_add_epi64",
+        "_mm256_sub_epi8", "_mm256_sub_epi16", "_mm256_sub_epi32",
+        "_mm256_sub_epi64",
+        "_mm256_mul_epu32",
+        # 256-bit bitwise
+        "_mm256_and_si256", "_mm256_andnot_si256",
+        "_mm256_or_si256", "_mm256_xor_si256",
+        # 256-bit compare
+        "_mm256_cmpeq_epi8", "_mm256_cmpeq_epi16", "_mm256_cmpeq_epi32",
+        "_mm256_cmpeq_epi64",
+        # 256-bit shift
+        "_mm256_slli_epi16", "_mm256_slli_epi32", "_mm256_slli_epi64",
+        "_mm256_srli_epi16", "_mm256_srli_epi32", "_mm256_srli_epi64",
+        "_mm256_sllv_epi32", "_mm256_srlv_epi32",
+        # 256-bit pack / shuffle / broadcast / cast
+        "_mm256_shuffle_epi8",
+        "_mm256_broadcastb_epi8", "_mm256_broadcastw_epi16",
+        "_mm256_broadcastd_epi32", "_mm256_broadcastq_epi64",
+        "_mm256_castsi128_si256", "_mm256_castsi256_si128",
+        "_mm256_unpacklo_epi64",
+        "_mm256_permutevar8x32_epi32",
+        # 256-bit set / convert
+        "_mm256_set_epi64x", "_mm256_setzero_si256",
+        "_mm256_cvtepi8_epi32",
+    ]
+
+    for name in _simd_loads_aligned:
+        out[name] = _summary(
+            name,
+            memsafe={"requires": ["src is non-NULL",
+                                  "src is aligned to vector width (16 or 32 bytes)",
+                                  "src is readable for vector width bytes"]},
+        )
+    for name in _simd_loads_unaligned:
+        out[name] = _summary(
+            name,
+            memsafe={"requires": ["src is non-NULL",
+                                  "src is readable for vector width bytes"]},
+        )
+    for name in _simd_loads_masked:
+        out[name] = _summary(
+            name,
+            memsafe={"requires": ["src is non-NULL",
+                                  "src is readable for vector width bytes"]},
+        )
+    for name in _simd_stores_aligned:
+        out[name] = _summary(
+            name,
+            memsafe={"requires": ["dst is non-NULL",
+                                  "dst is aligned to vector width (16 or 32 bytes)",
+                                  "dst is writable for vector width bytes"],
+                     "modifies": ["dst[0..vector_width-1]"]},
+        )
+    for name in _simd_stores_unaligned:
+        out[name] = _summary(
+            name,
+            memsafe={"requires": ["dst is non-NULL",
+                                  "dst is writable for vector width bytes"],
+                     "modifies": ["dst[0..vector_width-1]"]},
+        )
+    for name in _simd_pure:
+        out[name] = _summary(name, memsafe={})
+
+    # Register mangled variants that appear in consumer bitcode.
+    # The contract is identical — only the abilist key differs.
+    _simd_mangled_map: dict[str, list[str]] = {
+        # Loads
+        "_mm_load_si128": ["_ZL15_mm_load_si128PKDv2_x"],
+        "_mm_loadu_si128": ["_ZL15_mm_loadu_si128PKDv2_x"],
+        "_mm_loadl_epi64": ["_ZL15_mm_loadl_epi64PKDv2_x"],
+        "_mm256_load_si256": ["_ZL18_mm256_load_si256PKDv4_x"],
+        "_mm256_loadu_si256": ["_ZL19_mm256_loadu_si256PKDv4_x"],
+        "_mm_maskload_epi32": ["_ZL19_mm_maskload_epi32PKiDv2_x"],
+        "_mm256_maskload_epi32": ["_ZL22_mm256_maskload_epi32PKiDv4_x"],
+        # Stores
+        "_mm_store_si128": ["_ZL16_mm_store_si128PDv2_xS_"],
+        "_mm_storeu_si128": ["_ZL16_mm_storeu_si128PDv2_xS_"],
+        "_mm_storel_epi64": ["_ZL16_mm_storel_epi64PDv2_xS_"],
+        "_mm256_store_si256": ["_ZL19_mm256_store_si256PDv4_xS_"],
+        "_mm256_storeu_si256": ["_ZL20_mm256_storeu_si256PDv4_xS_"],
+        # Pure
+        "_mm_add_epi8": ["_ZL12_mm_add_epi8Dv2_xS_"],
+        "_mm_add_epi16": ["_ZL13_mm_add_epi16Dv2_xS_"],
+        "_mm_add_epi32": ["_ZL13_mm_add_epi32Dv2_xS_"],
+        "_mm_add_epi64": ["_ZL13_mm_add_epi64Dv2_xS_"],
+        "_mm_sub_epi8": ["_ZL12_mm_sub_epi8Dv2_xS_"],
+        "_mm_sub_epi16": ["_ZL13_mm_sub_epi16Dv2_xS_"],
+        "_mm_sub_epi32": ["_ZL13_mm_sub_epi32Dv2_xS_"],
+        "_mm_sub_epi64": ["_ZL13_mm_sub_epi64Dv2_xS_"],
+        "_mm_mul_epu32": ["_ZL13_mm_mul_epu32Dv2_xS_"],
+        "_mm_and_si128": ["_ZL13_mm_and_si128Dv2_xS_"],
+        "_mm_andnot_si128": ["_ZL16_mm_andnot_si128Dv2_xS_"],
+        "_mm_or_si128": ["_ZL12_mm_or_si128Dv2_xS_"],
+        "_mm_xor_si128": ["_ZL13_mm_xor_si128Dv2_xS_"],
+        "_mm_cmpeq_epi8": ["_ZL14_mm_cmpeq_epi8Dv2_xS_"],
+        "_mm_cmpeq_epi16": ["_ZL15_mm_cmpeq_epi16Dv2_xS_"],
+        "_mm_cmpeq_epi32": ["_ZL15_mm_cmpeq_epi32Dv2_xS_"],
+        "_mm_cmpeq_epi64": ["_ZL15_mm_cmpeq_epi64Dv2_xS_"],
+        "_mm_cmpgt_epi8": ["_ZL14_mm_cmpgt_epi8Dv2_xS_"],
+        "_mm_cmpgt_epi16": ["_ZL15_mm_cmpgt_epi16Dv2_xS_"],
+        "_mm_cmpgt_epi32": ["_ZL15_mm_cmpgt_epi32Dv2_xS_"],
+        "_mm_cmplt_epi16": ["_ZL15_mm_cmplt_epi16Dv2_xS_"],
+        "_mm_cmplt_epi32": ["_ZL15_mm_cmplt_epi32Dv2_xS_"],
+        "_mm_sll_epi32": ["_ZL13_mm_sll_epi32Dv2_xS_"],
+        "_mm_srl_epi32": ["_ZL13_mm_srl_epi32Dv2_xS_"],
+        "_mm_slli_epi16": ["_ZL14_mm_slli_epi16Dv2_xi"],
+        "_mm_slli_epi32": ["_ZL14_mm_slli_epi32Dv2_xi"],
+        "_mm_slli_epi64": ["_ZL14_mm_slli_epi64Dv2_xi"],
+        "_mm_srli_epi16": ["_ZL14_mm_srli_epi16Dv2_xi"],
+        "_mm_srli_epi32": ["_ZL14_mm_srli_epi32Dv2_xi"],
+        "_mm_srli_epi64": ["_ZL14_mm_srli_epi64Dv2_xi"],
+        "_mm_srai_epi32": ["_ZL14_mm_srai_epi32Dv2_xi"],
+        "_mm_packs_epi32": ["_ZL15_mm_packs_epi32Dv2_xS_"],
+        "_mm_packus_epi16": ["_ZL16_mm_packus_epi16Dv2_xS_"],
+        "_mm_shuffle_epi8": ["_ZL16_mm_shuffle_epi8Dv2_xS_"],
+        "_mm_blendv_epi8": ["_ZL15_mm_blendv_epi8Dv2_xS_S_"],
+        "_mm_unpackhi_epi8": ["_ZL17_mm_unpackhi_epi8Dv2_xS_"],
+        "_mm_unpackhi_epi16": ["_ZL18_mm_unpackhi_epi16Dv2_xS_"],
+        "_mm_unpacklo_epi8": ["_ZL17_mm_unpacklo_epi8Dv2_xS_"],
+        "_mm_unpacklo_epi16": ["_ZL18_mm_unpacklo_epi16Dv2_xS_"],
+        "_mm_set_epi8": ["_ZL12_mm_set_epi8cccccccccccccccc"],
+        "_mm_set_epi16": ["_ZL13_mm_set_epi16ssssssss"],
+        "_mm_set_epi32": ["_ZL13_mm_set_epi32iiii"],
+        "_mm_set_epi64x": ["_ZL14_mm_set_epi64xxx"],
+        "_mm_set1_epi8": ["_ZL13_mm_set1_epi8c"],
+        "_mm_set1_epi16": ["_ZL14_mm_set1_epi16s"],
+        "_mm_set1_epi32": ["_ZL14_mm_set1_epi32i"],
+        "_mm_setzero_si128": ["_ZL17_mm_setzero_si128v"],
+        "_mm_cvtsi32_si128": ["_ZL17_mm_cvtsi32_si128i"],
+        "_mm_cvtsi64_si128": ["_ZL17_mm_cvtsi64_si128x"],
+        "_mm_cvtsi128_si32": ["_ZL17_mm_cvtsi128_si32Dv2_x"],
+        "_mm_movemask_epi8": ["_ZL17_mm_movemask_epi8Dv2_x"],
+        "_mm_avg_epu8": ["_ZL12_mm_avg_epu8Dv2_xS_"],
+        "_mm_min_epi16": ["_ZL13_mm_min_epi16Dv2_xS_"],
+        # 256-bit pure
+        "_mm256_add_epi8": ["_ZL15_mm256_add_epi8Dv4_xS_"],
+        "_mm256_add_epi16": ["_ZL16_mm256_add_epi16Dv4_xS_"],
+        "_mm256_add_epi32": ["_ZL16_mm256_add_epi32Dv4_xS_"],
+        "_mm256_add_epi64": ["_ZL16_mm256_add_epi64Dv4_xS_"],
+        "_mm256_sub_epi8": ["_ZL15_mm256_sub_epi8Dv4_xS_"],
+        "_mm256_sub_epi16": ["_ZL16_mm256_sub_epi16Dv4_xS_"],
+        "_mm256_sub_epi32": ["_ZL16_mm256_sub_epi32Dv4_xS_"],
+        "_mm256_sub_epi64": ["_ZL16_mm256_sub_epi64Dv4_xS_"],
+        "_mm256_mul_epu32": ["_ZL16_mm256_mul_epu32Dv4_xS_"],
+        "_mm256_and_si256": ["_ZL16_mm256_and_si256Dv4_xS_"],
+        "_mm256_andnot_si256": ["_ZL19_mm256_andnot_si256Dv4_xS_"],
+        "_mm256_or_si256": ["_ZL15_mm256_or_si256Dv4_xS_"],
+        "_mm256_xor_si256": ["_ZL16_mm256_xor_si256Dv4_xS_"],
+        "_mm256_cmpeq_epi8": ["_ZL17_mm256_cmpeq_epi8Dv4_xS_"],
+        "_mm256_cmpeq_epi16": ["_ZL18_mm256_cmpeq_epi16Dv4_xS_"],
+        "_mm256_cmpeq_epi32": ["_ZL18_mm256_cmpeq_epi32Dv4_xS_"],
+        "_mm256_cmpeq_epi64": ["_ZL18_mm256_cmpeq_epi64Dv4_xS_"],
+        "_mm256_slli_epi16": ["_ZL17_mm256_slli_epi16Dv4_xi"],
+        "_mm256_slli_epi32": ["_ZL17_mm256_slli_epi32Dv4_xi"],
+        "_mm256_slli_epi64": ["_ZL17_mm256_slli_epi64Dv4_xi"],
+        "_mm256_srli_epi16": ["_ZL17_mm256_srli_epi16Dv4_xi"],
+        "_mm256_srli_epi32": ["_ZL17_mm256_srli_epi32Dv4_xi"],
+        "_mm256_srli_epi64": ["_ZL17_mm256_srli_epi64Dv4_xi"],
+        "_mm256_sllv_epi32": ["_ZL17_mm256_sllv_epi32Dv4_xS_"],
+        "_mm256_srlv_epi32": ["_ZL17_mm256_srlv_epi32Dv4_xS_"],
+        "_mm256_shuffle_epi8": ["_ZL19_mm256_shuffle_epi8Dv4_xS_"],
+        "_mm256_broadcastb_epi8": ["_ZL22_mm256_broadcastb_epi8Dv2_x"],
+        "_mm256_broadcastw_epi16": ["_ZL23_mm256_broadcastw_epi16Dv2_x"],
+        "_mm256_broadcastd_epi32": ["_ZL23_mm256_broadcastd_epi32Dv2_x"],
+        "_mm256_broadcastq_epi64": ["_ZL23_mm256_broadcastq_epi64Dv2_x"],
+        "_mm256_castsi128_si256": ["_ZL22_mm256_castsi128_si256Dv2_x"],
+        "_mm256_castsi256_si128": ["_ZL22_mm256_castsi256_si128Dv4_x"],
+        "_mm256_unpacklo_epi64": ["_ZL21_mm256_unpacklo_epi64Dv4_xS_"],
+        "_mm256_permutevar8x32_epi32": [
+            "_ZL27_mm256_permutevar8x32_epi32Dv4_xS_",
+        ],
+        "_mm256_set_epi64x": ["_ZL17_mm256_set_epi64xxxxx"],
+        "_mm256_setzero_si256": ["_ZL20_mm256_setzero_si256v"],
+        "_mm256_cvtepi8_epi32": ["_ZL20_mm256_cvtepi8_epi32Dv2_x"],
+    }
+
+    for base_name, mangled_names in _simd_mangled_map.items():
+        base = out.get(base_name)
+        if base is None:
+            continue
+        for mname in mangled_names:
+            alias = CodeContractSummary(
+                function=mname, properties=list(base.properties),
+            )
+            for prop in base.properties:
+                alias.requires[prop] = list(base.requires.get(prop, []))
+                alias.ensures[prop] = list(base.ensures.get(prop, []))
+                alias.modifies[prop] = list(base.modifies.get(prop, []))
+            out[mname] = alias
+
     return out
 
 
