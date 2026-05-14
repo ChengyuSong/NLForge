@@ -220,6 +220,11 @@ def _build_libc_contracts() -> dict[str, CodeContractSummary]:
                              "result points to a NUL-terminated static/thread-local "
                              "buffer; do not free; may be overwritten by next call"]},
     )
+    out["strerrordesc_np"] = _summary(
+        "strerrordesc_np",
+        memsafe={"ensures": ["result is NULL (unknown errnum) or points to a "
+                             "NUL-terminated static string; do not free"]},
+    )
 
     # ── string -> number ──
     out["atof"] = _summary(
@@ -454,6 +459,18 @@ def _build_libc_contracts() -> dict[str, CodeContractSummary]:
         "memchr",
         memsafe={"requires": ["s is readable for n bytes"],
                  "ensures":  ["result is NULL or points within s[0..n-1]"]},
+    )
+
+    # ── socket ancillary data ──
+    out["__cmsg_nxthdr"] = _summary(
+        "__cmsg_nxthdr",
+        memsafe={
+            "requires": ["msg != NULL",
+                         "msg->msg_control is readable for msg->msg_controllen bytes",
+                         "cmsg is NULL or points within msg->msg_control"],
+            "ensures":  ["result is NULL (no more headers) or points to the next "
+                         "cmsghdr within msg->msg_control; no allocation"],
+        },
     )
 
     # ── mmap / munmap ──
