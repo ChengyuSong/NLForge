@@ -16,14 +16,13 @@ from pathlib import Path
 # Regex for preprocessor line markers:  # 123 "/usr/include/zlib.h" 3 4
 _LINE_MARKER_RE = re.compile(r'^#\s+\d+\s+"([^"]+)"')
 
-# Regex for extern function declarations (simplified but sufficient):
-#   extern int deflate(z_streamp strm, int flush);
-#   extern unsigned long crc32(unsigned long crc, const Bytef *buf, uInt len);
-# We capture the function name.
+# Regex for extern function declarations.  Uses \bextern (not ^extern) so it
+# matches multiple declarations on a single preprocessor output line — common
+# when headers expand macros (e.g. pcre2.h emits all decls on one line).
 _EXTERN_FUNC_RE = re.compile(
-    r"^extern\s+"           # starts with 'extern'
-    r"[\w\s\*]+"            # return type (words, spaces, pointers)
-    r"\b(\w+)\s*\("         # function name followed by '('
+    r"\bextern\s+"            # 'extern' at a word boundary
+    r"[\w\s\*]+"              # return type (words, spaces, pointers)
+    r"\b(\w+)\s*\("           # function name followed by '('
 )
 
 # Flags to strip when converting a compile command to preprocessor-only
@@ -176,25 +175,13 @@ def extract_extern_headers(
     if verbose:
         print(f"[extern-headers] Preprocessing {len(targets)} source files")
 
-    # Deduplicate by include flags — many files share the same -I/-D set
-    seen_flag_sets: dict[tuple, dict[str, str] | None] = {}
     header_map: dict[str, str] = {}
     failed_sources: list[str] = []
 
     for src in targets:
         compiler, flags, directory = file_cmds[src]
-        flag_key = tuple(sorted(f for f in flags if f.startswith(("-I", "-isystem", "-D"))))
-
-        if flag_key in seen_flag_sets:
-            cached = seen_flag_sets[flag_key]
-            if cached is not None:
-                header_map.update(cached)
-            else:
-                failed_sources.append(src)
-            continue
 
         pp_result = _run_preprocessor(compiler, flags, src, directory, project_prefixes, verbose)
-        seen_flag_sets[flag_key] = pp_result
         if pp_result is None:
             failed_sources.append(src)
         else:
@@ -326,8 +313,7 @@ def _parse_preprocessor_output(
         if not current_file or _is_project_header(current_file, project_prefixes):
             continue
 
-        m = _EXTERN_FUNC_RE.match(line)
-        if m:
+        for m in _EXTERN_FUNC_RE.finditer(line):
             func_name = m.group(1)
             if func_name not in header_map:
                 header_map[func_name] = current_file
