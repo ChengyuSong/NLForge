@@ -822,9 +822,16 @@
   },
   {
     "name": "harfbuzz",
-    "url": "https://github.com/harfbuzz/harfbuzz",
+    "url": "https://github.com/harfbuzz/harfbuzz.git",
     "tier" : 1,
     "area": "Other essential libraries",
     "project_dir": "harfbuzz"
+  },
+  {
+    "name": "pcre2",
+    "url": "https://github.com/PCRE2Project/pcre2.git",
+    "tier": 1,
+    "area": "Other essential libraries",
+    "project_dir": "pcre2"
   }
 ]
