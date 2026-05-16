@@ -3376,6 +3376,10 @@ def show_issues(
     "--force", is_flag=True,
     help="Re-triage issues regardless of existing review status.",
 )
+@click.option(
+    "--log-llm", default=None,
+    help="Log all LLM prompts and responses to file.",
+)
 def triage(
     db_path: str, backend: str, model: str | None,
     llm_host: str, llm_port: int | None, disable_thinking: bool,
@@ -3387,6 +3391,7 @@ def triage(
     harness_dir: str | None,
     build_dir: str | None,
     force: bool,
+    log_llm: str | None,
 ) -> None:
     """Triage verification issues: prove safety or feasibility.
 
@@ -3448,6 +3453,7 @@ def triage(
             build_script_dir=bsd_path,
             harness_output_dir=harness_out,
             build_dir=_Path(build_dir) if build_dir else None,
+            log_file=log_llm,
         )
 
         # Resolve functions to triage

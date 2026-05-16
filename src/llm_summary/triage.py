@@ -433,6 +433,54 @@ DEFAULT_DOC_AUDIT_TURNS = 50
 DEFAULT_VERDICT_TURNS = 100
 
 
+def _log_react_start(
+    log_file: str, prefix: str,
+    system_prompt: str, user_prompt: str,
+) -> None:
+    import datetime
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        ts = datetime.datetime.now().isoformat()
+        f.write(f"\n{'=' * 80}\n")
+        f.write(f"Stage: {prefix} (start)\n")
+        f.write(f"Timestamp: {ts}\n")
+        f.write(f"{'-' * 80}\n")
+        f.write("SYSTEM PROMPT:\n")
+        f.write(system_prompt)
+        f.write(f"\n{'-' * 80}\n")
+        f.write("USER PROMPT:\n")
+        f.write(user_prompt)
+        f.write("\n")
+
+
+def _log_react_turn(
+    log_file: str, prefix: str, turn: int,
+    assistant_content: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> None:
+    import datetime
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        ts = datetime.datetime.now().isoformat()
+        f.write(f"\n{'-' * 80}\n")
+        f.write(f"{prefix} turn {turn + 1} | {ts}\n")
+        f.write(f"{'-' * 80}\n")
+        f.write("ASSISTANT:\n")
+        for block in assistant_content:
+            if block.get("type") == "text":
+                tag = "[thinking] " if block.get("thought") else ""
+                f.write(f"{tag}{block['text']}\n")
+            elif block.get("type") == "tool_use":
+                f.write(
+                    f"[tool_use] {block['name']}"
+                    f"({json.dumps(block['input'])})\n",
+                )
+        f.write("TOOL RESULTS:\n")
+        for tr in tool_results:
+            content = tr.get("content", "")
+            f.write(f"  {content}\n")
+
+
 def _run_react_loop(
     *,
     llm: LLMBackend,
@@ -447,6 +495,7 @@ def _run_react_loop(
     git_tools: GitTools | None = None,
     project_path: Path | None = None,
     llm_for_verify: LLMBackend | None = None,
+    log_file: str | None = None,
 ) -> dict[str, Any] | None:
     """Run a ReAct loop until the terminal tool is called or turns run out.
 
@@ -464,6 +513,9 @@ def _run_react_loop(
     ]
 
     terminal_input: dict[str, Any] | None = None
+
+    if log_file:
+        _log_react_start(log_file, log_prefix, system_prompt, user_prompt)
 
     for turn in range(max_turns):
         response = llm.complete_with_tools(
@@ -532,6 +584,12 @@ def _run_react_loop(
 
         messages.append({"role": "assistant", "content": assistant_content})
         messages.append({"role": "user", "content": tool_results})
+
+        if log_file:
+            _log_react_turn(
+                log_file, log_prefix, turn,
+                assistant_content, tool_results,
+            )
 
         if terminal_input is not None:
             break
@@ -612,6 +670,7 @@ class TriageAgent:
         build_script_dir: Path | None = None,
         harness_output_dir: Path | None = None,
         build_dir: Path | None = None,
+        log_file: str | None = None,
     ) -> None:
         self.db = db
         self.llm_factory = llm_factory
@@ -622,6 +681,7 @@ class TriageAgent:
         self.build_script_dir = build_script_dir
         self.build_dir = build_dir
         self.harness_output_dir = harness_output_dir
+        self.log_file = log_file
         self._results: list[dict[str, Any]] = []
 
     def _rel_path(self, abs_path: str) -> str:
@@ -631,6 +691,26 @@ class TriageAgent:
             return str(Path(abs_path).relative_to(self.project_path))
         except ValueError:
             return abs_path
+
+    def _log_interaction(
+        self, label: str, prompt: str, response: str,
+    ) -> None:
+        if not self.log_file:
+            return
+        import datetime
+
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            ts = datetime.datetime.now().isoformat()
+            f.write(f"\n{'=' * 80}\n")
+            f.write(f"Stage: {label}\n")
+            f.write(f"Timestamp: {ts}\n")
+            f.write(f"{'-' * 80}\n")
+            f.write("PROMPT:\n")
+            f.write(prompt)
+            f.write(f"\n{'-' * 80}\n")
+            f.write("RESPONSE:\n")
+            f.write(response)
+            f.write("\n")
 
     # -- DB writeback & incremental save --
 
@@ -938,6 +1018,7 @@ class TriageAgent:
                 GitTools(self.project_path) if self.project_path else None
             ),
             project_path=self.project_path,
+            log_file=self.log_file,
         )
 
         if result is None:
@@ -1019,6 +1100,7 @@ class TriageAgent:
             log_prefix="DocAudit",
             git_tools=GitTools(self.project_path) if self.project_path else None,
             project_path=self.project_path,
+            log_file=self.log_file,
         )
 
         if result is None:
@@ -1095,6 +1177,7 @@ class TriageAgent:
             ),
             project_path=self.project_path,
             llm_for_verify=self.llm_factory(),
+            log_file=self.log_file,
         )
 
         if result is None:
@@ -1237,25 +1320,31 @@ class TriageAgent:
 
         for attempt in range(DEFAULT_WITNESS_TURNS):
             if attempt == 0:
+                cur_prompt = prompt
                 response = llm.complete(
-                    prompt, system=WITNESS_SYSTEM_PROMPT,
+                    cur_prompt, system=WITNESS_SYSTEM_PROMPT,
                 )
             else:
-                response = llm.complete(
+                cur_prompt = (
                     f"{prompt}\n\n"
                     f"---\n\n"
                     f"The previous attempt:\n\n"
                     f"```c\n{c_code}\n```\n\n"
                     f"failed with:\n\n"
                     f"```\n{compile_err}\n```\n\n"
-                    "Fix the code. Output a single ```c fenced block.",
-                    system=WITNESS_SYSTEM_PROMPT,
+                    "Fix the code. Output a single ```c fenced block."
+                )
+                response = llm.complete(
+                    cur_prompt, system=WITNESS_SYSTEM_PROMPT,
                 )
 
             text = (
                 response.text
                 if hasattr(response, "text")
                 else str(response)
+            )
+            self._log_interaction(
+                f"Witness attempt {attempt + 1}", cur_prompt, text,
             )
             extracted = _extract_c_block(text)
             if not extracted:
@@ -1670,18 +1759,24 @@ class TriageAgent:
         gdb_script: str | None = None
         for attempt in range(DEFAULT_DEBUG_TURNS):
             if attempt == 0:
+                cur_prompt = gdb_prompt
                 resp = llm.complete(
-                    gdb_prompt, system=DEBUG_GDB_SYSTEM_PROMPT,
+                    cur_prompt, system=DEBUG_GDB_SYSTEM_PROMPT,
                 )
             else:
-                resp = llm.complete(
+                cur_prompt = (
                     "The GDB script produced no useful output. "
                     "Revise the breakpoints and try again. "
-                    "Output a single ```gdb fenced block.",
-                    system=DEBUG_GDB_SYSTEM_PROMPT,
+                    "Output a single ```gdb fenced block."
+                )
+                resp = llm.complete(
+                    cur_prompt, system=DEBUG_GDB_SYSTEM_PROMPT,
                 )
             text = (
                 resp.text if hasattr(resp, "text") else str(resp)
+            )
+            self._log_interaction(
+                f"Debug GDB attempt {attempt + 1}", cur_prompt, text,
             )
             extracted = _extract_gdb_block(text)
             if extracted:
@@ -1729,6 +1824,7 @@ class TriageAgent:
             if hasattr(diag_resp, "text")
             else str(diag_resp)
         )
+        self._log_interaction("Debug diagnosis", diag_prompt, diag_text)
 
         # Parse JSON from response
         diagnosis = self._parse_diagnosis(diag_text)
