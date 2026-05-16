@@ -54,7 +54,7 @@ class TriageResult:
     function_name: str
     issue_index: int
     issue: SafetyIssue
-    hypothesis: str  # "safe", "contract_gap", or "feasible"
+    hypothesis: str  # "safe", "contract_gap", "feasible", or "unknown"
     reasoning: str  # natural language proof
 
     # Safety proof: updated contracts that eliminate the issue
@@ -428,9 +428,9 @@ DEFAULT_DEBUG_TURNS = 2
 # Shared ReAct loop
 # ---------------------------------------------------------------------------
 
-DEFAULT_REACHABILITY_TURNS = 30
-DEFAULT_DOC_AUDIT_TURNS = 25
-DEFAULT_VERDICT_TURNS = 35
+DEFAULT_REACHABILITY_TURNS = 60
+DEFAULT_DOC_AUDIT_TURNS = 50
+DEFAULT_VERDICT_TURNS = 100
 
 
 def _run_react_loop(
@@ -642,6 +642,10 @@ class TriageAgent:
             self._apply_contract_updates(func, result)
             self._mark_issue_review(
                 func, result, status="false_positive",
+            )
+        elif result.hypothesis == "unknown":
+            self._mark_issue_review(
+                func, result, status="unknown",
             )
         elif result.hypothesis == "feasible":
             self._mark_issue_review(
@@ -1098,7 +1102,7 @@ class TriageAgent:
                 function_name=func.name,
                 issue_index=issue_index,
                 issue=issue,
-                hypothesis="feasible",
+                hypothesis="unknown",
                 reasoning="Verdict stage hit turn limit.",
                 entry_function=rv.entry_function,
                 reachability_chain=rv.call_chain,
@@ -1424,47 +1428,6 @@ class TriageAgent:
 
         return "\n".join(lines)
 
-    def _extract_include_flags(self) -> str:
-        """Extract unique -I flags from compile_commands.json.
-
-        Host paths from ``compile_commands.json`` are remapped to
-        Docker container paths (``/workspace/src``, ``/workspace/build``)
-        so the inner script can use them directly.
-        """
-        if not self.compile_commands:
-            return "-I/workspace/src -I/workspace/build"
-
-        # Determine host paths for remapping
-        assert self.build_script_dir is not None
-        assert self.build_dir is not None
-        config_path = self.build_script_dir / "config.json"
-        project_path = ""
-        if config_path.exists():
-            with open(config_path) as f:
-                project_path = json.load(f).get("project_path", "")
-        host_build = str(self.build_dir)
-
-        seen: set[str] = set()
-        for entry in self.compile_commands:
-            cmd = entry.get("command", "")
-            for token in cmd.split():
-                if token.startswith("-I"):
-                    inc = token[2:] if len(token) > 2 else ""
-                    if not inc:
-                        continue
-                    # Remap host paths to Docker paths
-                    if host_build and inc.startswith(host_build):
-                        inc = "/workspace/build" + inc[len(host_build):]
-                    elif project_path and inc.startswith(project_path):
-                        inc = "/workspace/src" + inc[len(project_path):]
-                    if inc not in seen:
-                        seen.add(inc)
-        if not seen:
-            return "-I/workspace/src -I/workspace/build"
-        seen.add("/workspace/src")
-        seen.add("/workspace/build")
-        return " ".join(f"-I{d}" for d in sorted(seen))
-
     @staticmethod
     def _parse_witness_deps(test_c: Path) -> list[str]:
         """Extract ``// DEPS: pkg1 pkg2`` from the test source."""
@@ -1528,9 +1491,6 @@ class TriageAgent:
 
         cmake_args = " ".join(f"'{f}'" for f in sanitized)
 
-        # Extract -I flags from compile_commands.json
-        include_flags = self._extract_include_flags()
-
         # Parse // DEPS: lines from the test source for apt packages
         deps_pkgs = self._parse_witness_deps(test_c)
 
@@ -1572,8 +1532,13 @@ class TriageAgent:
             "/workspace/build/CMakeCache.txt 2>/dev/null "
             "| grep -v NOTFOUND | sed 's/.*=//' "
             "| sort -u | tr '\\n' ' ')",
+            "# Extract -I flags from the freshly-built compile_commands.json",
+            "INC_FLAGS=$(grep -ohP '(?<= )-I[^ \"]+' "
+            "/workspace/build/compile_commands.json 2>/dev/null "
+            "| sort -u | tr '\\n' ' ')",
+            'INC_FLAGS="${INC_FLAGS:--I/workspace/src -I/workspace/build}"',
             f"clang-18 -fsanitize=address,undefined -g "
-            f"{include_flags} "
+            f"$INC_FLAGS "
             f"/test/{test_c.name} "
             '"$LIB" $CMAKE_LIBS '
             f"-lm -lz -lpthread -lstdc++ -ldl "
